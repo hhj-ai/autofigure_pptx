@@ -92,6 +92,25 @@ fn schema_command_payload_contains_figure_plan_definition() {
 }
 
 #[test]
+fn figure_plan_defaults_missing_version_to_current_schema_version() {
+    let mut json = serde_json::to_value(FigurePlan::mock_from_method(
+        "Teacher guides student with latent residuals.",
+        StyleName::WpsClean,
+        CanvasAspect::PaperWide,
+        85,
+    ))
+    .expect("mock plan should serialize");
+    json.as_object_mut()
+        .expect("FigurePlan should serialize as object")
+        .remove("version");
+
+    let plan: FigurePlan =
+        serde_json::from_value(json).expect("missing version should use current default");
+
+    assert_eq!(plan.version, "0.1");
+}
+
+#[test]
 fn stable_id_validator_rejects_empty_and_duplicate_ids() {
     let mut plan = FigurePlan::mock_from_method(
         "Teacher guides student with latent residuals.",

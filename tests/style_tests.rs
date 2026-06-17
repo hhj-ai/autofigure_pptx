@@ -8,7 +8,9 @@ fn wps_clean_uses_goal_fonts_and_safe_line_widths() {
     assert_eq!(style.fonts.font_latin, "Arial");
     assert!(style.fonts.fallback_cjk.contains(&"DengXian".to_string()));
     assert!(style.line_widths.auxiliary >= 0.75);
-    assert!(style.line_widths.normal >= 0.75);
+    assert!(style.line_widths.normal >= 1.2);
+    assert!(style.line_widths.main_flow >= 2.0);
+    assert!(style.line_widths.strong_focus >= 2.25);
 }
 
 #[test]

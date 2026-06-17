@@ -13,6 +13,15 @@
 # Generated runs and exports
 /runs/
 
+# Test and coverage artifacts
+/coverage/
+/test-results/
+/junit.xml
+/lcov.info
+/tarpaulin-report.html
+/*.profraw
+/*.profdata
+
 # Local task notes
 /plan.md
 /goal.md

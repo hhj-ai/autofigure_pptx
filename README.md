@@ -66,6 +66,16 @@ The MVP includes `--mock-models` for tests and local dry runs. Mock mode does no
 
 ## Usage
 
+For a real environment run with automatic output naming, use the helper script:
+
+```bash
+bash scripts/run_real_env.sh examples/teacher_student.md
+```
+
+The script names the run directory as `<content-summary>_<timestamp>` under `runs/`, uses `--image-provider none`, and leaves the iteration cap to the CLI default instead of hardcoding one in the script.
+
+If you want to call the CLI directly:
+
 ```bash
 cargo run -- run \
   --method examples/teacher_student.md \
@@ -73,7 +83,6 @@ cargo run -- run \
   --style wps-clean \
   --aspect paper-wide \
   --target-width-mm 85 \
-  --max-iterations 12 \
   --max-cost-usd 3.00 \
   --max-minutes 20 \
   --image-provider none \
@@ -129,3 +138,5 @@ cd renderer && npm run build
 ```
 
 The mock end-to-end test verifies that the loop fails once, writes a patch plan, passes the next review, and creates final artifacts without real API calls.
+
+Acceptance is intentionally conservative. A figure is accepted only when the vision review clears the score thresholds and the local quality gate finds no collapsed components, major component overlap, degenerate edges, or obvious edge crossings in `layout_map.json`. Low color semantics or aesthetic scores also force rejection.

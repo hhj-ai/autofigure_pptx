@@ -1,4 +1,5 @@
 pub mod asset_gen;
+pub mod canonicalize;
 pub mod cost;
 pub mod doctor;
 pub mod export;

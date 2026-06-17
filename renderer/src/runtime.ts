@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import { createRequire } from "node:module";
 import path from "node:path";
-import { type LayoutMap, type LayoutObject, type NormalizedBox, normalizeBox } from "./safe_api.js";
+import { clamp01, type LayoutMap, type LayoutObject, type NormalizedBox, normalizeBox } from "./safe_api.js";
 
 const require = createRequire(import.meta.url);
 const PptxGenJS = require("pptxgenjs") as new () => any;
@@ -168,6 +168,25 @@ export class FigureRuntime {
     for (const component of this.payload.plan.components) {
       const normalized = boxes.get(component.id);
       if (!normalized) continue;
+      if (isCaptionComponent(component, normalized)) {
+        const box = this.toBox(normalized);
+        this.slide.addText(component.label, {
+          ...box,
+          margin: 0.02,
+          fit: "shrink",
+          breakLine: false,
+          valign: "mid",
+          align: "center",
+          fontFace: this.payload.style.fonts.font_cjk,
+          fontSize: this.payload.style.font_sizes.auxiliary_label,
+          color: this.payload.style.palette.muted_text,
+          fill: { color: this.payload.style.palette.background, transparency: 100 },
+          line: { color: this.payload.style.palette.background, transparency: 100 },
+          shapeName: `methodfig_caption_${component.id}`
+        });
+        this.track(component.id, "annotation", normalized);
+        continue;
+      }
       const box = this.toBox(normalized);
       const isStrong = component.visual_weight === "strong";
       const isMuted = component.visual_weight === "muted";
@@ -220,8 +239,12 @@ export class FigureRuntime {
       const from = boxes.get(edge.from);
       const to = boxes.get(edge.to);
       if (!from || !to) continue;
-      const start = anchor(from, to);
-      const end = anchor(to, from);
+      let start = anchor(from, to);
+      let end = anchor(to, from);
+      const reverse = this.payload.plan.edges.find(candidate => candidate.from === edge.to && candidate.to === edge.from);
+      if (reverse) {
+        [start, end] = offsetSegment(start, end, 0.018);
+      }
       const lineBox = this.toLine(start, end);
       const isMain = edge.importance === "main";
       const isSupervision = edge.semantic === "supervision" || edge.semantic === "loss" || edge.style !== "solid";
@@ -255,6 +278,7 @@ export class FigureRuntime {
           line: { color: this.payload.style.palette.background, transparency: 100 },
           shapeName: `methodfig_edge_label_${edge.id}`
         });
+        this.track(`${edge.id}_label`, "label", labelBox);
       }
 
       this.track(edge.id, "edge", normalizeBox([start[0], start[1], end[0], end[1]]));
@@ -283,12 +307,50 @@ export class FigureRuntime {
   }
 
   private layoutComponents(): Map<string, NormalizedBox> {
+    const boxes = this.regionBasedLayout();
     const template = this.payload.plan.layout.template;
-    if (template === "teacher_student") return this.teacherStudentLayout();
-    if (template === "multimodal_fusion") return this.multimodalFusionLayout();
-    if (template === "training_inference_split") return this.trainingInferenceLayout();
-    if (template === "module_zoom_in") return this.moduleZoomLayout();
-    return this.pipelineLayout();
+    const fallback =
+      template === "teacher_student"
+        ? this.teacherStudentLayout()
+        : template === "multimodal_fusion"
+          ? this.multimodalFusionLayout()
+          : template === "training_inference_split"
+            ? this.trainingInferenceLayout()
+            : template === "module_zoom_in"
+              ? this.moduleZoomLayout()
+              : this.pipelineLayout();
+    return fillMissingBoxes(boxes, fallback);
+  }
+
+  private regionBasedLayout(): Map<string, NormalizedBox> {
+    const boxes = new Map<string, NormalizedBox>();
+    const regions = new Map<string, NormalizedBox>();
+    for (const region of this.payload.plan.layout.regions) {
+      const bbox = normalizeBox(region.bbox);
+      if (boxWidth(bbox) > 0.03 && boxHeight(bbox) > 0.03) {
+        regions.set(region.id, bbox);
+      }
+    }
+
+    const componentsByRegion = new Map<string, Component[]>();
+    for (const component of this.payload.plan.components) {
+      if (!regions.has(component.region)) continue;
+      const components = componentsByRegion.get(component.region) ?? [];
+      components.push(component);
+      componentsByRegion.set(component.region, components);
+    }
+
+    for (const [regionId, components] of componentsByRegion.entries()) {
+      const region = regions.get(regionId);
+      if (!region) continue;
+      const packed = packRegion(region, components.length);
+      components.forEach((component, index) => {
+        const box = packed[index];
+        boxes.set(component.id, isCaptionComponent(component, box) ? captionBox(region) : box);
+      });
+    }
+
+    return boxes;
   }
 
   private pipelineLayout(): Map<string, NormalizedBox> {
@@ -399,7 +461,30 @@ function anchor(from: NormalizedBox, to: NormalizedBox): [number, number] {
 function edgeLabelBox(start: [number, number], end: [number, number]): NormalizedBox {
   const mx = (start[0] + end[0]) / 2;
   const my = (start[1] + end[1]) / 2;
-  return normalizeBox([mx - 0.07, my - 0.035, mx + 0.07, my + 0.035]);
+  const dx = Math.abs(end[0] - start[0]);
+  const dy = Math.abs(end[1] - start[1]);
+  const longHorizontal = dx >= dy;
+  if (longHorizontal) {
+    const preferAbove = my >= 0.5;
+    const yOffset = preferAbove ? -0.24 : 0.20;
+    return normalizeBox([mx - 0.085, my + yOffset - 0.03, mx + 0.085, my + yOffset + 0.03]);
+  }
+  const preferLeft = mx > 0.6;
+  const xOffset = preferLeft ? -0.24 : 0.16;
+  return normalizeBox([mx + xOffset - 0.09, my - 0.03, mx + xOffset + 0.09, my + 0.03]);
+}
+
+function offsetSegment(start: [number, number], end: [number, number], amount: number): [[number, number], [number, number]] {
+  const dx = end[0] - start[0];
+  const dy = end[1] - start[1];
+  const length = Math.sqrt(dx * dx + dy * dy);
+  if (length < 0.001) return [start, end];
+  const nx = (-dy / length) * amount;
+  const ny = (dx / length) * amount;
+  return [
+    [clamp01(start[0] + nx), clamp01(start[1] + ny)],
+    [clamp01(end[0] + nx), clamp01(end[1] + ny)]
+  ];
 }
 
 function dashType(style: Edge["style"]): string {
@@ -408,11 +493,98 @@ function dashType(style: Edge["style"]): string {
   return "solid";
 }
 
+function packRegion(region: NormalizedBox, count: number): NormalizedBox[] {
+  if (count <= 0) return [];
+  if (count === 1) return [insetBox(region, adaptivePadding(region))];
+
+  const width = boxWidth(region);
+  const height = boxHeight(region);
+  const gap = adaptiveGap(region);
+  let columns: number;
+  if (count === 2) {
+    columns = width >= height ? 2 : 1;
+  } else {
+    const aspect = width / Math.max(height, 0.001);
+    columns = Math.ceil(Math.sqrt(count * aspect));
+    columns = Math.max(1, Math.min(count, columns));
+  }
+  const rows = Math.ceil(count / columns);
+  const [x1, y1, x2, y2] = insetBox(region, adaptivePadding(region));
+  const innerWidth = Math.max(0.001, x2 - x1);
+  const innerHeight = Math.max(0.001, y2 - y1);
+  const cellWidth = Math.max(0.001, (innerWidth - gap * (columns - 1)) / columns);
+  const cellHeight = Math.max(0.001, (innerHeight - gap * (rows - 1)) / rows);
+  const boxes: NormalizedBox[] = [];
+
+  for (let index = 0; index < count; index += 1) {
+    const row = Math.floor(index / columns);
+    const column = index % columns;
+    const cell: NormalizedBox = [
+      x1 + column * (cellWidth + gap),
+      y1 + row * (cellHeight + gap),
+      x1 + column * (cellWidth + gap) + cellWidth,
+      y1 + row * (cellHeight + gap) + cellHeight
+    ];
+    boxes.push(insetBox(cell, Math.min(gap * 0.35, 0.01)));
+  }
+
+  return boxes;
+}
+
+function adaptivePadding(box: NormalizedBox): number {
+  return Math.min(0.028, boxWidth(box) * 0.14, boxHeight(box) * 0.14);
+}
+
+function adaptiveGap(box: NormalizedBox): number {
+  return Math.min(0.026, boxWidth(box) * 0.09, boxHeight(box) * 0.09);
+}
+
+function insetBox(box: NormalizedBox, padding: number): NormalizedBox {
+  const [x1, y1, x2, y2] = normalizeBox(box);
+  const maxX = Math.max(0, (x2 - x1 - 0.025) / 2);
+  const maxY = Math.max(0, (y2 - y1 - 0.025) / 2);
+  const px = Math.min(padding, maxX);
+  const py = Math.min(padding, maxY);
+  return normalizeBox([x1 + px, y1 + py, x2 - px, y2 - py]);
+}
+
+function boxWidth(box: NormalizedBox): number {
+  const [x1, , x2] = normalizeBox(box);
+  return x2 - x1;
+}
+
+function boxHeight(box: NormalizedBox): number {
+  const [, y1, , y2] = normalizeBox(box);
+  return y2 - y1;
+}
+
 function fillMissingBoxes(boxes: Map<string, NormalizedBox>, fallback: Map<string, NormalizedBox>): Map<string, NormalizedBox> {
   for (const [id, box] of fallback.entries()) {
     if (!boxes.has(id)) boxes.set(id, box);
   }
   return boxes;
+}
+
+function isCaptionComponent(component: Component, box: NormalizedBox): boolean {
+  if (component.visual_weight !== "muted") return false;
+  const label = `${component.id} ${component.label}`.toLowerCase();
+  const labelLike =
+    label.includes("inference") ||
+    label.includes("training") ||
+    label.includes("deployed") ||
+    label.includes("only") ||
+    label.includes("phase");
+  return labelLike || boxWidth(box) * boxHeight(box) > 0.25;
+}
+
+function captionBox(region: NormalizedBox): NormalizedBox {
+  const [x1, y1, x2, y2] = normalizeBox(region);
+  const width = Math.min(0.32, Math.max(0.16, boxWidth(region) * 0.45));
+  const height = Math.min(0.09, Math.max(0.055, boxHeight(region) * 0.12));
+  const right = Math.min(x2 - 0.028, 0.94);
+  const left = Math.max(x1 + 0.028, right - width);
+  const top = Math.min(y2 - height - 0.028, y1 + 0.028);
+  return normalizeBox([left, top, left + width, top + height]);
 }
 
 function lighten(hex: string, amount: number): string {

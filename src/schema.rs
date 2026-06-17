@@ -54,6 +54,7 @@ pub enum Template {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct FigurePlan {
+    #[serde(default = "default_schema_version")]
     pub version: String,
     pub canvas: Canvas,
     pub story: Story,
@@ -63,6 +64,10 @@ pub struct FigurePlan {
     pub annotations: Vec<Annotation>,
     pub assets: Vec<AssetSpec>,
     pub design: DesignPolicy,
+}
+
+fn default_schema_version() -> String {
+    "0.1".to_string()
 }
 
 impl FigurePlan {
@@ -749,5 +754,15 @@ fn collect_ids(plan: &FigurePlan) -> Vec<(&'static str, &str)> {
 
 pub fn figure_plan_schema_json() -> Result<String> {
     let schema = schema_for!(FigurePlan);
+    Ok(serde_json::to_string_pretty(&schema)?)
+}
+
+pub fn review_schema_json() -> Result<String> {
+    let schema = schema_for!(Review);
+    Ok(serde_json::to_string_pretty(&schema)?)
+}
+
+pub fn patch_plan_schema_json() -> Result<String> {
+    let schema = schema_for!(PatchPlan);
     Ok(serde_json::to_string_pretty(&schema)?)
 }

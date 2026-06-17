@@ -10,18 +10,49 @@ fn env_lock() -> &'static Mutex<()> {
     LOCK.get_or_init(|| Mutex::new(()))
 }
 
+const MODEL_CONFIG_KEYS: &[&str] = &[
+    "METHODFIG_REASONER_API_KEY",
+    "METHODFIG_REASONER_MODEL",
+    "METHODFIG_CODER_API_KEY",
+    "METHODFIG_CODER_MODEL",
+    "METHODFIG_VISION_API_KEY",
+    "METHODFIG_VISION_MODEL",
+];
+
+struct EnvSnapshot {
+    values: Vec<(&'static str, Option<String>)>,
+}
+
+impl EnvSnapshot {
+    fn capture(keys: &[&'static str]) -> Self {
+        Self {
+            values: keys
+                .iter()
+                .map(|key| (*key, std::env::var(key).ok()))
+                .collect(),
+        }
+    }
+}
+
+impl Drop for EnvSnapshot {
+    fn drop(&mut self) {
+        for (key, value) in &self.values {
+            match value {
+                Some(value) => std::env::set_var(key, value),
+                None => std::env::remove_var(key),
+            }
+        }
+    }
+}
+
 #[test]
 fn non_mock_pipeline_requires_configured_reasoner() {
-    let _guard = env_lock().lock().expect("env lock");
-    for key in [
-        "METHODFIG_REASONER_API_KEY",
-        "METHODFIG_REASONER_MODEL",
-        "METHODFIG_CODER_API_KEY",
-        "METHODFIG_CODER_MODEL",
-        "METHODFIG_VISION_API_KEY",
-        "METHODFIG_VISION_MODEL",
-    ] {
-        std::env::remove_var(key);
+    let _guard = env_lock()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let _env_snapshot = EnvSnapshot::capture(MODEL_CONFIG_KEYS);
+    for key in MODEL_CONFIG_KEYS {
+        std::env::set_var(key, "");
     }
 
     let temp = tempfile::tempdir().expect("tempdir");
@@ -49,11 +80,14 @@ fn non_mock_pipeline_requires_configured_reasoner() {
 
 #[test]
 fn non_mock_pipeline_requires_configured_coder_before_api_calls() {
-    let _guard = env_lock().lock().expect("env lock");
+    let _guard = env_lock()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let _env_snapshot = EnvSnapshot::capture(MODEL_CONFIG_KEYS);
     std::env::set_var("METHODFIG_REASONER_API_KEY", "reasoner-key");
     std::env::set_var("METHODFIG_REASONER_MODEL", "reasoner-model");
-    std::env::remove_var("METHODFIG_CODER_API_KEY");
-    std::env::remove_var("METHODFIG_CODER_MODEL");
+    std::env::set_var("METHODFIG_CODER_API_KEY", "");
+    std::env::set_var("METHODFIG_CODER_MODEL", "");
     std::env::set_var("METHODFIG_VISION_API_KEY", "vision-key");
     std::env::set_var("METHODFIG_VISION_MODEL", "vision-model");
 
@@ -82,7 +116,10 @@ fn non_mock_pipeline_requires_configured_coder_before_api_calls() {
 
 #[test]
 fn non_mock_pipeline_enforces_cost_cap_before_external_calls() {
-    let _guard = env_lock().lock().expect("env lock");
+    let _guard = env_lock()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let _env_snapshot = EnvSnapshot::capture(MODEL_CONFIG_KEYS);
     std::env::set_var("METHODFIG_REASONER_API_KEY", "reasoner-key");
     std::env::set_var("METHODFIG_REASONER_MODEL", "reasoner-model");
     std::env::set_var("METHODFIG_CODER_API_KEY", "coder-key");

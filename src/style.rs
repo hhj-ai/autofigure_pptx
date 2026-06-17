@@ -125,9 +125,9 @@ fn base_style(name: StyleName, primary: &str, accent: &str, warning: &str) -> St
         },
         line_widths: LineWidths {
             auxiliary: 0.75,
-            normal: 1.0,
-            main_flow: 1.5,
-            strong_focus: 2.0,
+            normal: 1.25,
+            main_flow: 2.1,
+            strong_focus: 2.4,
         },
         corner_radius: CornerRadius {
             module: 0.12,

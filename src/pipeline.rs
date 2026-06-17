@@ -15,14 +15,16 @@ use crate::schema::{
 };
 use crate::style::style_by_name;
 use crate::tools::asset_gen::materialize_assets;
+use crate::tools::canonicalize::canonicalize_plan_for_render;
 use crate::tools::cost::{
     CostTracker, EST_CODER_USD, EST_IMAGE_ASSET_USD, EST_REASONER_INITIAL_USD,
     EST_REASONER_PATCH_USD, EST_VISION_USD,
 };
 use crate::tools::export::export_round;
-use crate::tools::render::{default_renderer_root, run_node_renderer};
-use crate::tools::review::review_passes_threshold;
-use crate::tools::validate::validate_plan_for_render;
+use crate::tools::pptx_codegen::generate_typescript;
+use crate::tools::render::{default_renderer_root, run_node_renderer_with_fallback};
+use crate::tools::review::{apply_plan_geometry_gate, apply_render_quality_gate};
+use crate::tools::validate::{normalize_plan_for_render, validate_plan_for_render};
 
 #[derive(Clone, Debug)]
 pub struct RunOptions {
@@ -109,6 +111,7 @@ pub fn run_pipeline(options: RunOptions) -> Result<PipelineResult> {
         &config,
         options.mock_models,
     )?;
+    let mut pending_patch: Option<PatchPlan> = None;
 
     for round_index in 0..options.max_iterations {
         if start.elapsed() > Duration::from_secs(u64::from(options.max_minutes) * 60) {
@@ -116,12 +119,14 @@ pub fn run_pipeline(options: RunOptions) -> Result<PipelineResult> {
             break;
         }
 
-        if round_index > 0 {
-            apply_patch_plan_to_figure(&mut plan);
+        if let Some(patch) = pending_patch.take() {
+            apply_patch_plan_to_figure(&mut plan, &patch);
         }
 
         let round_dir = options.out_dir.join(format!("round_{round_index:03}"));
         fs::create_dir_all(round_dir.join("assets"))?;
+        canonicalize_plan_for_render(&mut plan, options.image_provider);
+        normalize_plan_for_render(&mut plan);
         validate_plan_for_render(&plan, &style)?;
         write_json(&round_dir.join("figure_plan.json"), &plan)?;
 
@@ -159,8 +164,11 @@ pub fn run_pipeline(options: RunOptions) -> Result<PipelineResult> {
             &config,
             options.mock_models,
         )?;
-        run_node_renderer(
+        let fallback_code =
+            generate_typescript(&plan, &style, &round_dir, &renderer_root, &asset_paths)?;
+        run_node_renderer_with_fallback(
             &code,
+            &fallback_code,
             &round_dir,
             &renderer_root,
             options.renderer_timeout,
@@ -178,7 +186,8 @@ pub fn run_pipeline(options: RunOptions) -> Result<PipelineResult> {
         }
         let mut review =
             review_rendered_figure(&plan, &round_dir, &config, options.mock_models, round_index)?;
-        review.passed = review_passes_threshold(&review);
+        apply_plan_geometry_gate(&plan, &mut review);
+        apply_render_quality_gate(&mut review, &round_dir.join("layout_map.json"))?;
         write_json(&round_dir.join("review.json"), &review)?;
         best_round = Some((round_index, review.clone()));
 
@@ -209,6 +218,7 @@ pub fn run_pipeline(options: RunOptions) -> Result<PipelineResult> {
         }
         let patch = create_patch_plan(&plan, &review, &config, options.mock_models)?;
         write_json(&round_dir.join("patch_plan.json"), &patch)?;
+        pending_patch = Some(patch);
     }
 
     let (round_index, review) = best_round.ok_or_else(|| anyhow!("no round was produced"))?;

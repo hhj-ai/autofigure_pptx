@@ -122,6 +122,42 @@ pub fn run_node_renderer(
     }
 }
 
+pub fn run_node_renderer_with_fallback(
+    primary_code: &str,
+    fallback_code: &str,
+    round_dir: &Path,
+    renderer_root: &Path,
+    timeout: Duration,
+    allow_placeholder: bool,
+) -> Result<()> {
+    match run_node_renderer(
+        primary_code,
+        round_dir,
+        renderer_root,
+        timeout,
+        allow_placeholder,
+    ) {
+        Ok(()) => Ok(()),
+        Err(primary_error) => {
+            fs::create_dir_all(round_dir)?;
+            fs::write(
+                round_dir.join("figure.model_error.log"),
+                primary_error.to_string(),
+            )?;
+            run_node_renderer(
+                fallback_code,
+                round_dir,
+                renderer_root,
+                timeout,
+                allow_placeholder,
+            )
+            .with_context(|| {
+                format!("model-generated renderer failed, and deterministic fallback also failed; model error: {primary_error}")
+            })
+        }
+    }
+}
+
 fn run_with_timeout(command: &mut Command, _timeout: Duration) -> Result<std::process::Output> {
     let timeout = _timeout;
     let mut child = command.spawn().context("failed to run Node renderer")?;
