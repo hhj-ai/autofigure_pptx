@@ -1,0 +1,36 @@
+[package]
+name = "methodfig"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Paper method-overview figure compiler that outputs editable PPTX plus PDF/PNG."
+
+[lib]
+name = "methodfig"
+path = "src/lib.rs"
+
+[[bin]]
+name = "methodfig"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+async-trait = "0.1"
+base64 = "0.22"
+clap = { version = "4", features = ["derive"] }
+dotenvy = "0.15"
+image = { version = "0.25", default-features = false, features = ["png"] }
+mime_guess = "2"
+reqwest = { version = "0.12", features = ["json", "multipart", "rustls-tls"] }
+schemars = "0.8"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+thiserror = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+
+[dev-dependencies]
+tempfile = "3"

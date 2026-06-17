@@ -1,0 +1,23 @@
+# Local environment
+.env
+.env.*
+!.env.example
+
+# Rust build output
+/target/
+
+# Node dependencies and build output
+/renderer/node_modules/
+/renderer/dist/
+
+# Generated runs and exports
+/runs/
+
+# Local task notes
+/plan.md
+/goal.md
+/docs/plan.md
+/docs/goal.md
+
+# OS files
+.DS_Store
