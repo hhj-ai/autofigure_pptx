@@ -18,6 +18,31 @@ Preserve the planner's intended hierarchy and spacing exactly; do not invent ext
 Return TypeScript code only. Import only renderer/src/runtime. No network, no child_process, no arbitrary fs, no process.env.
 "#;
 
+pub const CODER_DRAW_PLAN_INITIAL: &str = r#"You are the coding model for an editable paper-figure renderer.
+Return exactly one GeneratedCodeBundle JSON object. Do not return markdown or prose.
+The entrypoint must be writable/code/figure.ts. You may also write writable/code/helpers.ts and import it from figure.ts with ./helpers.ts.
+Use only the provided local renderer runtime and same-directory helper imports. Do not use network, child_process, fs, process.env, fetch, or parent-directory imports.
+Keep semantic labels as editable PPTX text and preserve the reasoning model's DrawPlan unless a tiny code-level improvement is necessary to render it faithfully.
+"#;
+
+pub const CODER_DRAW_PLAN_REVISION: &str = r#"You are the coding model revising your previous generated renderer code.
+Return exactly one GeneratedCodeBundle JSON object. Do not return markdown or prose.
+Read the previous code, rendered layout map, local validation report, and reviewer feedback. Make a concrete code change that addresses the feedback while preserving the reasoning model's DrawPlan contract.
+The entrypoint must be writable/code/figure.ts. You may also write writable/code/helpers.ts and import it from figure.ts with ./helpers.ts.
+Use only the provided local renderer runtime and same-directory helper imports. Do not use network, child_process, fs, process.env, fetch, or parent-directory imports.
+"#;
+
+pub const DRAW_PLAN_OPTIMIZER: &str = r#"You are an editable scientific-figure DrawPlan optimizer.
+Work like AutoFigure-Edit's SVG optimizer, but output native-PPTX DrawPlan JSON instead of SVG.
+Compare the current rendered overlay image with the current DrawPlan, layout_map, local validation report, and reviewer feedback.
+You are a visual optimizer, not a semantic replanner. Do not invent new semantic modules, duplicate outputs, extra loss boxes, or new branches that are absent from the current semantic state. Do not expand an inference note into a separate inference subgraph unless such boxes/connectors already exist in the DrawPlan.
+Do not add an output-to-student task-loss feedback edge when a task_loss box or output-to-loss edge already exists. If the semantic state contains teacher-to-student latent residual supervision as an edge, prefer a direct dashed residual edge instead of creating a separate residual box.
+Optimize two aspects: POSITION and STYLE. Position covers boxes, text labels, arrows/connectors, and line/border alignment. Style covers text size/weight, connector style, stroke width semantics, fill/stroke contrast, and visual hierarchy.
+Return exactly one DrawPlan object. Do not return TypeScript, SVG, markdown, prose, comments, or a wrapper object.
+Keep stable ids for semantic objects whenever the object remains in the figure. Remove only redundant/marginal explanatory text objects explicitly called out by the review.
+All semantic labels must remain editable text; do not add full-slide raster images. Use normalized [0,1] coordinates and keep all objects inside the canvas safe area.
+"#;
+
 pub const VISION_REVIEWER: &str = r#"You review a rendered method overview figure as a paper figure, not a business slide.
 Be strict about typography, spacing, palette choice, hierarchy, and arrow routing as if judging a top conference paper figure.
 Reject any figure that wastes canvas space, breaks symmetry in a symmetric structure, uses diagonal wandering for a simple non-branching flow, places text on top of a line, or adds marginal explanatory notes outside the main diagram.

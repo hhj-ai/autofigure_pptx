@@ -2,8 +2,9 @@ export type NormalizedBox = [number, number, number, number];
 
 export interface LayoutObject {
   id: string;
-  kind: "component" | "edge" | "annotation" | "region";
+  kind: "component" | "edge" | "annotation" | "region" | "label" | "image";
   bbox: NormalizedBox;
+  points?: Array<[number, number]>;
 }
 
 export interface LayoutMap {

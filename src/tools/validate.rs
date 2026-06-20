@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use anyhow::{anyhow, Result};
 
 use crate::schema::FigurePlan;
@@ -8,6 +10,7 @@ const MIN_NORMALIZED_BOX_HEIGHT: f64 = 0.06;
 
 pub fn normalize_plan_for_render(plan: &mut FigurePlan) {
     normalize_editable_text(plan);
+    deduplicate_region_stable_ids(plan);
 
     if !plan.canvas.safe_margin.is_finite()
         || plan.canvas.safe_margin < 0.0
@@ -42,6 +45,79 @@ pub fn normalize_plan_for_render(plan: &mut FigurePlan) {
                 clamp_normalized_box(bbox)
             });
         }
+    }
+}
+
+fn deduplicate_region_stable_ids(plan: &mut FigurePlan) {
+    let mut used: HashSet<String> = plan
+        .components
+        .iter()
+        .map(|component| component.id.clone())
+        .chain(plan.edges.iter().map(|edge| edge.id.clone()))
+        .chain(
+            plan.annotations
+                .iter()
+                .map(|annotation| annotation.id.clone()),
+        )
+        .chain(plan.assets.iter().map(|asset| asset.id.clone()))
+        .collect();
+    let mut region_ids = HashSet::new();
+    let mut renames = Vec::new();
+
+    for (index, region) in plan.layout.regions.iter_mut().enumerate() {
+        let original = region.id.clone();
+        let needs_rename = original.trim().is_empty()
+            || used.contains(&original)
+            || region_ids.contains(&original);
+        if needs_rename {
+            let base = if original.trim().is_empty() {
+                format!("region_{index}")
+            } else {
+                format!("{}_region", sanitize_stable_id(&original))
+            };
+            region.id = unique_stable_id(&base, &used, &region_ids);
+            renames.push((original, region.id.clone()));
+        }
+        used.insert(region.id.clone());
+        region_ids.insert(region.id.clone());
+    }
+
+    for (old_id, new_id) in renames {
+        for component in &mut plan.components {
+            if component.region == old_id {
+                component.region = new_id.clone();
+            }
+        }
+    }
+}
+
+fn unique_stable_id(base: &str, used: &HashSet<String>, region_ids: &HashSet<String>) -> String {
+    let mut candidate = base.to_string();
+    let mut suffix = 2;
+    while used.contains(&candidate) || region_ids.contains(&candidate) {
+        candidate = format!("{base}_{suffix}");
+        suffix += 1;
+    }
+    candidate
+}
+
+fn sanitize_stable_id(value: &str) -> String {
+    let sanitized = value
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || character == '_' {
+                character.to_ascii_lowercase()
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>()
+        .trim_matches('_')
+        .to_string();
+    if sanitized.is_empty() {
+        "region".to_string()
+    } else {
+        sanitized
     }
 }
 

@@ -12,6 +12,8 @@
 
 # Generated runs and exports
 /runs/
+/outputs/
+/tmp/
 
 # Test and coverage artifacts
 /coverage/
@@ -21,12 +23,6 @@
 /tarpaulin-report.html
 /*.profraw
 /*.profdata
-
-# Local task notes
-/plan.md
-/goal.md
-/docs/plan.md
-/docs/goal.md
 
 # OS files
 .DS_Store

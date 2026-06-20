@@ -1,4 +1,5 @@
-use std::path::Path;
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, Context, Result};
 
@@ -6,16 +7,21 @@ use crate::config::AppConfig;
 use crate::llm::openai_compatible::OpenAiCompatibleProvider;
 use crate::llm::{ChatMessage, ChatProvider, ChatRequest};
 use crate::prompts::{
-    REASON_INITIAL_PLANNER, REASON_PATCH_PLANNER, TOP_TIER_FIGURE_DIRECTIVE, VISION_REVIEWER,
+    CODER_DRAW_PLAN_INITIAL, CODER_DRAW_PLAN_REVISION, DRAW_PLAN_OPTIMIZER, REASON_INITIAL_PLANNER,
+    REASON_PATCH_PLANNER, TOP_TIER_FIGURE_DIRECTIVE, VISION_REVIEWER,
 };
 use crate::schema::{
-    figure_plan_schema_json, patch_plan_schema_json, review_schema_json, CanvasAspect, FigurePlan,
-    LayoutRegion, PatchOperation, PatchOperationType, PatchPlan, PatchStopReason, Review,
-    StyleName, VisualWeight,
+    draw_plan_schema_json, figure_plan_schema_json, patch_plan_schema_json, review_schema_json,
+    validate_draw_plan, CanvasAspect, DrawObject, DrawPlan, FigurePlan, LayoutRegion,
+    PatchOperation, PatchOperationType, PatchPlan, PatchStopReason, Review, StyleName,
+    VisualWeight,
 };
 use crate::style::StyleSpec;
+use crate::tools::draw_plan::{generate_draw_plan_typescript, preserve_semantic_draw_objects};
+use crate::tools::generated_code::{normalize_generated_code_bundle, GeneratedCodeBundle};
 use crate::tools::pptx_codegen::generate_typescript;
 use crate::tools::render::scan_generated_typescript;
+use crate::tools::template_library::method_template_pack_json;
 
 pub fn validate_required_model_config(config: &AppConfig, mock_models: bool) -> Result<()> {
     if mock_models {
@@ -77,19 +83,23 @@ pub fn build_initial_plan_prompt(
     target_width_mm: u32,
 ) -> Result<String> {
     let schema = figure_plan_schema_json()?;
+    let method_templates = method_template_pack_json()?;
     Ok(format!(
         "Create exactly one FigurePlan object for the method below.\n\
 Return JSON only: no markdown, no prose, no schema wrapper, no comments.\n\
 Required top-level keys: version, canvas, story, layout, components, edges, annotations, assets, design.\n\
 Every stable id must be globally unique across layout.regions, components, edges, annotations, and assets; do not reuse a component id as an edge or asset id.\n\
 Set version to \"0.1\". Set canvas.aspect to \"{}\" and canvas.target_width_mm to {target_width_mm}.\n\
-Use design.style \"{}\". Keep generated assets small and local only; semantic labels must remain editable PPTX text.\n\n\
+Use design.style \"{}\". Keep generated assets small and local only; semantic labels must remain editable PPTX text.\n\
+Before creating the plan, apply method_templates.json selection_rules. If a rule matches the method, adapt its preferred template slots/flows as the layout grammar. Treat the matching rule's avoid list as hard anti-patterns unless the method explicitly requires them. Record the chosen template id in story.visual_focus or annotation text only if it helps the renderer; do not copy source artwork.\n\n\
 {}\n\n\
+method_templates.json:\n{}\n\n\
 FigurePlan JSON Schema:\n{schema}\n\n\
 Method Markdown:\n{method}",
         aspect_json_name(aspect),
         style_json_name(style),
-        TOP_TIER_FIGURE_DIRECTIVE
+        TOP_TIER_FIGURE_DIRECTIVE,
+        method_templates
     ))
 }
 
@@ -110,6 +120,351 @@ pub fn create_typescript_code(
     Ok(deterministic)
 }
 
+pub fn create_initial_code_bundle(
+    draw_plan: &DrawPlan,
+    style: &StyleSpec,
+    round_dir: &Path,
+    renderer_root: &Path,
+    asset_paths: &BTreeMap<String, PathBuf>,
+    config: &AppConfig,
+    mock_models: bool,
+) -> Result<GeneratedCodeBundle> {
+    let deterministic =
+        generate_draw_plan_typescript(draw_plan, style, round_dir, renderer_root, asset_paths)?;
+    if mock_models {
+        return Ok(GeneratedCodeBundle::single_figure(
+            deterministic,
+            "mock initial code generated from DrawPlan",
+        ));
+    }
+    if !config.coder.is_configured() {
+        return Err(anyhow!("coder model is not configured for generated code"));
+    }
+    let provider = OpenAiCompatibleProvider::new(config.coder.clone());
+    let request = ChatRequest {
+        temperature: 0.1,
+        messages: vec![
+            ChatMessage {
+                role: "system".to_string(),
+                content: CODER_DRAW_PLAN_INITIAL.to_string(),
+            },
+            ChatMessage {
+                role: "user".to_string(),
+                content: build_initial_code_prompt(
+                    draw_plan,
+                    style,
+                    renderer_root,
+                    asset_paths,
+                    &deterministic,
+                )?,
+            },
+        ],
+    };
+    code_bundle_or_draw_plan_runtime(deterministic, block_on(provider.complete(request)), "coder")
+}
+
+pub fn create_revised_code_bundle(
+    previous_code: &str,
+    draw_plan: &DrawPlan,
+    review: &Review,
+    layout_map: &str,
+    validation_report: &str,
+    style: &StyleSpec,
+    round_dir: &Path,
+    renderer_root: &Path,
+    asset_paths: &BTreeMap<String, PathBuf>,
+    config: &AppConfig,
+    mock_models: bool,
+    round_index: u32,
+) -> Result<GeneratedCodeBundle> {
+    let deterministic =
+        generate_draw_plan_typescript(draw_plan, style, round_dir, renderer_root, asset_paths)?;
+    if mock_models {
+        let feedback = review
+            .blocking_issues
+            .first()
+            .map(String::as_str)
+            .unwrap_or("mock revision after previous review");
+        return Ok(GeneratedCodeBundle::single_figure(
+            format!(
+                "// methodfig mock coder revision round {round_index}\n// feedback: {}\n{}",
+                sanitize_ts_comment(feedback),
+                deterministic
+            ),
+            "mock revised code generated from previous feedback",
+        ));
+    }
+    if !config.coder.is_configured() {
+        return Err(anyhow!("coder model is not configured for code revision"));
+    }
+    let provider = OpenAiCompatibleProvider::new(config.coder.clone());
+    let request = ChatRequest {
+        temperature: 0.1,
+        messages: vec![
+            ChatMessage {
+                role: "system".to_string(),
+                content: CODER_DRAW_PLAN_REVISION.to_string(),
+            },
+            ChatMessage {
+                role: "user".to_string(),
+                content: build_revised_code_prompt(
+                    previous_code,
+                    draw_plan,
+                    review,
+                    layout_map,
+                    validation_report,
+                    style,
+                    renderer_root,
+                    asset_paths,
+                    &deterministic,
+                )?,
+            },
+        ],
+    };
+    code_bundle_or_draw_plan_runtime(
+        deterministic,
+        block_on(provider.complete(request)),
+        "revised coder",
+    )
+}
+
+pub fn revise_draw_plan_from_feedback(
+    previous_draw_plan: &DrawPlan,
+    review: &Review,
+    layout_map: &str,
+    validation_report: &str,
+    overlay_path: &Path,
+    config: &AppConfig,
+    mock_models: bool,
+    round_index: u32,
+) -> Result<DrawPlan> {
+    if mock_models {
+        let revised = mock_revise_draw_plan(previous_draw_plan, round_index);
+        validate_draw_plan(&revised)?;
+        return Ok(revised);
+    }
+    if !config.vision.is_configured() {
+        return Err(anyhow!(
+            "vision model is not configured for DrawPlan optimization"
+        ));
+    }
+    let previous_draw_plan_json = serde_json::to_string_pretty(previous_draw_plan)?;
+    let review_json = serde_json::to_string_pretty(review)?;
+    let prompt = build_draw_plan_revision_prompt(
+        &previous_draw_plan_json,
+        layout_map,
+        &review_json,
+        validation_report,
+    )?;
+    let text = block_on(OpenAiCompatibleProvider::complete_vision(
+        config.vision.clone(),
+        DRAW_PLAN_OPTIMIZER,
+        &prompt,
+        overlay_path,
+    ))?;
+    let mut draw_plan: DrawPlan = serde_json::from_str(strip_json_fence(&text))
+        .with_context(|| "DrawPlan optimizer did not return valid DrawPlan JSON")?;
+    preserve_semantic_draw_objects(previous_draw_plan, &mut draw_plan);
+    validate_draw_plan(&draw_plan)?;
+    Ok(draw_plan)
+}
+
+pub fn build_draw_plan_revision_prompt(
+    previous_draw_plan_json: &str,
+    layout_map: &str,
+    review_json: &str,
+    validation_report_json: &str,
+) -> Result<String> {
+    let schema = draw_plan_schema_json()?;
+    let method_templates = method_template_pack_json()?;
+    Ok(format!(
+        "Revise the editable primitive DrawPlan for the next round.\n\
+Return exactly one DrawPlan object. Do not return TypeScript, SVG, markdown, prose, comments, or a schema wrapper.\n\
+The current rendered overlay image is attached. Treat it like AutoFigure-Edit's optimizer evidence: compare the visual overlay, layout_map coordinates, local validation errors, reviewer feedback, and current DrawPlan code/state.\n\n\
+You are allowed to make substantial layout changes when the current figure is weak. First apply method_templates.json selection_rules, then adapt the preferred template slots/flows over preserving a bad local layout. Treat the matching rule's avoid list as hard anti-patterns: if the current figure contains one, remove or redesign it instead of merely moving it. These templates are derived from extracted PDF/SVG method-overview figures from classic papers. Use them as editable layout grammar only; do not copy the source figure artwork or paste a full-page raster.\n\n\
+You are a visual optimizer, not a semantic replanner. Do not invent new semantic modules, duplicate outputs, extra loss boxes, or new branches that are absent from the current semantic state. Do not expand an inference note into a separate inference subgraph unless such boxes/connectors already exist in the DrawPlan.\n\n\
+Do not add an output-to-student task-loss feedback edge when a task_loss box or output-to-loss edge already exists. If the semantic state contains teacher-to-student latent residual supervision as an edge, prefer a direct dashed residual edge instead of creating a separate residual box.\n\n\
+Please carefully compare and optimize these TWO MAJOR ASPECTS:\n\
+## ASPECT 1: POSITION\n\
+1. Components and groups: resize oversized empty boxes and move crowded items into clean whitespace.\n\
+2. Text positions: move labels away from connector strokes and away from other labels.\n\
+3. Arrows and connectors: use orthogonal or clean polyline routes for non-branching flows; avoid diagonal wandering.\n\
+4. Lines and borders: align starts/ends to box edges and avoid overlaps.\n\n\
+## ASPECT 2: STYLE\n\
+5. Component hierarchy: keep the main contribution visually strongest without huge empty containers.\n\
+6. Text style: keep labels short, readable at paper width, and editable.\n\
+7. Arrow style: preserve semantic styles such as dashed supervision and solid data flow.\n\
+8. Line/border style: keep restrained high-contrast WPS-friendly styling.\n\n\
+Keep stable ids for objects that remain semantic parts of the figure. Remove only redundant or marginal explanatory text objects explicitly flagged by the review.\n\
+All bbox values and connector points must be normalized [0,1]. Keep objects inside the canvas safe area.\n\
+Do not add full-slide raster images; semantic content must remain native shapes/text/connectors.\n\n\
+DrawPlan JSON Schema:\n{schema}\n\n\
+method_templates.json:\n{method_templates}\n\n\
+Current DrawPlan JSON:\n{previous_draw_plan_json}\n\n\
+layout_map.json:\n{layout_map}\n\n\
+Review JSON:\n{review_json}\n\n\
+validation_report.json:\n{validation_report_json}"
+    ))
+}
+
+fn build_initial_code_prompt(
+    draw_plan: &DrawPlan,
+    style: &StyleSpec,
+    renderer_root: &Path,
+    asset_paths: &BTreeMap<String, PathBuf>,
+    deterministic_code: &str,
+) -> Result<String> {
+    let method_templates = method_template_pack_json()?;
+    Ok(format!(
+        "Return a GeneratedCodeBundle JSON object for this figure renderer.\n\
+Allowed paths are writable/code/figure.ts and writable/code/helpers.ts. Include writable/code/figure.ts.\n\
+method_templates.json is provided as layout evidence derived from extracted PDF/SVG figures. Do not copy those source figures; render the current DrawPlan as native PPTX shapes/text/connectors.\n\
+GeneratedCodeBundle JSON Schema:\n{}\n\n\
+Renderer runtime path:\n{}\n\n\
+method_templates.json:\n{}\n\n\
+StyleSpec JSON:\n{}\n\n\
+Asset paths JSON:\n{}\n\n\
+DrawPlan JSON:\n{}\n\n\
+Reference code that already renders the DrawPlan; you may improve structure, helper extraction, and small renderer-level choices but must keep the same output contract:\n```ts\n{}\n```",
+        GeneratedCodeBundle::schema_json()?,
+        renderer_root.join("src/runtime.ts").display(),
+        method_templates,
+        serde_json::to_string_pretty(style)?,
+        serde_json::to_string_pretty(asset_paths)?,
+        serde_json::to_string_pretty(draw_plan)?,
+        deterministic_code
+    ))
+}
+
+fn build_revised_code_prompt(
+    previous_code: &str,
+    draw_plan: &DrawPlan,
+    review: &Review,
+    layout_map: &str,
+    validation_report: &str,
+    style: &StyleSpec,
+    renderer_root: &Path,
+    asset_paths: &BTreeMap<String, PathBuf>,
+    deterministic_code: &str,
+) -> Result<String> {
+    let method_templates = method_template_pack_json()?;
+    Ok(format!(
+        "Revise the generated renderer code. Return a GeneratedCodeBundle JSON object only.\n\
+Allowed paths are writable/code/figure.ts and writable/code/helpers.ts. Include writable/code/figure.ts.\n\
+method_templates.json is provided as layout evidence derived from extracted PDF/SVG figures. Do not copy those source figures; implement the current DrawPlan as native PPTX shapes/text/connectors.\n\
+GeneratedCodeBundle JSON Schema:\n{}\n\n\
+Renderer runtime path:\n{}\n\n\
+method_templates.json:\n{}\n\n\
+StyleSpec JSON:\n{}\n\n\
+Asset paths JSON:\n{}\n\n\
+Current DrawPlan JSON:\n{}\n\n\
+Previous figure.ts:\n```ts\n{}\n```\n\n\
+Previous review JSON:\n{}\n\n\
+Previous layout_map.json:\n{}\n\n\
+Previous validation_report.json:\n{}\n\n\
+Reference code that renders the current DrawPlan if the previous code is too broken:\n```ts\n{}\n```",
+        GeneratedCodeBundle::schema_json()?,
+        renderer_root.join("src/runtime.ts").display(),
+        method_templates,
+        serde_json::to_string_pretty(style)?,
+        serde_json::to_string_pretty(asset_paths)?,
+        serde_json::to_string_pretty(draw_plan)?,
+        previous_code,
+        serde_json::to_string_pretty(review)?,
+        layout_map,
+        validation_report,
+        deterministic_code
+    ))
+}
+
+fn parse_generated_code_bundle_text(text: &str) -> Result<GeneratedCodeBundle> {
+    let bundle: GeneratedCodeBundle = serde_json::from_str(strip_json_fence(text))?;
+    normalize_generated_code_bundle(&bundle)
+}
+
+pub fn code_bundle_or_draw_plan_runtime(
+    deterministic_code: String,
+    coder_result: Result<String>,
+    context: &str,
+) -> Result<GeneratedCodeBundle> {
+    match coder_result {
+        Ok(text) => parse_generated_code_bundle_text(&text).or_else(|error| {
+            Ok(GeneratedCodeBundle::single_figure(
+                deterministic_code,
+                format!(
+                    "{context} returned unusable output; deterministic DrawPlan runtime used: {error}"
+                ),
+            ))
+        }),
+        Err(error) => Ok(GeneratedCodeBundle::single_figure(
+            deterministic_code,
+            format!("{context} failed; deterministic DrawPlan runtime used: {error}"),
+        )),
+    }
+}
+
+fn mock_revise_draw_plan(previous_draw_plan: &DrawPlan, round_index: u32) -> DrawPlan {
+    let mut revised = previous_draw_plan.clone();
+    revised
+        .objects
+        .retain(|object| !matches!(object, DrawObject::Text { id, .. } if id.starts_with("a_")));
+
+    for object in &mut revised.objects {
+        match object {
+            DrawObject::Box { id, bbox, .. } => {
+                if id == "inference_tag" {
+                    *bbox = [0.72, 0.72, 0.94, 0.80];
+                } else if box_height(*bbox) > 0.48 {
+                    *bbox = shrink_box_height(*bbox, 0.34);
+                }
+            }
+            DrawObject::Connector { points, label, .. } => {
+                if points.len() == 2 && points[0][0] != points[1][0] && points[0][1] != points[1][1]
+                {
+                    let start = points[0];
+                    let end = points[1];
+                    points.insert(1, [end[0], start[1]]);
+                }
+                if let Some(label) = label {
+                    label.bbox = offset_label_box(label.bbox, round_index);
+                }
+            }
+            DrawObject::Text { bbox, .. } => {
+                *bbox = clamp_bbox(*bbox);
+            }
+            DrawObject::Image { bbox, .. } | DrawObject::Group { bbox, .. } => {
+                *bbox = clamp_bbox(*bbox);
+            }
+        }
+    }
+    revised
+}
+
+fn offset_label_box(bbox: [f64; 4], round_index: u32) -> [f64; 4] {
+    let dy = 0.08 + f64::from(round_index.min(3)) * 0.01;
+    clamp_bbox([bbox[0], bbox[1] - dy, bbox[2], bbox[3] - dy])
+}
+
+fn shrink_box_height(bbox: [f64; 4], target_height: f64) -> [f64; 4] {
+    let [x1, y1, x2, y2] = clamp_bbox(bbox);
+    let center_y = (y1 + y2) / 2.0;
+    let half = target_height / 2.0;
+    clamp_bbox([x1, center_y - half, x2, center_y + half])
+}
+
+fn clamp_bbox(bbox: [f64; 4]) -> [f64; 4] {
+    let x1 = bbox[0].clamp(0.0, 1.0);
+    let y1 = bbox[1].clamp(0.0, 1.0);
+    let x2 = bbox[2].clamp(0.0, 1.0);
+    let y2 = bbox[3].clamp(0.0, 1.0);
+    [x1.min(x2), y1.min(y2), x1.max(x2), y1.max(y2)]
+}
+
+fn box_height(bbox: [f64; 4]) -> f64 {
+    let bbox = clamp_bbox(bbox);
+    bbox[3] - bbox[1]
+}
+
 pub fn review_rendered_figure(
     plan: &FigurePlan,
     round_dir: &Path,
@@ -124,9 +479,11 @@ pub fn review_rendered_figure(
         return Err(anyhow!("vision model is not configured; set METHODFIG_VISION_API_KEY and METHODFIG_VISION_MODEL or use --mock-models"));
     }
     let plan_json = serde_json::to_string_pretty(plan)?;
+    let draw_plan_json = std::fs::read_to_string(round_dir.join("draw_plan.json"))
+        .unwrap_or_else(|_| "{}".to_string());
     let layout_map = std::fs::read_to_string(round_dir.join("layout_map.json"))
         .unwrap_or_else(|_| "{}".to_string());
-    let user_text = build_review_prompt(&plan_json, &layout_map)?;
+    let user_text = build_review_prompt(&plan_json, &draw_plan_json, &layout_map)?;
     let image_path = round_dir.join(format!(
         "figure_{}mm_preview.png",
         plan.canvas.target_width_mm
@@ -138,7 +495,7 @@ pub fn review_rendered_figure(
         &image_path,
     ))?;
     let review = parse_review_text(&text).or_else(|first_error| {
-        let retry_user_text = build_review_retry_prompt(&plan_json, &layout_map)?;
+        let retry_user_text = build_review_retry_prompt(&plan_json, &draw_plan_json, &layout_map)?;
         let retry_text = block_on(OpenAiCompatibleProvider::complete_vision(
             config.vision.clone(),
             VISION_REVIEWER,
@@ -154,28 +511,46 @@ pub fn review_rendered_figure(
     Ok(review)
 }
 
-pub fn build_review_prompt(plan_json: &str, layout_map: &str) -> Result<String> {
+pub fn build_review_prompt(
+    plan_json: &str,
+    draw_plan_json: &str,
+    layout_map: &str,
+) -> Result<String> {
     let schema = review_schema_json()?;
     Ok(format!(
         "Review this paper method figure. Return exactly one Review object.\n\
 Return JSON only: no markdown, no prose, no comments.\n\
 Scores must include every field from the schema, including semantic_fidelity and wps_editability, each as an integer from 1 to 10.\n\
 Keep string values short and do not embed quotation marks inside string content.\n\n\
+DrawPlan is the rendered source of truth for visible editable objects. Use FigurePlan for semantic intent, but judge object presence, removal, routing, and placement against DrawPlan and layout_map.\n\
+Do not report FigurePlan annotations as missing when they are absent from DrawPlan; assume redundant or marginal annotations may be intentionally removed before rendering.\n\n\
+Respect PDF-derived template reading order when FigurePlan/layout_map clearly follows a classic method-overview grammar. For example, a SimCLR-style bottom-center source branching upward to two paths and an upper alignment objective is acceptable; do not penalize it solely for not being top-down. Penalize only if arrows or spacing make that reading order unclear.\n\n\
+For wps_editability, inspect DrawPlan/layout_map rather than guessing from the PNG. If the visible semantic figure is composed of native boxes, text, and connectors with no full-slide raster image, assign wps_editability 9 or 10 unless there is concrete evidence of non-editable text, missing objects, or invalid geometry.\n\n\
 Review JSON Schema:\n{schema}\n\n\
 FigurePlan:\n{plan_json}\n\n\
+DrawPlan:\n{draw_plan_json}\n\n\
 layout_map.json:\n{layout_map}"
     ))
 }
 
-pub fn build_review_retry_prompt(plan_json: &str, layout_map: &str) -> Result<String> {
+pub fn build_review_retry_prompt(
+    plan_json: &str,
+    draw_plan_json: &str,
+    layout_map: &str,
+) -> Result<String> {
     let schema = review_schema_json()?;
     Ok(format!(
         "The previous answer was not valid JSON. Return the same Review object again.\n\
 Return strict JSON only: no markdown, no prose, no comments, and no code fences.\n\
 Keep each string value short and avoid embedded quotation marks inside the text.\n\
 Scores must include every field from the schema, including semantic_fidelity and wps_editability, each as an integer from 1 to 10.\n\n\
+DrawPlan is the rendered source of truth for visible editable objects. Use FigurePlan for semantic intent, but judge object presence, removal, routing, and placement against DrawPlan and layout_map.\n\
+Do not report FigurePlan annotations as missing when they are absent from DrawPlan.\n\n\
+Respect PDF-derived template reading order when FigurePlan/layout_map clearly follows a classic method-overview grammar, including a SimCLR-style bottom-center source branching upward to two paths and an upper alignment objective. Penalize only if arrows or spacing make that reading order unclear.\n\n\
+For wps_editability, inspect DrawPlan/layout_map rather than guessing from the PNG. If the visible semantic figure is composed of native boxes, text, and connectors with no full-slide raster image, assign wps_editability 9 or 10 unless there is concrete evidence of non-editable text, missing objects, or invalid geometry.\n\n\
 Review JSON Schema:\n{schema}\n\n\
 FigurePlan:\n{plan_json}\n\n\
+DrawPlan:\n{draw_plan_json}\n\n\
 layout_map.json:\n{layout_map}"
     ))
 }
@@ -598,6 +973,12 @@ fn strip_json_fence(text: &str) -> &str {
 fn parse_review_text(text: &str) -> Result<Review> {
     serde_json::from_str(strip_json_fence(text))
         .with_context(|| "vision model did not return valid Review JSON")
+}
+
+fn sanitize_ts_comment(text: &str) -> String {
+    text.replace('\n', " ")
+        .replace('\r', " ")
+        .replace("*/", "* /")
 }
 
 fn aspect_json_name(aspect: CanvasAspect) -> &'static str {

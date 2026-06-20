@@ -1,4 +1,4 @@
-use methodfig::schema::{CanvasAspect, FigurePlan, StyleName};
+use methodfig::schema::{validate_stable_ids, CanvasAspect, FigurePlan, StyleName};
 use methodfig::tools::validate::normalize_plan_for_render;
 
 #[test]
@@ -57,4 +57,23 @@ fn converts_literal_backslash_n_in_editable_labels_to_real_line_breaks() {
     assert_eq!(plan.components[0].label, "Teacher\n(Large LM)");
     assert_eq!(plan.edges[0].label, "latent\nsupervision");
     assert_eq!(plan.annotations[0].label, "Training\nphase");
+}
+
+#[test]
+fn normalizes_duplicate_region_component_ids_and_updates_references() {
+    let mut plan = FigurePlan::mock_from_method(
+        "Teacher guides student with latent residuals.",
+        StyleName::WpsClean,
+        CanvasAspect::PaperWide,
+        85,
+    );
+    plan.layout.regions[0].id = "teacher".to_string();
+    plan.components[0].id = "teacher".to_string();
+    plan.components[0].region = "teacher".to_string();
+
+    normalize_plan_for_render(&mut plan);
+
+    assert_ne!(plan.layout.regions[0].id, "teacher");
+    assert_eq!(plan.components[0].region, plan.layout.regions[0].id);
+    validate_stable_ids(&plan).expect("normalization should remove duplicate stable ids");
 }

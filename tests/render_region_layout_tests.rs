@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::process::Command;
 use std::time::Duration;
 
 use methodfig::schema::{
@@ -6,6 +7,7 @@ use methodfig::schema::{
     FigurePlan, LayoutRegion, StyleName, VisualWeight,
 };
 use methodfig::style::style_by_name;
+use methodfig::tools::draw_plan::generate_draw_plan_typescript;
 use methodfig::tools::pptx_codegen::generate_typescript;
 use methodfig::tools::render::{default_renderer_root, run_node_renderer};
 
@@ -195,6 +197,97 @@ fn renderer_tracks_large_muted_caption_component_as_annotation() {
     let bbox = object_bbox_any_kind(&layout_map, "c_inference_label");
     assert!(bbox[2] - bbox[0] <= 0.35, "{bbox:?} is too wide");
     assert!(bbox[3] - bbox[1] <= 0.12, "{bbox:?} is too tall");
+}
+
+#[test]
+fn draw_plan_renderer_draws_connector_labels_above_boxes() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let round_dir = temp.path().join("round_000");
+    let renderer_root = default_renderer_root().expect("renderer root");
+    let style = style_by_name(StyleName::WpsClean);
+    let draw_plan = methodfig::schema::DrawPlan {
+        version: "0.2".to_string(),
+        canvas: methodfig::schema::Canvas {
+            aspect: CanvasAspect::PaperWide,
+            target_width_mm: 85,
+            safe_margin: 0.06,
+        },
+        style_tokens: BTreeMap::new(),
+        objects: vec![
+            methodfig::schema::DrawObject::Connector {
+                id: "e1".to_string(),
+                points: vec![[0.1, 0.5], [0.9, 0.5]],
+                from: None,
+                to: None,
+                style: "main_flow".to_string(),
+                label: Some(methodfig::schema::DrawLabel {
+                    text: "label".to_string(),
+                    bbox: [0.42, 0.46, 0.58, 0.54],
+                }),
+                z: 10,
+            },
+            methodfig::schema::DrawObject::Box {
+                id: "b1".to_string(),
+                bbox: [0.35, 0.35, 0.65, 0.65],
+                text: "Box".to_string(),
+                role: "main".to_string(),
+                style: "primary_module".to_string(),
+                z: 20,
+            },
+        ],
+    };
+    let code = generate_draw_plan_typescript(
+        &draw_plan,
+        &style,
+        &round_dir,
+        &renderer_root,
+        &BTreeMap::new(),
+    )
+    .expect("draw plan code should generate");
+
+    run_node_renderer(
+        &code,
+        &round_dir,
+        &renderer_root,
+        Duration::from_secs(20),
+        false,
+    )
+    .expect("renderer should complete");
+
+    let slide_xml = Command::new("unzip")
+        .arg("-p")
+        .arg(round_dir.join("figure.pptx"))
+        .arg("ppt/slides/slide1.xml")
+        .output()
+        .expect("unzip should run");
+    assert!(slide_xml.status.success());
+    let slide_xml = String::from_utf8(slide_xml.stdout).expect("slide xml should be utf8");
+    let box_index = slide_xml
+        .find(">Box<")
+        .expect("box text should be in slide xml");
+    let label_index = slide_xml
+        .find(">label<")
+        .expect("label text should be in slide xml");
+    assert!(
+        label_index > box_index,
+        "edge label should be drawn after boxes so it stays visible"
+    );
+
+    let layout_map: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(round_dir.join("layout_map.json")).expect("layout map should exist"),
+    )
+    .expect("layout map should parse");
+    let edge = layout_map["objects"]
+        .as_array()
+        .expect("objects is array")
+        .iter()
+        .find(|object| object["id"] == "e1" && object["kind"] == "edge")
+        .expect("edge layout entry exists");
+    assert_eq!(
+        edge["points"],
+        serde_json::json!([[0.1, 0.5], [0.9, 0.5]]),
+        "DrawPlan renderer should preserve connector points for local geometry gates"
+    );
 }
 
 fn object_bbox(layout_map: &serde_json::Value, id: &str) -> [f64; 4] {

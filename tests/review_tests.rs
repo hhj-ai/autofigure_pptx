@@ -84,7 +84,43 @@ fn render_quality_gate_flags_label_overlap_and_low_utilization() {
 }
 
 #[test]
-fn plan_geometry_gate_rejects_diagonal_simple_chain_and_corner_annotations() {
+fn render_quality_gate_uses_polyline_points_for_edge_crossing() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let layout_map = temp.path().join("layout_map.json");
+    std::fs::write(
+        &layout_map,
+        serde_json::json!({
+            "canvas": {"width": 7.1, "height": 3.2, "aspect": "paper-wide", "target_width_mm": 85},
+            "objects": [
+                {
+                    "id": "vertical",
+                    "kind": "edge",
+                    "bbox": [0.68, 0.58, 0.68, 0.72],
+                    "points": [[0.68, 0.58], [0.68, 0.72]]
+                },
+                {
+                    "id": "elbow",
+                    "kind": "edge",
+                    "bbox": [0.52, 0.50, 0.82, 0.735],
+                    "points": [[0.52, 0.735], [0.62, 0.735], [0.62, 0.535], [0.74, 0.535], [0.74, 0.50], [0.82, 0.50]]
+                }
+            ]
+        })
+        .to_string(),
+    )
+    .expect("layout map");
+
+    let issues = render_quality_issues(&layout_map).expect("quality gate should read layout map");
+
+    assert!(
+        !issues.iter().any(|issue| issue.contains("edge crossing")),
+        "polyline segments do not cross; the edge bbox diagonal must not be used as geometry: {issues:?}"
+    );
+}
+
+#[test]
+fn plan_geometry_gate_rejects_diagonal_simple_chain_without_treating_annotations_as_source_of_truth(
+) {
     let mut plan = methodfig::schema::FigurePlan::mock_from_method(
         "Teacher guides student with latent residuals.",
         StyleName::WpsClean,
@@ -122,10 +158,13 @@ fn plan_geometry_gate_rejects_diagonal_simple_chain_and_corner_annotations() {
         .blocking_issues
         .iter()
         .any(|issue| issue.contains("simple chain should read horizontally or vertically")));
-    assert!(review
-        .blocking_issues
-        .iter()
-        .any(|issue| issue.contains("annotation ann_corner sits outside the main figure area")));
+    assert!(
+        !review
+            .blocking_issues
+            .iter()
+            .any(|issue| issue.contains("annotation ann_corner sits outside the main figure area")),
+        "FigurePlan annotations are not rendered source-of-truth after DrawPlan repair"
+    );
 }
 
 #[test]

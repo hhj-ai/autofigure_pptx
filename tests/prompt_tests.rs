@@ -1,5 +1,6 @@
 use methodfig::agent::{
-    build_initial_plan_prompt, build_patch_prompt, build_review_prompt, build_review_retry_prompt,
+    build_draw_plan_revision_prompt, build_initial_plan_prompt, build_patch_prompt,
+    build_review_prompt, build_review_retry_prompt,
 };
 use methodfig::prompts::{TOP_TIER_FIGURE_DIRECTIVE, VISION_REVIEWER};
 use methodfig::schema::{CanvasAspect, StyleName};
@@ -24,30 +25,55 @@ fn initial_plan_prompt_includes_schema_and_required_top_level_keys() {
     assert!(prompt.contains("high space utilization"));
     assert!(prompt.contains("Never let text cover lines or arrows"));
     assert!(prompt.contains(TOP_TIER_FIGURE_DIRECTIVE));
+    assert!(prompt.contains("method_templates.json"));
+    assert!(prompt.contains("simclr_contrastive_y_branch"));
+    assert!(prompt.contains("unet_skip_encoder_decoder"));
+    assert!(prompt.contains("selection_rules"));
+    assert!(prompt.contains("teacher_student_distillation"));
+    assert!(prompt.contains("teacher and student as two correlated branches"));
+    assert!(prompt.contains("avoid list as hard anti-patterns"));
+    assert!(prompt.contains("bottom-heavy separate inference lane"));
+    assert!(prompt.contains("standalone inference note component"));
+    assert!(prompt.contains("connector-overlapping labels"));
 }
 
 #[test]
 fn review_prompt_includes_schema_and_all_score_fields() {
-    let prompt = build_review_prompt("{\"version\":\"0.1\"}", "{\"objects\":[]}")
-        .expect("review prompt should build");
+    let prompt = build_review_prompt(
+        "{\"version\":\"0.1\"}",
+        "{\"version\":\"0.2\",\"objects\":[]}",
+        "{\"objects\":[]}",
+    )
+    .expect("review prompt should build");
 
     assert!(prompt.contains("\"Review\""));
     assert!(prompt.contains("semantic_fidelity"));
     assert!(prompt.contains("wps_editability"));
     assert!(prompt.contains("Return exactly one Review object"));
+    assert!(prompt.contains("DrawPlan is the rendered source of truth"));
+    assert!(prompt.contains("Do not report FigurePlan annotations as missing"));
+    assert!(prompt.contains("PDF-derived template reading order"));
+    assert!(prompt.contains("bottom-center source"));
+    assert!(prompt.contains("native boxes, text, and connectors"));
+    assert!(prompt.contains("wps_editability 9 or 10"));
     assert!(prompt.contains("do not embed quotation marks"));
     assert!(!prompt.contains(TOP_TIER_FIGURE_DIRECTIVE));
 }
 
 #[test]
 fn review_retry_prompt_is_strict_about_json_only_output() {
-    let prompt = build_review_retry_prompt("{\"version\":\"0.1\"}", "{\"objects\":[]}")
-        .expect("retry prompt should build");
+    let prompt = build_review_retry_prompt(
+        "{\"version\":\"0.1\"}",
+        "{\"version\":\"0.2\",\"objects\":[]}",
+        "{\"objects\":[]}",
+    )
+    .expect("retry prompt should build");
 
     assert!(prompt.contains("not valid JSON"));
     assert!(prompt.contains("strict JSON only"));
     assert!(prompt.contains("avoid embedded quotation marks"));
     assert!(prompt.contains("semantic_fidelity"));
+    assert!(prompt.contains("DrawPlan is the rendered source of truth"));
 }
 
 #[test]
@@ -70,4 +96,43 @@ fn vision_reviewer_mentions_the_new_hard_constraints() {
     assert!(VISION_REVIEWER.contains("Reject any figure that wastes canvas space"));
     assert!(VISION_REVIEWER.contains("text on top of a line"));
     assert!(VISION_REVIEWER.contains("marginal explanatory notes"));
+}
+
+#[test]
+fn draw_plan_revision_prompt_uses_autofigure_style_visual_optimization_contract() {
+    let prompt = build_draw_plan_revision_prompt(
+        "{\"version\":\"0.2\",\"objects\":[]}",
+        "{\"objects\":[]}",
+        "{\"passed\":false}",
+        "{\"errors\":[\"label overlaps edge\"]}",
+    )
+    .expect("draw plan revision prompt should build");
+
+    assert!(prompt.contains("\"DrawPlan\""));
+    assert!(prompt.contains("Return exactly one DrawPlan object"));
+    assert!(prompt.contains("current rendered overlay image"));
+    assert!(prompt.contains("POSITION"));
+    assert!(prompt.contains("STYLE"));
+    assert!(prompt.contains("Text positions"));
+    assert!(prompt.contains("Arrows"));
+    assert!(prompt.contains("Keep stable ids"));
+    assert!(prompt.contains("visual optimizer, not a semantic replanner"));
+    assert!(prompt.contains("Do not invent new semantic modules"));
+    assert!(prompt.contains("Do not expand an inference note"));
+    assert!(prompt.contains("Do not add an output-to-student task-loss feedback edge"));
+    assert!(prompt.contains("prefer a direct dashed residual edge"));
+    assert!(prompt.contains("Do not return TypeScript"));
+    assert!(prompt.contains("method_templates.json"));
+    assert!(prompt.contains("simclr_contrastive_y_branch"));
+    assert!(prompt.contains("unet_skip_encoder_decoder"));
+    assert!(prompt.contains("derived from extracted PDF/SVG"));
+    assert!(prompt.contains("selection_rules"));
+    assert!(prompt.contains("teacher_student_distillation"));
+    assert!(prompt.contains("teacher and student as two correlated branches"));
+    assert!(prompt.contains("avoid list as hard anti-patterns"));
+    assert!(prompt.contains("remove or redesign it instead of merely moving it"));
+    assert!(prompt.contains("bottom-heavy separate inference lane"));
+    assert!(prompt.contains("standalone inference note component"));
+    assert!(prompt.contains("asymmetric branch annotations"));
+    assert!(prompt.contains("connector-overlapping labels"));
 }

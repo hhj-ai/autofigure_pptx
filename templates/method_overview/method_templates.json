@@ -1,0 +1,232 @@
+{
+  "version": "0.1",
+  "purpose": "Classic paper method-overview templates derived from PDF/SVG extraction. These are abstract layout templates, not copied figure artwork.",
+  "copyright_policy": "Do not paste the extracted source figure as a full-slide image. Use the slots, flows, and visual grammar as editable native PPTX shapes/text/connectors.",
+  "selection_rules": [
+    {
+      "id": "teacher_student_distillation",
+      "when_method_mentions": ["teacher", "student", "distillation", "residual"],
+      "prefer_template": "simclr_contrastive_y_branch",
+      "adaptation": "Treat the shared training input as the SimCLR source, teacher and student as two correlated branches, latent residual or distillation loss as the agreement objective, and inference-only student as a compact post-training note or side output instead of a bottom-heavy separate lane.",
+      "avoid": [
+        "bottom-heavy separate inference lane",
+        "residual as standalone node",
+        "floating phase labels",
+        "long input detours",
+        "standalone inference note component",
+        "asymmetric branch annotations",
+        "connector-overlapping labels"
+      ]
+    },
+    {
+      "id": "encoder_decoder_skip_architecture",
+      "when_method_mentions": ["encoder", "decoder", "skip", "multi-scale"],
+      "prefer_template": "unet_skip_encoder_decoder",
+      "adaptation": "Map contracting modules to encoder stages, bottleneck or latent state to the center valley, expanding modules to decoder stages, and long feature reuse edges to subdued skip connections."
+    },
+    {
+      "id": "diffusion_or_iterative_refinement",
+      "when_method_mentions": ["diffusion", "denoise", "reverse process", "iterative refinement"],
+      "prefer_template": "ddpm_bidirectional_chain",
+      "adaptation": "Use state nodes along a horizontal chain, separate fixed forward/noising references from learned reverse/refinement arrows by style, and keep any thumbnails as small local assets only."
+    },
+    {
+      "id": "stacked_attention_or_seq2seq",
+      "when_method_mentions": ["attention", "transformer", "encoder-decoder", "cross attention"],
+      "prefer_template": "transformer_encoder_decoder_stack",
+      "adaptation": "Use stacked grouped modules with a bridge into the decoder side; collapse repeated layers into grouped blocks for 85 mm paper-width readability."
+    }
+  ],
+  "templates": [
+    {
+      "id": "simclr_contrastive_y_branch",
+      "name": "Two-view contrastive Y-branch",
+      "best_for": ["contrastive_learning", "teacher_student_pairs", "dual_view_training", "positive_pair_alignment"],
+      "source": {
+        "paper": "A Simple Framework for Contrastive Learning of Visual Representations",
+        "authors": "Ting Chen, Simon Kornblith, Mohammad Norouzi, Geoffrey Hinton",
+        "year": 2020,
+        "figure": "Figure 2",
+        "pdf_url": "https://arxiv.org/pdf/2002.05709"
+      },
+      "extraction": {
+        "page": 2,
+        "local_pdf": "tmp/pdfs/method_templates/simclr.pdf",
+        "local_svg": "tmp/pdfs/method_templates/svg/simclr_page2.svg",
+        "source_svg_sha256": "5e6f3182fb7420e9cf8821121f59c554abb835867b0d1bfd083658efb1842a24",
+        "source_svg_bytes": 1103539,
+        "embedded_bitmap_count": 0,
+        "derived_from_pdf_vector_page": true,
+        "figure_bbox_page_norm": [0.53, 0.07, 0.89, 0.32],
+        "svg_object_counts": {"path": 967, "rect": 1, "image": 0, "use": 4156}
+      },
+      "layout_pattern": {
+        "reading_order": "bottom_center_to_two_branches_to_top_alignment",
+        "slots": [
+          {"id": "source", "role": "shared_source", "bbox": [0.45, 0.76, 0.55, 0.90]},
+          {"id": "left_view", "role": "input_variant", "bbox": [0.10, 0.55, 0.24, 0.70]},
+          {"id": "right_view", "role": "input_variant", "bbox": [0.76, 0.55, 0.90, 0.70]},
+          {"id": "left_encoder", "role": "encoder", "bbox": [0.12, 0.32, 0.24, 0.45]},
+          {"id": "right_encoder", "role": "encoder", "bbox": [0.76, 0.32, 0.88, 0.45]},
+          {"id": "left_projection", "role": "projection_or_head", "bbox": [0.12, 0.14, 0.24, 0.26]},
+          {"id": "right_projection", "role": "projection_or_head", "bbox": [0.76, 0.14, 0.88, 0.26]},
+          {"id": "agreement", "role": "alignment_objective", "bbox": [0.31, 0.04, 0.69, 0.12]}
+        ],
+        "flows": [
+          {"from": "source", "to": "left_view", "style": "stochastic_branch"},
+          {"from": "source", "to": "right_view", "style": "stochastic_branch"},
+          {"from": "left_view", "to": "left_encoder", "style": "main_flow"},
+          {"from": "right_view", "to": "right_encoder", "style": "main_flow"},
+          {"from": "left_encoder", "to": "left_projection", "style": "main_flow"},
+          {"from": "right_encoder", "to": "right_projection", "style": "main_flow"},
+          {"from": "left_projection", "to": "right_projection", "style": "objective_alignment"}
+        ]
+      },
+      "adaptation_guidelines": [
+        "Use this when the method has two correlated views, two models, or two augmentations sharing a source.",
+        "Keep the shared source visually below the branches and the agreement/loss above or between branch endpoints.",
+        "Do not add a third branch unless the input method explicitly has three parallel views."
+      ]
+    },
+    {
+      "id": "unet_skip_encoder_decoder",
+      "name": "Symmetric encoder-decoder with skip connections",
+      "best_for": ["encoder_decoder", "multi_scale_features", "skip_connections", "coarse_to_fine"],
+      "source": {
+        "paper": "U-Net: Convolutional Networks for Biomedical Image Segmentation",
+        "authors": "Olaf Ronneberger, Philipp Fischer, Thomas Brox",
+        "year": 2015,
+        "figure": "Figure 1",
+        "pdf_url": "https://arxiv.org/pdf/1505.04597"
+      },
+      "extraction": {
+        "page": 2,
+        "local_pdf": "tmp/pdfs/method_templates/unet.pdf",
+        "local_svg": "tmp/pdfs/method_templates/svg/unet_page2.svg",
+        "source_svg_sha256": "9ff938e1d4b5a28f3fe47179db2621c81113b59ffd385cd9d782ffd83500f85e",
+        "source_svg_bytes": 366951,
+        "embedded_bitmap_count": 0,
+        "derived_from_pdf_vector_page": true,
+        "figure_bbox_page_norm": [0.20, 0.13, 0.79, 0.48],
+        "svg_object_counts": {"path": 351, "rect": 1, "image": 0, "use": 1768}
+      },
+      "layout_pattern": {
+        "reading_order": "left_down_then_right_up",
+        "slots": [
+          {"id": "input", "role": "input", "bbox": [0.02, 0.08, 0.12, 0.22]},
+          {"id": "enc_1", "role": "encoder_stage", "bbox": [0.12, 0.10, 0.24, 0.24]},
+          {"id": "enc_2", "role": "encoder_stage", "bbox": [0.22, 0.32, 0.34, 0.46]},
+          {"id": "bottleneck", "role": "bottleneck", "bbox": [0.43, 0.72, 0.57, 0.86]},
+          {"id": "dec_2", "role": "decoder_stage", "bbox": [0.66, 0.32, 0.78, 0.46]},
+          {"id": "dec_1", "role": "decoder_stage", "bbox": [0.78, 0.10, 0.90, 0.24]},
+          {"id": "output", "role": "output", "bbox": [0.91, 0.08, 0.99, 0.24]}
+        ],
+        "flows": [
+          {"from": "input", "to": "enc_1", "style": "main_flow"},
+          {"from": "enc_1", "to": "enc_2", "style": "downsample"},
+          {"from": "enc_2", "to": "bottleneck", "style": "downsample"},
+          {"from": "bottleneck", "to": "dec_2", "style": "upsample"},
+          {"from": "dec_2", "to": "dec_1", "style": "upsample"},
+          {"from": "dec_1", "to": "output", "style": "main_flow"},
+          {"from": "enc_1", "to": "dec_1", "style": "skip_connection"},
+          {"from": "enc_2", "to": "dec_2", "style": "skip_connection"}
+        ]
+      },
+      "adaptation_guidelines": [
+        "Use this when the method has a contracting path, a bottleneck, and an expansive path.",
+        "Keep skip connections long and straight, with subdued stroke weight behind primary arrows.",
+        "Use repeated stage boxes instead of drawing every layer when paper-width readability matters."
+      ]
+    },
+    {
+      "id": "ddpm_bidirectional_chain",
+      "name": "Bidirectional stochastic process chain",
+      "best_for": ["diffusion", "markov_chain", "iterative_refinement", "forward_reverse_process"],
+      "source": {
+        "paper": "Denoising Diffusion Probabilistic Models",
+        "authors": "Jonathan Ho, Ajay Jain, Pieter Abbeel",
+        "year": 2020,
+        "figure": "Figure 2",
+        "pdf_url": "https://arxiv.org/pdf/2006.11239"
+      },
+      "extraction": {
+        "page": 2,
+        "local_pdf": "tmp/pdfs/method_templates/ddpm.pdf",
+        "local_svg": "tmp/pdfs/method_templates/svg/ddpm_page2.svg",
+        "source_svg_sha256": "6dec4cd5daa5dcd15bfc3b41260ee3aa72f35b93f4fd08c43afd4b70a163671a",
+        "source_svg_bytes": 731794,
+        "embedded_bitmap_count": 3,
+        "derived_from_pdf_vector_page": true,
+        "figure_bbox_page_norm": [0.25, 0.08, 0.75, 0.18],
+        "svg_object_counts": {"path": 488, "rect": 0, "image": 3, "use": 3276}
+      },
+      "layout_pattern": {
+        "reading_order": "right_to_left_reverse_process_with_left_to_right_forward_reference",
+        "slots": [
+          {"id": "state_t", "role": "latent_or_noisy_state", "bbox": [0.05, 0.34, 0.16, 0.62]},
+          {"id": "state_mid", "role": "intermediate_state", "bbox": [0.42, 0.34, 0.54, 0.62]},
+          {"id": "state_0", "role": "clean_or_output_state", "bbox": [0.84, 0.34, 0.95, 0.62]},
+          {"id": "reverse_model", "role": "learned_reverse_step", "bbox": [0.55, 0.12, 0.80, 0.28]},
+          {"id": "forward_reference", "role": "fixed_forward_process", "bbox": [0.24, 0.66, 0.78, 0.82]}
+        ],
+        "flows": [
+          {"from": "state_t", "to": "state_mid", "style": "forward_reference"},
+          {"from": "state_mid", "to": "state_0", "style": "forward_reference"},
+          {"from": "state_0", "to": "state_mid", "style": "reverse_model"},
+          {"from": "state_mid", "to": "state_t", "style": "reverse_model"}
+        ]
+      },
+      "adaptation_guidelines": [
+        "Use this for iterative generation, denoising, refinement, or temporal chains.",
+        "Separate learned reverse arrows from fixed forward arrows by vertical offset or line style.",
+        "Use small local image assets only for state thumbnails; semantic labels and arrows must stay editable."
+      ]
+    },
+    {
+      "id": "transformer_encoder_decoder_stack",
+      "name": "Encoder-decoder stacked module diagram",
+      "best_for": ["encoder_decoder", "stacked_blocks", "attention", "residual_norm"],
+      "source": {
+        "paper": "Attention Is All You Need",
+        "authors": "Ashish Vaswani et al.",
+        "year": 2017,
+        "figure": "Figure 1",
+        "pdf_url": "https://arxiv.org/pdf/1706.03762"
+      },
+      "extraction": {
+        "page": 3,
+        "local_pdf": "tmp/pdfs/method_templates/attention_is_all_you_need.pdf",
+        "local_svg": "tmp/pdfs/method_templates/svg/attention_transformer_page3.svg",
+        "source_svg_sha256": "0ff5d42560c9600df675bd2abd6366acf6deb6342d529f5ed199e8998300cc6a",
+        "source_svg_bytes": 547957,
+        "embedded_bitmap_count": 2,
+        "derived_from_pdf_vector_page": false,
+        "figure_bbox_page_norm": [0.32, 0.08, 0.69, 0.56],
+        "svg_object_counts": {"path": 273, "rect": 0, "image": 2, "use": 1536}
+      },
+      "layout_pattern": {
+        "reading_order": "bottom_to_top_with_cross_attention_bridge",
+        "slots": [
+          {"id": "encoder_input", "role": "input_embedding", "bbox": [0.06, 0.82, 0.32, 0.94]},
+          {"id": "encoder_stack", "role": "stacked_encoder", "bbox": [0.05, 0.18, 0.36, 0.76]},
+          {"id": "bridge", "role": "cross_connection", "bbox": [0.37, 0.35, 0.55, 0.48]},
+          {"id": "decoder_input", "role": "decoder_input", "bbox": [0.61, 0.82, 0.87, 0.94]},
+          {"id": "decoder_stack", "role": "stacked_decoder", "bbox": [0.58, 0.10, 0.92, 0.76]},
+          {"id": "output_head", "role": "output_head", "bbox": [0.62, 0.00, 0.88, 0.09]}
+        ],
+        "flows": [
+          {"from": "encoder_input", "to": "encoder_stack", "style": "main_flow"},
+          {"from": "encoder_stack", "to": "bridge", "style": "context_bridge"},
+          {"from": "decoder_input", "to": "decoder_stack", "style": "main_flow"},
+          {"from": "bridge", "to": "decoder_stack", "style": "cross_attention"},
+          {"from": "decoder_stack", "to": "output_head", "style": "main_flow"}
+        ]
+      },
+      "adaptation_guidelines": [
+        "Use this for modular stacks with residual sublayers and a cross-module bridge.",
+        "Do not copy the original raster image; use this only as a stack-and-bridge layout grammar.",
+        "Collapse repeated layers into one grouped module when target_width_mm is 85."
+      ]
+    }
+  ]
+}

@@ -13,6 +13,13 @@ interface RenderPayload {
   asset_paths: Record<string, string>;
 }
 
+interface DrawRenderPayload {
+  out_dir: string;
+  draw_plan: DrawPlan;
+  style: StyleSpec;
+  asset_paths: Record<string, string>;
+}
+
 interface FigurePlan {
   canvas: {
     aspect: "paper-wide" | "single-column" | "double-column" | "16:9";
@@ -32,6 +39,55 @@ interface FigurePlan {
   edges: Edge[];
   annotations: Array<{ id: string; label: string; target_id?: string; bbox?: NormalizedBox }>;
 }
+
+interface DrawPlan {
+  canvas: FigurePlan["canvas"];
+  objects: DrawObject[];
+}
+
+type DrawObject =
+  | {
+      kind: "box";
+      id: string;
+      bbox: NormalizedBox;
+      text: string;
+      role: string;
+      style: string;
+      z: number;
+    }
+  | {
+      kind: "text";
+      id: string;
+      bbox: NormalizedBox;
+      text: string;
+      style: string;
+      z: number;
+    }
+  | {
+      kind: "connector";
+      id: string;
+      points: Array<[number, number]>;
+      from?: string;
+      to?: string;
+      style: string;
+      label?: { text: string; bbox: NormalizedBox };
+      z: number;
+    }
+  | {
+      kind: "image";
+      id: string;
+      bbox: NormalizedBox;
+      asset_id: string;
+      z: number;
+    }
+  | {
+      kind: "group";
+      id: string;
+      bbox: NormalizedBox;
+      label?: string;
+      style: string;
+      z: number;
+    };
 
 interface Component {
   id: string;
@@ -102,18 +158,247 @@ export function createFigureRuntime(payload: RenderPayload): FigureRuntime {
   return new FigureRuntime(payload);
 }
 
+export function createDrawPlanRuntime(payload: DrawRenderPayload): DrawPlanRuntime {
+  return new DrawPlanRuntime(payload);
+}
+
+function trustedOutDir(payloadOutDir: string): string {
+  // 输出目录由 Rust orchestrator 控制，避免模型代码把产物写到其他 round。
+  return process.env.METHODFIG_RENDER_OUT_DIR || payloadOutDir;
+}
+
+export class DrawPlanRuntime {
+  private pptx: any;
+  private slide: any;
+  private objects: LayoutObject[] = [];
+  private size: CanvasSize;
+  private outDir: string;
+
+  constructor(private readonly payload: DrawRenderPayload) {
+    this.size = canvasSize(payload.draw_plan.canvas.aspect);
+    this.outDir = trustedOutDir(payload.out_dir);
+  }
+
+  async renderDrawPlan(): Promise<void> {
+    fs.mkdirSync(this.outDir, { recursive: true });
+    this.pptx = new PptxGenJS();
+    const layoutName = `METHODFIG_DRAW_${Date.now()}`;
+    this.pptx.defineLayout({ name: layoutName, width: this.size.width, height: this.size.height });
+    this.pptx.layout = layoutName;
+    this.pptx.author = "methodfig";
+    this.pptx.company = "methodfig";
+    this.pptx.subject = "Paper method overview figure";
+    this.pptx.title = "methodfig generated editable figure";
+    this.pptx.lang = "zh-CN";
+
+    this.slide = this.pptx.addSlide();
+    this.slide.background = { color: this.payload.style.palette.background };
+
+    const objects = [...this.payload.draw_plan.objects].sort((left, right) => left.z - right.z);
+    const connectorLabels: Array<Extract<DrawObject, { kind: "connector" }>> = [];
+    for (const object of objects) {
+      if (object.kind === "box") this.drawBox(object);
+      if (object.kind === "text") this.drawText(object);
+      if (object.kind === "group") this.drawGroup(object);
+      if (object.kind === "connector") {
+        this.drawConnector(object);
+        if (object.label) connectorLabels.push(object);
+      }
+      if (object.kind === "image") this.drawImage(object);
+    }
+    for (const object of connectorLabels) this.drawConnectorLabel(object);
+
+    const layoutMap: LayoutMap = {
+      canvas: {
+        width: this.size.width,
+        height: this.size.height,
+        aspect: this.payload.draw_plan.canvas.aspect,
+        target_width_mm: this.payload.draw_plan.canvas.target_width_mm
+      },
+      objects: this.objects
+    };
+    fs.writeFileSync(
+      path.join(this.outDir, "layout_map.json"),
+      JSON.stringify(layoutMap, null, 2),
+      "utf8"
+    );
+    await this.pptx.writeFile({ fileName: path.join(this.outDir, "figure.pptx") });
+  }
+
+  private drawBox(object: Extract<DrawObject, { kind: "box" }>): void {
+    const isPrimary = object.style.includes("primary") || object.role === "main";
+    const forceRegular = object.style.includes("regular");
+    const isMuted = object.style.includes("muted");
+    const fill = isPrimary ? lighten(this.payload.style.palette.primary, 0.86) : this.payload.style.palette.muted_fill;
+    const stroke = isPrimary ? this.payload.style.palette.primary : this.payload.style.palette.stroke;
+    const color = isMuted ? this.payload.style.palette.muted_text : this.payload.style.palette.text;
+    this.slide.addText(object.text, {
+      ...this.toBox(object.bbox),
+      shape: this.shape("roundRect"),
+      rectRadius: this.payload.style.corner_radius.module,
+      margin: 0.05,
+      fit: "shrink",
+      breakLine: false,
+      valign: "mid",
+      align: "center",
+      fontFace: this.payload.style.fonts.font_cjk,
+      fontSize: this.payload.style.font_sizes.module_label,
+      bold: isPrimary && !forceRegular,
+      color,
+      fill: { color: fill },
+      line: { color: stroke, width: isPrimary ? this.payload.style.line_widths.strong_focus : this.payload.style.line_widths.normal },
+      shapeName: `methodfig_draw_box_${object.id}`
+    });
+    this.track(object.id, "component", object.bbox);
+  }
+
+  private drawText(object: Extract<DrawObject, { kind: "text" }>): void {
+    this.slide.addText(object.text, {
+      ...this.toBox(object.bbox),
+      margin: 0.02,
+      fit: "shrink",
+      align: "center",
+      valign: "mid",
+      fontFace: this.payload.style.fonts.font_cjk,
+      fontSize: this.payload.style.font_sizes.auxiliary_label,
+      color: this.payload.style.palette.muted_text,
+      fill: { color: this.payload.style.palette.background, transparency: 100 },
+      line: { color: this.payload.style.palette.background, transparency: 100 },
+      shapeName: `methodfig_draw_text_${object.id}`
+    });
+    this.track(object.id, "annotation", object.bbox);
+  }
+
+  private drawGroup(object: Extract<DrawObject, { kind: "group" }>): void {
+    this.slide.addShape(this.shape("rect"), {
+      ...this.toBox(object.bbox),
+      fill: { color: this.payload.style.palette.background, transparency: 100 },
+      line: { color: this.payload.style.palette.stroke, width: this.payload.style.line_widths.auxiliary, dashType: "dash" },
+      shapeName: `methodfig_draw_group_${object.id}`
+    });
+    if (object.label) {
+      const [x1, y1, x2] = object.bbox;
+      const labelBox: NormalizedBox = normalizeBox([x1 + 0.01, y1 + 0.01, Math.min(x2, x1 + 0.22), y1 + 0.07]);
+      this.slide.addText(object.label, {
+        ...this.toBox(labelBox),
+        margin: 0.01,
+        fit: "shrink",
+        fontFace: this.payload.style.fonts.font_cjk,
+        fontSize: this.payload.style.font_sizes.auxiliary_label,
+        color: this.payload.style.palette.muted_text,
+        fill: { color: this.payload.style.palette.background, transparency: 100 },
+        line: { color: this.payload.style.palette.background, transparency: 100 },
+        shapeName: `methodfig_draw_group_label_${object.id}`
+      });
+      this.track(`${object.id}_label`, "label", labelBox);
+    }
+    this.track(object.id, "region", object.bbox);
+  }
+
+  private drawConnector(object: Extract<DrawObject, { kind: "connector" }>): void {
+    const points = object.points.map(point => [clamp01(point[0]), clamp01(point[1])] as [number, number]);
+    if (points.length < 2) return;
+    const isMain = object.style.includes("main");
+    const isDash = object.style.includes("dash") || object.style.includes("supervision");
+    const color = isDash ? this.payload.style.palette.accent : this.payload.style.palette.primary;
+    const width = isMain ? this.payload.style.line_widths.main_flow : this.payload.style.line_widths.normal;
+    for (let index = 0; index < points.length - 1; index += 1) {
+      const start = points[index];
+      const end = points[index + 1];
+      this.slide.addShape(this.shape("line"), {
+        ...this.toLine(start, end),
+        line: {
+          color,
+          width,
+          dashType: isDash ? "dash" : "solid",
+          endArrowType: index === points.length - 2 ? "triangle" : "none"
+        },
+        shapeName: `methodfig_draw_edge_${object.id}_${index}`
+      });
+    }
+    this.track(object.id, "edge", pointsToBox(points), points);
+  }
+
+  private drawConnectorLabel(object: Extract<DrawObject, { kind: "connector" }>): void {
+    if (!object.label) return;
+    this.slide.addText(object.label.text, {
+      ...this.toBox(object.label.bbox),
+      margin: 0.01,
+      fit: "shrink",
+      align: "center",
+      valign: "mid",
+      fontFace: this.payload.style.fonts.font_cjk,
+      fontSize: this.payload.style.font_sizes.auxiliary_label,
+      color: this.payload.style.palette.muted_text,
+      fill: { color: this.payload.style.palette.background, transparency: 8 },
+      line: { color: this.payload.style.palette.background, transparency: 100 },
+      shapeName: `methodfig_draw_edge_label_${object.id}`
+    });
+    this.track(`${object.id}_label`, "label", object.label.bbox);
+  }
+
+  private drawImage(object: Extract<DrawObject, { kind: "image" }>): void {
+    const assetPath = this.payload.asset_paths[object.asset_id];
+    if (!assetPath || !fs.existsSync(assetPath)) return;
+    this.slide.addImage({
+      path: assetPath,
+      ...this.toBox(object.bbox),
+      transparency: 0
+    });
+    this.track(object.id, "image", object.bbox);
+  }
+
+  private toBox(normalized: NormalizedBox): Box {
+    const [x1, y1, x2, y2] = normalizeBox(normalized);
+    return {
+      x: x1 * this.size.width,
+      y: y1 * this.size.height,
+      w: (x2 - x1) * this.size.width,
+      h: (y2 - y1) * this.size.height
+    };
+  }
+
+  private toLine(start: [number, number], end: [number, number]): Box {
+    return {
+      x: start[0] * this.size.width,
+      y: start[1] * this.size.height,
+      w: (end[0] - start[0]) * this.size.width,
+      h: (end[1] - start[1]) * this.size.height
+    };
+  }
+
+  private shape(name: "rect" | "roundRect" | "line"): string {
+    const shapeType = this.pptx.ShapeType as Record<string, string>;
+    if (name === "roundRect") return shapeType.roundRect ?? shapeType.rect;
+    return shapeType[name];
+  }
+
+  private track(
+    id: string,
+    kind: LayoutObject["kind"],
+    bbox: NormalizedBox,
+    points?: Array<[number, number]>
+  ): void {
+    const object: LayoutObject = { id, kind, bbox: normalizeBox(bbox) };
+    if (points) object.points = points.map(point => [clamp01(point[0]), clamp01(point[1])]);
+    this.objects.push(object);
+  }
+}
+
 export class FigureRuntime {
   private pptx: any;
   private slide: any;
   private objects: LayoutObject[] = [];
   private size: CanvasSize;
+  private outDir: string;
 
   constructor(private readonly payload: RenderPayload) {
     this.size = canvasSize(payload.plan.canvas.aspect);
+    this.outDir = trustedOutDir(payload.out_dir);
   }
 
   async renderPlan(): Promise<void> {
-    fs.mkdirSync(this.payload.out_dir, { recursive: true });
+    fs.mkdirSync(this.outDir, { recursive: true });
     this.pptx = new PptxGenJS();
     const layoutName = `METHODFIG_${Date.now()}`;
     this.pptx.defineLayout({ name: layoutName, width: this.size.width, height: this.size.height });
@@ -144,11 +429,11 @@ export class FigureRuntime {
     };
 
     fs.writeFileSync(
-      path.join(this.payload.out_dir, "layout_map.json"),
+      path.join(this.outDir, "layout_map.json"),
       JSON.stringify(layoutMap, null, 2),
       "utf8"
     );
-    await this.pptx.writeFile({ fileName: path.join(this.payload.out_dir, "figure.pptx") });
+    await this.pptx.writeFile({ fileName: path.join(this.outDir, "figure.pptx") });
   }
 
   private drawRegions(): void {
@@ -281,7 +566,7 @@ export class FigureRuntime {
         this.track(`${edge.id}_label`, "label", labelBox);
       }
 
-      this.track(edge.id, "edge", normalizeBox([start[0], start[1], end[0], end[1]]));
+      this.track(edge.id, "edge", normalizeBox([start[0], start[1], end[0], end[1]]), [start, end]);
     }
   }
 
@@ -434,8 +719,15 @@ export class FigureRuntime {
     return shapeType[name];
   }
 
-  private track(id: string, kind: LayoutObject["kind"], bbox: NormalizedBox): void {
-    this.objects.push({ id, kind, bbox: normalizeBox(bbox) });
+  private track(
+    id: string,
+    kind: LayoutObject["kind"],
+    bbox: NormalizedBox,
+    points?: Array<[number, number]>
+  ): void {
+    const object: LayoutObject = { id, kind, bbox: normalizeBox(bbox) };
+    if (points) object.points = points.map(point => [clamp01(point[0]), clamp01(point[1])]);
+    this.objects.push(object);
   }
 }
 
@@ -485,6 +777,17 @@ function offsetSegment(start: [number, number], end: [number, number], amount: n
     [clamp01(start[0] + nx), clamp01(start[1] + ny)],
     [clamp01(end[0] + nx), clamp01(end[1] + ny)]
   ];
+}
+
+function pointsToBox(points: Array<[number, number]>): NormalizedBox {
+  const xs = points.map(point => point[0]);
+  const ys = points.map(point => point[1]);
+  return normalizeBox([
+    Math.min(...xs),
+    Math.min(...ys),
+    Math.max(...xs),
+    Math.max(...ys)
+  ]);
 }
 
 function dashType(style: Edge["style"]): string {

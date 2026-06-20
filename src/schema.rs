@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 
 use anyhow::{anyhow, Result};
 use schemars::{schema_for, JsonSchema};
@@ -64,6 +64,74 @@ pub struct FigurePlan {
     pub annotations: Vec<Annotation>,
     pub assets: Vec<AssetSpec>,
     pub design: DesignPolicy,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct DrawPlan {
+    #[serde(default = "default_draw_plan_version")]
+    pub version: String,
+    pub canvas: Canvas,
+    #[serde(default)]
+    pub style_tokens: BTreeMap<String, String>,
+    #[serde(default)]
+    pub objects: Vec<DrawObject>,
+}
+
+fn default_draw_plan_version() -> String {
+    "0.2".to_string()
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "kind")]
+pub enum DrawObject {
+    #[serde(rename = "box")]
+    Box {
+        id: String,
+        bbox: [f64; 4],
+        text: String,
+        role: String,
+        style: String,
+        z: i32,
+    },
+    #[serde(rename = "text")]
+    Text {
+        id: String,
+        bbox: [f64; 4],
+        text: String,
+        style: String,
+        z: i32,
+    },
+    #[serde(rename = "connector")]
+    Connector {
+        id: String,
+        points: Vec<[f64; 2]>,
+        from: Option<String>,
+        to: Option<String>,
+        style: String,
+        label: Option<DrawLabel>,
+        z: i32,
+    },
+    #[serde(rename = "image")]
+    Image {
+        id: String,
+        bbox: [f64; 4],
+        asset_id: String,
+        z: i32,
+    },
+    #[serde(rename = "group")]
+    Group {
+        id: String,
+        bbox: [f64; 4],
+        label: Option<String>,
+        style: String,
+        z: i32,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct DrawLabel {
+    pub text: String,
+    pub bbox: [f64; 4],
 }
 
 fn default_schema_version() -> String {
@@ -732,6 +800,93 @@ pub fn validate_stable_ids(plan: &FigurePlan) -> Result<()> {
     Ok(())
 }
 
+pub fn validate_draw_plan(plan: &DrawPlan) -> Result<()> {
+    if plan.version.trim().is_empty() {
+        return Err(anyhow!("DrawPlan has empty version"));
+    }
+
+    let mut ids = HashSet::new();
+    for object in &plan.objects {
+        let id = draw_object_id(object);
+        if id.trim().is_empty() {
+            return Err(anyhow!("draw object has empty id"));
+        }
+        if !ids.insert(id.to_string()) {
+            return Err(anyhow!("duplicate draw object id: {id}"));
+        }
+
+        match object {
+            DrawObject::Box { bbox, .. }
+            | DrawObject::Text { bbox, .. }
+            | DrawObject::Group { bbox, .. } => validate_draw_bbox(id, *bbox)?,
+            DrawObject::Image { bbox, asset_id, .. } => {
+                validate_draw_bbox(id, *bbox)?;
+                if asset_id.trim().is_empty() {
+                    return Err(anyhow!("draw image {id} has empty asset_id"));
+                }
+                if draw_bbox_area(*bbox) > 0.45 {
+                    return Err(anyhow!(
+                        "full-slide raster image is not allowed in DrawPlan: {id}"
+                    ));
+                }
+            }
+            DrawObject::Connector { points, label, .. } => {
+                if points.len() < 2 {
+                    return Err(anyhow!("draw connector {id} needs at least two points"));
+                }
+                for point in points {
+                    validate_draw_point(id, *point)?;
+                }
+                if let Some(label) = label {
+                    validate_draw_bbox(id, label.bbox)?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn draw_object_id(object: &DrawObject) -> &str {
+    match object {
+        DrawObject::Box { id, .. }
+        | DrawObject::Text { id, .. }
+        | DrawObject::Connector { id, .. }
+        | DrawObject::Image { id, .. }
+        | DrawObject::Group { id, .. } => id,
+    }
+}
+
+fn validate_draw_bbox(id: &str, bbox: [f64; 4]) -> Result<()> {
+    if bbox.iter().any(|value| !value.is_finite()) {
+        return Err(anyhow!("draw object {id} has non-finite bbox"));
+    }
+    if bbox.iter().any(|value| *value < 0.0 || *value > 1.0) {
+        return Err(anyhow!(
+            "draw object {id} bbox is outside normalized canvas"
+        ));
+    }
+    if bbox[2] <= bbox[0] || bbox[3] <= bbox[1] {
+        return Err(anyhow!("draw object {id} bbox has non-positive size"));
+    }
+    Ok(())
+}
+
+fn validate_draw_point(id: &str, point: [f64; 2]) -> Result<()> {
+    if point.iter().any(|value| !value.is_finite()) {
+        return Err(anyhow!("draw connector {id} has non-finite point"));
+    }
+    if point.iter().any(|value| *value < 0.0 || *value > 1.0) {
+        return Err(anyhow!(
+            "draw connector {id} point is outside normalized canvas"
+        ));
+    }
+    Ok(())
+}
+
+fn draw_bbox_area(bbox: [f64; 4]) -> f64 {
+    ((bbox[2] - bbox[0]).max(0.0)) * ((bbox[3] - bbox[1]).max(0.0))
+}
+
 fn collect_ids(plan: &FigurePlan) -> Vec<(&'static str, &str)> {
     let mut ids = Vec::new();
     for region in &plan.layout.regions {
@@ -754,6 +909,11 @@ fn collect_ids(plan: &FigurePlan) -> Vec<(&'static str, &str)> {
 
 pub fn figure_plan_schema_json() -> Result<String> {
     let schema = schema_for!(FigurePlan);
+    Ok(serde_json::to_string_pretty(&schema)?)
+}
+
+pub fn draw_plan_schema_json() -> Result<String> {
+    let schema = schema_for!(DrawPlan);
     Ok(serde_json::to_string_pretty(&schema)?)
 }
 

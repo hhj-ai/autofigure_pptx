@@ -127,9 +127,7 @@ fn render_quality_issues_from_map(layout_map: &LayoutMap) -> Vec<String> {
                     continue;
                 }
             }
-            let overlap = intersection_area(label.bbox, edge.bbox);
-            let label_area = area(label.bbox).max(0.0001);
-            if overlap > 0.001 && overlap / label_area > 0.2 {
+            if label_overlaps_edge(label.bbox, edge) {
                 issues.push(format!(
                     "render quality failed: label {} overlaps edge {}",
                     label.id, edge.id
@@ -140,7 +138,7 @@ fn render_quality_issues_from_map(layout_map: &LayoutMap) -> Vec<String> {
     }
 
     for edge in &edges {
-        if segment_length(edge.bbox) < 0.04 {
+        if edge_length(edge) < 0.04 {
             issues.push(format!(
                 "render quality failed: degenerate edge {} is too short",
                 edge.id
@@ -150,10 +148,14 @@ fn render_quality_issues_from_map(layout_map: &LayoutMap) -> Vec<String> {
 
     for (index, left) in edges.iter().enumerate() {
         for right in edges.iter().skip(index + 1) {
-            if segment_length(left.bbox) < 0.04 || segment_length(right.bbox) < 0.04 {
+            if edge_length(left) < 0.04 || edge_length(right) < 0.04 {
                 continue;
             }
-            if segments_cross(left.bbox, right.bbox) {
+            if edge_segments(left).iter().any(|left_segment| {
+                edge_segments(right)
+                    .iter()
+                    .any(|right_segment| segments_cross(*left_segment, *right_segment))
+            }) {
                 issues.push(format!(
                     "render quality failed: edge crossing between {} and {}",
                     left.id, right.id
@@ -265,34 +267,6 @@ fn plan_geometry_issues(plan: &FigurePlan) -> Vec<String> {
         }
     }
 
-    let component_union = union_bbox(component_boxes.iter().copied());
-    for annotation in plan
-        .annotations
-        .iter()
-        .filter(|annotation| annotation.bbox.is_some())
-    {
-        if annotation.id.contains("label") {
-            continue;
-        }
-        let bbox = annotation.bbox.expect("checked above");
-        if bbox[0] < 0.08 || bbox[1] < 0.08 || bbox[2] > 0.92 || bbox[3] > 0.92 {
-            issues.push(format!(
-                "render quality failed: annotation {} sits outside the main figure area",
-                annotation.id
-            ));
-            continue;
-        }
-        if let Some(component_union) = component_union {
-            let expanded = expand_box(component_union, 0.08);
-            if !boxes_overlap(expanded, bbox) {
-                issues.push(format!(
-                    "render quality failed: annotation {} sits outside the main figure area",
-                    annotation.id
-                ));
-            }
-        }
-    }
-
     issues
 }
 
@@ -380,6 +354,7 @@ struct LayoutObject {
     id: String,
     kind: String,
     bbox: [f64; 4],
+    points: Option<Vec<[f64; 2]>>,
 }
 
 fn box_size(bbox: [f64; 4]) -> (f64, f64) {
@@ -399,17 +374,57 @@ fn intersection_area(a: [f64; 4], b: [f64; 4]) -> f64 {
     ((x2 - x1).max(0.0)) * ((y2 - y1).max(0.0))
 }
 
-fn segment_length(bbox: [f64; 4]) -> f64 {
-    let dx = bbox[2] - bbox[0];
-    let dy = bbox[3] - bbox[1];
+fn edge_length(edge: &LayoutObject) -> f64 {
+    edge_segments(edge)
+        .iter()
+        .map(|segment| segment_length(*segment))
+        .sum()
+}
+
+fn edge_segments(edge: &LayoutObject) -> Vec<([f64; 2], [f64; 2])> {
+    if let Some(points) = &edge.points {
+        if points.len() >= 2 {
+            return points
+                .windows(2)
+                .map(|window| (window[0], window[1]))
+                .collect();
+        }
+    }
+    vec![([edge.bbox[0], edge.bbox[1]], [edge.bbox[2], edge.bbox[3]])]
+}
+
+fn label_overlaps_edge(label_bbox: [f64; 4], edge: &LayoutObject) -> bool {
+    let label_area = area(label_bbox).max(0.0001);
+    edge_segments(edge).iter().any(|(start, end)| {
+        let segment_bbox = expand_box(segment_bbox(*start, *end), 0.006);
+        let overlap = intersection_area(label_bbox, segment_bbox);
+        overlap > 0.001 && overlap / label_area > 0.2
+    })
+}
+
+fn segment_bbox(start: [f64; 2], end: [f64; 2]) -> [f64; 4] {
+    [
+        start[0].min(end[0]),
+        start[1].min(end[1]),
+        start[0].max(end[0]),
+        start[1].max(end[1]),
+    ]
+}
+
+fn segment_length(segment: ([f64; 2], [f64; 2])) -> f64 {
+    let dx = segment.1[0] - segment.0[0];
+    let dy = segment.1[1] - segment.0[1];
     (dx * dx + dy * dy).sqrt()
 }
 
-fn segments_cross(a: [f64; 4], b: [f64; 4]) -> bool {
-    let p1 = (a[0], a[1]);
-    let p2 = (a[2], a[3]);
-    let q1 = (b[0], b[1]);
-    let q2 = (b[2], b[3]);
+fn segments_cross(a: ([f64; 2], [f64; 2]), b: ([f64; 2], [f64; 2])) -> bool {
+    if segment_length(a) < 0.04 || segment_length(b) < 0.04 {
+        return false;
+    }
+    let p1 = (a.0[0], a.0[1]);
+    let p2 = (a.1[0], a.1[1]);
+    let q1 = (b.0[0], b.0[1]);
+    let q2 = (b.1[0], b.1[1]);
 
     if points_close(p1, q1) || points_close(p1, q2) || points_close(p2, q1) || points_close(p2, q2)
     {

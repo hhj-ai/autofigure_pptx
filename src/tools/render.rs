@@ -36,20 +36,83 @@ pub fn scan_generated_typescript(code: &str) -> Result<()> {
         ));
     }
 
-    let imports: Vec<_> = code
-        .lines()
-        .map(str::trim)
-        .filter(|line| line.starts_with("import "))
-        .collect();
-    for import in imports {
-        if !(import.contains("renderer/src/runtime") || import.contains("./runtime")) {
+    for import in collect_static_imports(code) {
+        if !is_allowed_generated_import(&import) {
             return Err(anyhow!(
-                "unsafe generated TypeScript import is not a local renderer runtime: {import}"
+                "unsafe generated TypeScript import is not an allowed local runtime/helper import: {import}"
             ));
         }
     }
 
     Ok(())
+}
+
+fn collect_static_imports(code: &str) -> Vec<String> {
+    let mut imports = Vec::new();
+    let mut current: Option<String> = None;
+
+    for line in code.lines().map(str::trim) {
+        if line.is_empty() {
+            continue;
+        }
+        if let Some(import) = current.as_mut() {
+            import.push(' ');
+            import.push_str(line);
+            if line.ends_with(';') {
+                imports.push(import.clone());
+                current = None;
+            }
+            continue;
+        }
+        if line.starts_with("import ") {
+            if line.ends_with(';') {
+                imports.push(line.to_string());
+            } else {
+                current = Some(line.to_string());
+            }
+        }
+    }
+
+    if let Some(import) = current {
+        imports.push(import);
+    }
+    imports
+}
+
+fn is_allowed_generated_import(import: &str) -> bool {
+    if import.contains("renderer/src/runtime") || import.contains("./runtime") {
+        return true;
+    }
+
+    let Some(source) = import_source(import) else {
+        return false;
+    };
+    if !source.starts_with("./") {
+        return false;
+    }
+    let local = &source[2..];
+    !local.is_empty()
+        && !local.contains('/')
+        && !local.contains('\\')
+        && !local.contains("..")
+        && (local.ends_with(".ts") || !local.contains('.'))
+}
+
+fn import_source(import: &str) -> Option<&str> {
+    let source_start = if let Some(from_index) = import.rfind(" from ") {
+        from_index + " from ".len()
+    } else {
+        "import ".len()
+    };
+    let source = import[source_start..].trim().trim_end_matches(';').trim();
+    source
+        .strip_prefix('"')
+        .and_then(|value| value.strip_suffix('"'))
+        .or_else(|| {
+            source
+                .strip_prefix('\'')
+                .and_then(|value| value.strip_suffix('\''))
+        })
 }
 
 pub fn run_node_renderer(
@@ -76,6 +139,7 @@ pub fn run_node_renderer(
             Command::new(tsx_bin)
                 .arg(&figure_ts)
                 .current_dir(&round_dir)
+                .env("METHODFIG_RENDER_OUT_DIR", &round_dir)
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped()),
             timeout,

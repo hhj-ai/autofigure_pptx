@@ -66,20 +66,56 @@ The MVP includes `--mock-models` for tests and local dry runs. Mock mode does no
 
 ## Usage
 
-For a real environment run with automatic output naming, use the helper script:
+For a finite real environment run with automatic output naming, use:
 
 ```bash
 bash scripts/run_real_env.sh examples/teacher_student.md
 ```
 
-The script names the run directory as `<content-summary>_<timestamp>` under `runs/`, uses `--image-provider none`, and leaves the iteration cap to the CLI default instead of hardcoding one in the script.
+For a single command that keeps iterating in one session directory until the figure is accepted or you stop it, use:
+
+```bash
+bash scripts/run_real_loop.sh examples/teacher_student.md
+```
+
+The scripts group output by task: `runs/<content-summary>/<session-id>/`. `run_real_env.sh` defaults to `MAX_ITERATIONS=3` for bounded smoke runs. `run_real_loop.sh` defaults to `MAX_ITERATIONS=0` and `MAX_MINUTES=0`; in the CLI, `0` means no cap for that guardrail.
+
+After a successful run, the script prints the exact final artifact paths, updates `runs/<content-summary>/latest` for the task, and updates global `runs/latest` to point at the newest session. The editable PPTX is:
+
+```bash
+runs/latest/final/figure.pptx
+```
+
+On macOS, open the latest editable output directly:
+
+```bash
+open runs/latest/final/figure.pptx
+```
+
+## Template Library
+
+`methodfig` includes a PDF-derived method overview template pack at:
+
+```text
+templates/method_overview/method_templates.json
+```
+
+The pack stores abstract slots and flows derived from classic paper figures: Transformer Figure 1, SimCLR Figure 2, DDPM Figure 2, and U-Net Figure 1. It is used as layout grammar for editable PPTX shapes, text, and connectors; the renderer must not paste a source paper figure as a full-slide raster image.
+
+To reproduce the extraction evidence:
+
+```bash
+bash scripts/extract_method_templates.sh
+```
+
+The script downloads the source PDFs to `tmp/pdfs/method_templates/`, extracts the relevant pages as SVG with Poppler, and prints SHA-256 plus embedded bitmap inventories. `tmp/` is ignored; the packaged project keeps the abstract template JSON and extraction script.
 
 If you want to call the CLI directly:
 
 ```bash
 cargo run -- run \
   --method examples/teacher_student.md \
-  --out runs/teacher_student \
+  --out runs/teacher_student/manual \
   --style wps-clean \
   --aspect paper-wide \
   --target-width-mm 85 \
@@ -94,19 +130,29 @@ cargo run -- run \
 Resume or inspect schemas:
 
 ```bash
-cargo run -- resume --run runs/teacher_student
+cargo run -- resume --run runs/teacher_student/manual
 cargo run -- schema --print
 ```
 
 ## Output Layout
 
 ```text
-runs/name/
+runs/<task-slug>/<session-id>/
   input.md
   config_snapshot.json
   run.log
   round_000/
+    workspace/
+      manifest.json
+      readable/
+      writable/
+        design_brief.md
+        figure_plan.json
+        draw_plan.json
+        code/
+          figure.ts
     figure_plan.json
+    draw_plan.json
     assets/
     figure.ts
     figure.pptx
@@ -116,13 +162,18 @@ runs/name/
     figure_review_overlay.png
     layout_map.json
     review.json
-    patch_plan.json
+    validation_report.json
+    renderer_status.json
   final/
     figure.pptx
     figure.pdf
     figure.png
+    figure.ts
     figure_plan.json
+    draw_plan.json
     review.json
+    validation_report.json
+    renderer_status.json
     status.json
     assets/
 ```
@@ -137,6 +188,6 @@ cargo test
 cd renderer && npm run build
 ```
 
-The mock end-to-end test verifies that the loop fails once, writes a patch plan, passes the next review, and creates final artifacts without real API calls.
+The mock end-to-end test verifies that the loop fails once, gives the next round access to the previous generated code and review artifacts, revises `figure.ts`, passes the next review, and creates final artifacts without real API calls.
 
 Acceptance is intentionally conservative. A figure is accepted only when the vision review clears the score thresholds and the local quality gate finds no collapsed components, major component overlap, degenerate edges, or obvious edge crossings in `layout_map.json`. Low color semantics or aesthetic scores also force rejection.

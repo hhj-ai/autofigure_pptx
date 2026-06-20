@@ -11,6 +11,32 @@ fn safety_scan_accepts_local_renderer_import() {
 }
 
 #[test]
+fn safety_scan_accepts_same_directory_helper_imports() {
+    let code = r#"
+        import { createDrawPlanRuntime } from "/tmp/methodfig/renderer/src/runtime";
+        import { buildPayload } from "./helpers.ts";
+        const runtime = createDrawPlanRuntime(buildPayload());
+        await runtime.renderDrawPlan();
+    "#;
+    scan_generated_typescript(code).expect("same-directory helper import should be allowed");
+}
+
+#[test]
+fn safety_scan_accepts_multiline_static_runtime_imports() {
+    let code = r#"
+        import {
+          createDrawPlanRuntime,
+        } from "/tmp/methodfig/renderer/src/runtime";
+        import {
+          buildPayload,
+        } from "./helpers.ts";
+        const runtime = createDrawPlanRuntime(buildPayload());
+        await runtime.renderDrawPlan();
+    "#;
+    scan_generated_typescript(code).expect("multiline local imports should be allowed");
+}
+
+#[test]
 fn safety_scan_rejects_network_child_process_and_env_access() {
     for code in [
         r#"import cp from "child_process";"#,
@@ -21,4 +47,15 @@ fn safety_scan_rejects_network_child_process_and_env_access() {
         let err = scan_generated_typescript(code).expect_err("unsafe code should fail");
         assert!(err.to_string().contains("unsafe generated TypeScript"));
     }
+}
+
+#[test]
+fn safety_scan_rejects_parent_directory_helper_imports() {
+    let code = r#"
+        import { createDrawPlanRuntime } from "/tmp/methodfig/renderer/src/runtime";
+        import { secret } from "../helpers.ts";
+        console.log(createDrawPlanRuntime, secret);
+    "#;
+    let err = scan_generated_typescript(code).expect_err("parent imports should be rejected");
+    assert!(err.to_string().contains("unsafe generated TypeScript"));
 }

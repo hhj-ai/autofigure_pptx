@@ -13,21 +13,11 @@ fn main() -> Result<()> {
     match cli.command {
         Command::Run(args) => {
             let result = run_pipeline(args.into_options())?;
-            println!(
-                "methodfig run complete: accepted={}, rounds={}, final={}",
-                result.accepted,
-                result.rounds,
-                result.run_dir.join("final").display()
-            );
+            print_result("methodfig run complete", &result);
         }
         Command::Resume(args) => {
             let result = resume_pipeline(args.run)?;
-            println!(
-                "methodfig resume complete: accepted={}, rounds={}, final={}",
-                result.accepted,
-                result.rounds,
-                result.run_dir.join("final").display()
-            );
+            print_result("methodfig resume complete", &result);
         }
         Command::Doctor => {
             let report = methodfig::tools::doctor::run_doctor()?;
@@ -44,4 +34,24 @@ fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+fn print_result(label: &str, result: &methodfig::pipeline::PipelineResult) {
+    let run_dir = std::fs::canonicalize(&result.run_dir).unwrap_or_else(|_| result.run_dir.clone());
+    let final_dir =
+        std::fs::canonicalize(&result.final_dir).unwrap_or_else(|_| result.final_dir.clone());
+    let pptx = final_dir.join("figure.pptx");
+    let png = final_dir.join("figure.png");
+    let status = final_dir.join("status.json");
+
+    println!(
+        "{}: accepted={}, rounds={}, reason={}",
+        label, result.accepted, result.rounds, result.reason
+    );
+    println!("run_dir: {}", run_dir.display());
+    println!("final_dir: {}", final_dir.display());
+    println!("pptx: {}", pptx.display());
+    println!("png: {}", png.display());
+    println!("status: {}", status.display());
+    println!("open_pptx: open \"{}\"", pptx.display());
 }
