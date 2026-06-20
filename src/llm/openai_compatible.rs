@@ -29,6 +29,15 @@ impl OpenAiCompatibleProvider {
         user_text: &str,
         image_path: &Path,
     ) -> Result<String> {
+        Self::complete_vision_with_images(config, system_prompt, user_text, &[image_path]).await
+    }
+
+    pub async fn complete_vision_with_images(
+        config: RoleConfig,
+        system_prompt: &str,
+        user_text: &str,
+        image_paths: &[&Path],
+    ) -> Result<String> {
         let api_key = config
             .api_key
             .as_ref()
@@ -37,15 +46,22 @@ impl OpenAiCompatibleProvider {
             .model
             .as_ref()
             .ok_or_else(|| anyhow!("missing model for OpenAI-compatible vision provider"))?;
-        let bytes = fs::read(image_path)
-            .with_context(|| format!("failed to read review image {}", image_path.display()))?;
-        let mime = mime_guess::from_path(image_path)
-            .first_or_octet_stream()
-            .to_string();
-        let data_url = format!(
-            "data:{mime};base64,{}",
-            base64::engine::general_purpose::STANDARD.encode(bytes)
-        );
+        if image_paths.is_empty() {
+            return Err(anyhow!("vision request requires at least one image"));
+        }
+        let mut content = vec![json!({"type": "text", "text": user_text})];
+        for image_path in image_paths {
+            let bytes = fs::read(image_path)
+                .with_context(|| format!("failed to read review image {}", image_path.display()))?;
+            let mime = mime_guess::from_path(image_path)
+                .first_or_octet_stream()
+                .to_string();
+            let data_url = format!(
+                "data:{mime};base64,{}",
+                base64::engine::general_purpose::STANDARD.encode(bytes)
+            );
+            content.push(json!({"type": "image_url", "image_url": {"url": data_url}}));
+        }
         let url = format!("{}/chat/completions", config.base_url.trim_end_matches('/'));
         let body = json!({
                 "model": model,
@@ -53,10 +69,7 @@ impl OpenAiCompatibleProvider {
                     {"role": "system", "content": system_prompt},
                     {
                         "role": "user",
-                        "content": [
-                            {"type": "text", "text": user_text},
-                            {"type": "image_url", "image_url": {"url": data_url}}
-                        ]
+                        "content": content
                     }
                 ],
                 "temperature": 0.0,

@@ -13,6 +13,12 @@ Act as the figure designer: decide layout, hierarchy, spacing, annotation placem
 Return JSON only. Preserve WPS editability: native PPTX text, shapes, lines and arrows; generated images only for small local icons without text.
 "#;
 
+pub const REFERENCE_SELECTOR: &str = r#"You select the single best visual reference for an editable paper method-overview figure.
+Return ReferenceSelection JSON only. Use the provided reference pack as read-only evidence.
+Choose a reference for its layout grammar, style grammar, anti-patterns, and quality targets, not because the source artwork should be copied.
+Never ask the renderer to use a reference preview as an output asset.
+"#;
+
 pub const CODER_PPTXGENJS_GENERATOR: &str = r#"You generate deterministic TypeScript using only the local methodfig renderer runtime.
 Preserve the planner's intended hierarchy and spacing exactly; do not invent extra decorations or alternate layouts.
 Return TypeScript code only. Import only renderer/src/runtime. No network, no child_process, no arbitrary fs, no process.env.
@@ -41,6 +47,13 @@ Optimize two aspects: POSITION and STYLE. Position covers boxes, text labels, ar
 Return exactly one DrawPlan object. Do not return TypeScript, SVG, markdown, prose, comments, or a wrapper object.
 Keep stable ids for semantic objects whenever the object remains in the figure. Remove only redundant/marginal explanatory text objects explicitly called out by the review.
 All semantic labels must remain editable text; do not add full-slide raster images. Use normalized [0,1] coordinates and keep all objects inside the canvas safe area.
+"#;
+
+pub const ROUND_IMPROVEMENT_PLANNER: &str = r#"You convert figure review feedback into concrete, useful next-round actions.
+Return exactly one RoundImprovementPlan JSON object. Do not return markdown or prose.
+Every rejected figure must have at least one action with a target_id or an explicit template/reference-level change.
+Each action must state the visible effect and a success check that can be verified in DrawPlan/layout_map.
+Vague advice such as improve aesthetics, make better, or clean up layout is not acceptable unless tied to a target object and visible geometry/style change.
 "#;
 
 pub const VISION_REVIEWER: &str = r#"You review a rendered method overview figure as a paper figure, not a business slide.

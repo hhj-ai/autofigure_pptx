@@ -2,7 +2,7 @@ use std::fs;
 use std::time::Duration;
 
 use methodfig::pipeline::{run_pipeline, RunOptions};
-use methodfig::schema::{CanvasAspect, ImageProviderKind, StyleName};
+use methodfig::schema::{CanvasAspect, ImageProviderKind, ReferencePreviewMode, StyleName};
 
 #[test]
 fn mock_pipeline_writes_agentic_workspace_and_draw_plan_artifacts() {
@@ -25,6 +25,7 @@ fn mock_pipeline_writes_agentic_workspace_and_draw_plan_artifacts() {
         max_cost_usd: 3.0,
         max_minutes: 20,
         image_provider: ImageProviderKind::None,
+        reference_previews: ReferencePreviewMode::Auto,
         mock_models: true,
         keep_intermediate: true,
         renderer_timeout: Duration::from_secs(20),
@@ -38,6 +39,9 @@ fn mock_pipeline_writes_agentic_workspace_and_draw_plan_artifacts() {
         .join("workspace/writable/design_brief.md")
         .exists());
     assert!(round_dir.join("workspace/writable/draw_plan.json").exists());
+    assert!(round_dir
+        .join("workspace/readable/reference_selection.json")
+        .exists());
     assert!(round_dir.join("workspace/writable/code/figure.ts").exists());
     assert!(round_dir
         .join("workspace/readable/method_templates.json")
@@ -45,8 +49,12 @@ fn mock_pipeline_writes_agentic_workspace_and_draw_plan_artifacts() {
     assert!(round_dir.join("draw_plan.json").exists());
     assert!(round_dir.join("figure.ts").exists());
     assert!(round_dir.join("validation_report.json").exists());
+    assert!(round_dir.join("reference_selection.json").exists());
+    assert!(round_dir.join("improvement_plan.json").exists());
     assert!(round_dir.join("renderer_status.json").exists());
     assert!(out_dir.join("final/draw_plan.json").exists());
+    assert!(out_dir.join("final/reference_selection.json").exists());
+    assert!(out_dir.join("final/improvement_plan.json").exists());
     assert!(out_dir.join("final/figure.ts").exists());
     assert!(out_dir.join("final/renderer_status.json").exists());
 
@@ -68,10 +76,19 @@ fn mock_pipeline_writes_agentic_workspace_and_draw_plan_artifacts() {
         .unwrap()
         .iter()
         .any(|entry| entry["path"] == "readable/method_templates.json"));
+    assert!(manifest["readable"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|entry| entry["path"] == "readable/reference_selection.json"));
     let method_templates =
         fs::read_to_string(round_dir.join("workspace/readable/method_templates.json")).unwrap();
     assert!(method_templates.contains("simclr_contrastive_y_branch"));
     assert!(method_templates.contains("derived_from_pdf_vector_page"));
+    let reference_selection =
+        fs::read_to_string(round_dir.join("reference_selection.json")).unwrap();
+    assert!(reference_selection.contains("selected_reference_id"));
+    assert!(reference_selection.contains("preview_path"));
 
     let renderer_status: serde_json::Value =
         serde_json::from_slice(&fs::read(round_dir.join("renderer_status.json")).unwrap()).unwrap();
@@ -100,6 +117,7 @@ fn mock_pipeline_revises_generated_code_from_previous_round_context() {
         max_cost_usd: 3.0,
         max_minutes: 20,
         image_provider: ImageProviderKind::None,
+        reference_previews: ReferencePreviewMode::Auto,
         mock_models: true,
         keep_intermediate: true,
         renderer_timeout: Duration::from_secs(20),

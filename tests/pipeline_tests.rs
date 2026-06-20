@@ -6,7 +6,9 @@ use methodfig::pipeline::{
     renderer_uses_generated_code_bundle, resume_pipeline, revision_source_round_index,
     run_pipeline, select_renderer_code, RunOptions,
 };
-use methodfig::schema::{CanvasAspect, ImageProviderKind, Review, ReviewScores, StyleName};
+use methodfig::schema::{
+    CanvasAspect, ImageProviderKind, ReferencePreviewMode, Review, ReviewScores, StyleName,
+};
 
 #[test]
 fn mock_pipeline_fails_once_patches_then_writes_final_artifacts() {
@@ -29,6 +31,7 @@ fn mock_pipeline_fails_once_patches_then_writes_final_artifacts() {
         max_cost_usd: 3.0,
         max_minutes: 20,
         image_provider: ImageProviderKind::None,
+        reference_previews: ReferencePreviewMode::Auto,
         mock_models: true,
         keep_intermediate: true,
         renderer_timeout: Duration::from_secs(20),
@@ -147,6 +150,7 @@ fn resume_pipeline_uses_existing_run_directory() {
         max_cost_usd: 3.0,
         max_minutes: 20,
         image_provider: ImageProviderKind::None,
+        reference_previews: ReferencePreviewMode::Auto,
         mock_models: true,
         keep_intermediate: true,
         renderer_timeout: Duration::from_secs(20),
@@ -181,6 +185,7 @@ fn resume_pipeline_continues_rejected_run_directory() {
         max_cost_usd: 3.0,
         max_minutes: 20,
         image_provider: ImageProviderKind::None,
+        reference_previews: ReferencePreviewMode::Auto,
         mock_models: true,
         keep_intermediate: true,
         renderer_timeout: Duration::from_secs(20),
@@ -190,6 +195,8 @@ fn resume_pipeline_continues_rejected_run_directory() {
     assert!(!initial.accepted);
     assert!(out_dir.join("round_000/review.json").exists());
     assert!(!out_dir.join("round_001").exists());
+    fs::create_dir_all(out_dir.join("round_001")).expect("create partial round");
+    fs::write(out_dir.join("round_001/figure_plan.json"), "{}").expect("write partial artifact");
     let round_000_before = fs::read(out_dir.join("round_000/figure.ts")).unwrap();
 
     let resumed = resume_pipeline(out_dir.clone()).expect("resume should append another round");
@@ -198,6 +205,10 @@ fn resume_pipeline_continues_rejected_run_directory() {
     assert_eq!(resumed.rounds, 2);
     assert_eq!(resumed.run_dir, out_dir);
     assert!(resumed.run_dir.join("round_001/review.json").exists());
+    assert!(
+        !resumed.run_dir.join("round_002").exists(),
+        "resume should reuse incomplete round directories instead of skipping them"
+    );
     assert_eq!(
         fs::read(resumed.run_dir.join("round_000/figure.ts")).unwrap(),
         round_000_before,
@@ -256,6 +267,7 @@ fn mock_pipeline_writes_rejected_final_when_iteration_cap_reached() {
         max_cost_usd: 3.0,
         max_minutes: 20,
         image_provider: ImageProviderKind::None,
+        reference_previews: ReferencePreviewMode::Auto,
         mock_models: true,
         keep_intermediate: true,
         renderer_timeout: Duration::from_secs(20),
@@ -290,6 +302,7 @@ fn mock_pipeline_accepts_zero_max_iterations_as_until_passed() {
         max_cost_usd: 3.0,
         max_minutes: 20,
         image_provider: ImageProviderKind::None,
+        reference_previews: ReferencePreviewMode::Auto,
         mock_models: true,
         keep_intermediate: true,
         renderer_timeout: Duration::from_secs(20),

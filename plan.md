@@ -338,6 +338,14 @@ round_000/
 - 修改 `scripts/run_real_env.sh`：成功运行后打印 `final/figure.pptx`、`final/figure.png`、`final/status.json`，并维护 `runs/latest` symlink 指向最新 run；如果命令失败，也列出该 run 下已经生成的 `round_*/figure.pptx`。
 - 修改 `README.md`：记录成功运行后可直接打开 `runs/latest/final/figure.pptx`。
 - 验证结果：
+
+## 2026-06-20 reference-guided useful-feedback loop plan
+
+- 用户反馈：后期绘图整体提升很小，怀疑 reasoning model 缺少“好图”判断能力；希望把 ViT、CLIP、BERT 以及近年 ML 三会优秀论文图作为上下文参考，并保证每轮都有有用、可执行的改图建议。
+- 本次采用“模板 + 只读预览”方案：仓库打包抽象 reference grammar，preview 由脚本生成到 ignored `tmp/reference_figures/`，可作为只读模型证据，但不能进入 renderer 或最终 PPTX。
+- 实施边界：优先实现 reference pack、reference selection artifact、prompt 注入、workspace 可见性、improvement plan、DrawPlan material-diff gate 和文档；Best Paper 元数据优先保存官方 award/blog URL 与可扩展模板，不把不确定的原图或整图 raster 写进仓库。
+- 预期修改：`templates/method_overview/reference_figures.json`、`src/schema.rs`、`src/tools/template_library.rs`、`src/agent.rs`、`src/pipeline.rs`、`src/cli.rs`、`src/llm/openai_compatible.rs`、`tests/*`、`README.md`、`scripts/extract_reference_previews.sh`。
+- 验证方法：先写 reference/prompt/pipeline/diff 相关测试，再运行 `cargo fmt --check`、`cargo test`、`cd renderer && npm run build`、`bash -n scripts/extract_reference_previews.sh`；如时间和外部模型稳定，补真实 `.env` smoke。
   - `cargo fmt --check` 通过。
   - `bash -n scripts/run_real_env.sh`、`bash -n scripts/run_real_loop.sh` 通过。
   - `cargo test` 全量通过。
@@ -1814,3 +1822,90 @@ round_000/
   - 脚本自动走 `cargo run -- resume --run <same-run-dir>`。
   - 没有创建新 session；同一目录下追加出 `round_001`。
   - 结果 `rounds=2`，仍因单次 resume cap 为 1 轮而 `accepted=false`；目录/续跑语义已验证。
+
+## 2026-06-20 reference-guided improvement loop implementation
+
+- 用户目标：
+  - 后期绘图每轮提升太小，reasoning model 需要更强的视觉判断依据。
+  - 初始阶段应由 reasoning model 为当前任务选择最合适的历史/经典图像模板作为参考。
+  - 每一轮反馈必须产生有用、可执行的建议；coding model 根据上一轮反馈继续改代码/DrawPlan。
+  - 多个模型共享当前代码、渲染图、参考图和上一轮计划上下文。
+- 约束：
+  - PPTX 输出必须继续是 editable native shapes/text/lines，不能把整页参考图 raster 化塞进 slide。
+  - 经典论文图和近年 best paper 图只作为只读视觉 grammar/reference；本地 preview 放在 `tmp/reference_figures/`，受 `.gitignore` 保护。
+  - `plan.md`/`goal.md`/`AGENTS.md` 仍按打包上下文要求保留在项目中，不加入 ignore。
+- 实现：
+  - 新增 `templates/method_overview/reference_figures.json`，收录 SimCLR、ViT、CLIP、BERT 以及 NeurIPS 2025 Gated Attention 等抽象参考模板，记录 selection tags、layout grammar、style grammar、anti-patterns 和质量 rubric。
+  - `src/tools/template_library.rs` 新增参考库加载、keyword/phrase 选择和 selected-reference JSON 生成；mock 路径可稳定选择参考，真实路径交给 reasoner 选择。
+  - `src/schema.rs` 新增 `ReferencePreviewMode`、`ReferenceSelection`、`RoundImprovementPlan`、`ImprovementAction` 及其 strict JSON schema。
+  - `src/prompts.rs` 和 `src/agent.rs` 新增 reference selector 与 round improvement planner；初始 FigurePlan 只注入被选中的参考模板，避免整包模板污染上下文。
+  - 每轮 review 后必须生成 `improvement_plan.json`；revision prompt 同时看到上一轮渲染图、可选参考 preview、selected reference 和 improvement actions。
+  - `src/tools/draw_plan.rs` 新增 material DrawPlan diff，revision 若没有实际可见改动会重试一次，仍无 material change 则报错，避免无效迭代。
+  - `src/llm/openai_compatible.rs` 支持同一次 vision call 传多张图片，使 reviewer/optimizer 可同时看当前图和参考 preview。
+  - `src/pipeline.rs` 新增 `reference_selection.json` 与 `improvement_plan.json` 的 run/round/final 持久化；resume 兼容旧 run，缺失 reference selection 时会从 method 重新选择。
+  - `src/cli.rs` 新增 `--reference-previews auto|off|required`，默认 `auto`；`required` 缺 preview 时会明确提示先运行提取脚本。
+  - 新增 `scripts/extract_reference_previews.sh`，下载并渲染经典论文 PDF 页面到 `tmp/reference_figures/*.png`。
+  - `README.md` 更新 reference-guided loop、输出目录、CLI 参数和 rejected round 规则。
+- 验证：
+  - `cargo fmt`、`cargo fmt --check` 通过。
+  - `cargo test` 全量通过。
+  - 重点测试 `cargo test --test reference_library_tests --test prompt_tests --test workspace_pipeline_tests --test draw_plan_diff_tests` 通过。
+  - `cd renderer && npm run build` 通过。
+  - `bash -n scripts/extract_reference_previews.sh` 通过。
+  - `bash scripts/extract_reference_previews.sh` 成功生成 SimCLR/ViT/CLIP/BERT preview PNG。
+  - `git diff --check` 通过。
+  - mock smoke：`cargo run -- run --method examples/teacher_student.md --out /tmp/methodfig_reference_smoke --style wps-clean --aspect paper-wide --target-width-mm 85 --max-iterations 2 --max-cost-usd 3.0 --max-minutes 20 --image-provider none --reference-previews required --mock-models` 通过，`accepted=true`、`rounds=2`。
+  - `unzip -t /tmp/methodfig_reference_smoke/final/figure.pptx` 无错误；final 目录含 `figure.pptx`、`reference_selection.json`、`improvement_plan.json`。
+- 外部来源核对：
+  - ICLR 2025 官方 outstanding paper awards 页面：`https://blog.iclr.cc/2025/04/22/announcing-the-outstanding-paper-awards-at-iclr-2025/`
+  - NeurIPS 2025 官方 best paper awards 页面：`https://blog.neurips.cc/2025/11/26/announcing-the-neurips-2025-best-paper-awards/`
+  - ICML 2025 官方 awards 页面：`https://icml.cc/Conferences/2025/Awards`
+- 剩余风险：
+  - 本轮只做了 mock smoke 和 preview extraction；未重新跑真实 `.env` non-mock 长循环。
+  - 近年 award reference 当前以抽象 layout/style grammar 为主；没有稳定 PDF 链接的 award 图不会被脚本自动下载为 preview。
+
+## 2026-06-20 tracked reference preview assets and required-preview smoke
+
+- 用户追加目标：
+  - 参考模板/preview 可以直接进入 git，让模型读取这些模板 evidence。
+  - 用真实路径测试能跑通。
+- 实现调整：
+  - 将 reference preview 默认位置从 ignored 的 `tmp/reference_figures/` 改为可追踪的 `templates/method_overview/reference_figures/assets/`。
+  - 复制并保留 4 个经典论文 preview PNG：SimCLR、ViT、CLIP、BERT。
+  - 新增 `neurips_2025_gated_attention_award.png` synthetic preview，避免 award reference 在 `--reference-previews required` 下缺图。
+  - `templates/method_overview/reference_figures.json` 的 `preview_root` 和每个 `preview.local_path` 已指向 tracked assets。
+  - `scripts/extract_reference_previews.sh` 现在默认把 PNG 写到 tracked assets，PDF 缓存仍在 ignored 的 `tmp/reference_figures/pdfs`。
+  - `scripts/run_real_env.sh` 新增 `REFERENCE_PREVIEWS` 环境变量，默认 `auto`；可用 `REFERENCE_PREVIEWS=required` 验证模型必须读取 preview。
+  - README 同步说明模板 PNG 是 versioned reference evidence，不是 renderer assets，最终 PPTX 仍不能嵌入这些参考图。
+- 真实 smoke 暴露并修复的问题：
+  - 第一次同目录 resume 时，真实 DrawPlan optimizer 生成 `ann_task_eq` 越界 bbox，`validate_draw_plan` 报 `draw object ann_task_eq bbox is outside normalized canvas`。
+  - 修复：`src/tools/draw_plan.rs` 新增 `normalize_draw_plan_bounds`，在模型 DrawPlan 验证前和 polish 后规范 object bbox、connector point、label bbox；合法 bbox 原样保留，越界 bbox 通过平移/缩放进画布，避免压成 0 宽高。
+  - `src/agent.rs` 在真实 optimizer 返回和 retry 返回后都调用 `normalize_draw_plan_bounds` 再验证。
+  - 另修复 resume 计数语义：`count_rounds` 和 `next_round_index` 只按有 `review.json` 的完成轮次计算；失败留下的半成品 round 会被下一次 resume 复用，而不是跳号。
+- 新增/更新测试：
+  - `tests/reference_library_tests.rs` 现在断言每个 reference 声明的 preview path 实际存在于可追踪模板目录。
+  - `tests/draw_plan_tests.rs` 新增越界 model geometry normalization 回归。
+  - `tests/pipeline_tests.rs` 新增半成品 `round_001` 被 resume 复用的回归。
+- 验证：
+  - `bash scripts/extract_reference_previews.sh` 通过，生成 5 个 PNG 到 `templates/method_overview/reference_figures/assets/`。
+  - `git check-ignore -v templates/method_overview/reference_figures/assets/simclr_contrastive_y_branch.png templates/method_overview/reference_figures/assets/neurips_2025_gated_attention_award.png || true` 无输出，说明模板 PNG 不被 ignore。
+  - `git ls-files --others --exclude-standard templates/method_overview/reference_figures/assets templates/method_overview/reference_figures.json scripts/extract_reference_previews.sh` 能列出新模板资产和脚本。
+  - 重点测试通过：`cargo test --test reference_library_tests --test prompt_tests --test workspace_pipeline_tests --test draw_plan_diff_tests`。
+  - 回归测试通过：`cargo test --test draw_plan_tests model_draw_plan_polish_normalizes_out_of_bounds_model_geometry -- --nocapture`。
+  - 回归测试通过：`cargo test --test pipeline_tests resume_pipeline_continues_rejected_run_directory -- --nocapture`。
+  - `cargo fmt --check` 通过。
+  - `cargo test` 全量通过。
+  - `cd renderer && npm run build` 通过。
+  - `bash -n scripts/extract_reference_previews.sh && bash -n scripts/run_real_env.sh && bash -n scripts/run_real_loop.sh && git diff --check` 通过。
+  - 真实 `.env` required-preview 两轮 smoke：
+    - 命令：`SESSION_ID=reference_assets_required_loop_20260620_141713 REFERENCE_PREVIEWS=required MAX_ITERATIONS=2 MAX_MINUTES=30 bash scripts/run_real_env.sh examples/teacher_student.md`
+    - run dir：`runs/teacher-student-distillation-with-latent-residuals/reference_assets_required_loop_20260620_141713`
+    - 结果：`accepted=false`、`rounds=2`、`reason="cap reached before acceptance"`。
+    - `final/reference_selection.json`：`selected_reference_id="simclr_contrastive_y_branch"`，`preview_path="templates/method_overview/reference_figures/assets/simclr_contrastive_y_branch.png"`，`preview_mode="required"`。
+    - `round_000/review.json` 和 `round_001/review.json` 都存在，证明两轮在同一目录完成。
+    - `round_000/improvement_plan.json` 有 5 条 actions，`round_001/improvement_plan.json` 有 6 条 actions。
+    - `round_001/renderer_status.json` 为 `source="model_generated_code"`、`used_fallback=false`，证明第二轮真实 coder path 可运行。
+    - `unzip -t final/figure.pptx` 无错误。
+- 剩余风险：
+  - 这次真实 smoke 因 `MAX_ITERATIONS=2` 到 cap 未 accepted；它验证的是 required-preview、两轮循环、同目录输出和 artifact 完整性，不是最终视觉质量收敛。
+  - `final/renderer_status.json` 选到 best-so-far 的 `round_000` deterministic fallback；`round_001` 已证明 model-generated code path 可运行，但 best-round 选择策略仍可能偏向带 fallback blocker 的高分轮次，后续可单独优化。

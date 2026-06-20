@@ -6,18 +6,21 @@ use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::agent::{
-    create_initial_code_bundle, create_initial_plan, create_revised_code_bundle,
-    review_rendered_figure, revise_draw_plan_from_feedback, validate_required_model_config,
+    create_initial_code_bundle, create_initial_plan, create_reference_selection,
+    create_revised_code_bundle, create_round_improvement_plan, review_rendered_figure,
+    revise_draw_plan_from_feedback, validate_required_model_config,
 };
 use crate::config::AppConfig;
 use crate::schema::{
-    validate_draw_plan, CanvasAspect, DrawPlan, FigurePlan, ImageProviderKind, Review, StyleName,
+    validate_draw_plan, CanvasAspect, DrawPlan, FigurePlan, ImageProviderKind,
+    ReferencePreviewMode, ReferenceSelection, Review, StyleName,
 };
 use crate::style::style_by_name;
 use crate::tools::asset_gen::materialize_assets;
 use crate::tools::canonicalize::canonicalize_plan_for_render;
 use crate::tools::cost::{
-    CostTracker, EST_CODER_USD, EST_IMAGE_ASSET_USD, EST_REASONER_INITIAL_USD, EST_VISION_USD,
+    CostTracker, EST_CODER_USD, EST_IMAGE_ASSET_USD, EST_REASONER_INITIAL_USD,
+    EST_REASONER_PATCH_USD, EST_VISION_USD,
 };
 use crate::tools::draw_plan::{
     draw_plan_from_figure_plan, generate_draw_plan_typescript,
@@ -32,7 +35,7 @@ use crate::tools::render::{
     default_renderer_root, run_node_renderer, run_node_renderer_with_fallback,
 };
 use crate::tools::review::{apply_plan_geometry_gate, apply_render_quality_gate};
-use crate::tools::template_library::method_template_pack_json;
+use crate::tools::template_library::{method_template_pack_json, select_reference_for_method};
 use crate::tools::validate::{normalize_plan_for_render, validate_plan_for_render};
 use crate::tools::workspace::{
     AgentWorkspace, WorkspaceFile, WorkspaceFileFormat, WorkspaceManifest,
@@ -49,6 +52,7 @@ pub struct RunOptions {
     pub max_cost_usd: f64,
     pub max_minutes: u32,
     pub image_provider: ImageProviderKind,
+    pub reference_previews: ReferencePreviewMode,
     pub mock_models: bool,
     pub keep_intermediate: bool,
     pub renderer_timeout: Duration,
@@ -72,8 +76,14 @@ struct ConfigSnapshot {
     max_cost_usd: f64,
     max_minutes: u32,
     image_provider: ImageProviderKind,
+    #[serde(default = "default_reference_previews")]
+    reference_previews: ReferencePreviewMode,
     mock_models: bool,
     keep_intermediate: bool,
+}
+
+fn default_reference_previews() -> ReferencePreviewMode {
+    ReferencePreviewMode::Auto
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -96,6 +106,7 @@ pub fn run_pipeline(options: RunOptions) -> Result<PipelineResult> {
 struct ResumeState {
     method_text: String,
     plan: FigurePlan,
+    reference_selection: ReferenceSelection,
     best_round: Option<(u32, Review)>,
     previous_review: Option<Review>,
     next_round_index: u32,
@@ -118,6 +129,7 @@ fn run_pipeline_inner(
     let (
         method_text,
         mut plan,
+        reference_selection,
         mut best_round,
         mut previous_review,
         mut rounds_completed,
@@ -131,6 +143,7 @@ fn run_pipeline_inner(
             (
                 state.method_text,
                 state.plan,
+                state.reference_selection,
                 state.best_round,
                 state.previous_review,
                 state.rounds_completed,
@@ -155,11 +168,25 @@ fn run_pipeline_inner(
                     max_cost_usd: options.max_cost_usd,
                     max_minutes: options.max_minutes,
                     image_provider: options.image_provider,
+                    reference_previews: options.reference_previews,
                     mock_models: options.mock_models,
                     keep_intermediate: options.keep_intermediate,
                 },
             )?;
             append_log(&options.out_dir, "run started")?;
+            if !options.mock_models {
+                cost.reserve("reasoner reference selection", EST_REASONER_PATCH_USD)?;
+            }
+            let reference_selection = create_reference_selection(
+                &method_text,
+                options.reference_previews,
+                &config,
+                options.mock_models,
+            )?;
+            write_json(
+                &options.out_dir.join("reference_selection.json"),
+                &reference_selection,
+            )?;
             if !options.mock_models {
                 cost.reserve("reasoner initial plan", EST_REASONER_INITIAL_USD)?;
             }
@@ -168,12 +195,15 @@ fn run_pipeline_inner(
                 options.style,
                 options.aspect,
                 options.target_width_mm,
+                &reference_selection,
                 &config,
                 options.mock_models,
             )?;
-            (method_text, plan, None, None, 0, 0)
+            (method_text, plan, reference_selection, None, None, 0, 0)
         }
     };
+    let reference_preview_path =
+        resolve_reference_preview_path(&reference_selection, options.reference_previews)?;
 
     let mut rounds_this_invocation = 0;
     loop {
@@ -226,6 +256,10 @@ fn run_pipeline_inner(
         normalize_plan_for_render(&mut plan);
         validate_plan_for_render(&plan, &style)?;
         write_json(&round_dir.join("figure_plan.json"), &plan)?;
+        write_json(
+            &round_dir.join("reference_selection.json"),
+            &reference_selection,
+        )?;
         let mut draw_plan = if let (Some(revision_round_dir), Some(revision_review)) =
             (revision_round_dir.as_deref(), revision_review.as_ref())
         {
@@ -240,12 +274,17 @@ fn run_pipeline_inner(
             let previous_draw_plan: DrawPlan =
                 read_json(&revision_round_dir.join("draw_plan.json"))
                     .context("failed to read revision source draw_plan.json")?;
+            let previous_improvement_plan =
+                read_text_or_empty(&revision_round_dir.join("improvement_plan.json"))?;
             revise_draw_plan_from_feedback(
                 &previous_draw_plan,
                 revision_review,
                 &read_text_or_empty(&revision_round_dir.join("layout_map.json"))?,
                 &read_text_or_empty(&revision_round_dir.join("validation_report.json"))?,
                 &previous_overlay_path(revision_round_dir, options.target_width_mm),
+                &reference_selection,
+                &previous_improvement_plan,
+                reference_preview_path.as_deref(),
                 &config,
                 options.mock_models,
                 round_index,
@@ -271,6 +310,7 @@ fn run_pipeline_inner(
             &round_dir,
             round_index,
             &method_text,
+            &reference_selection,
             revision_round_dir.as_deref(),
         )?;
         workspace.write_declared(
@@ -413,8 +453,15 @@ fn run_pipeline_inner(
                 break;
             }
         }
-        let mut review =
-            review_rendered_figure(&plan, &round_dir, &config, options.mock_models, round_index)?;
+        let mut review = review_rendered_figure(
+            &plan,
+            &round_dir,
+            &reference_selection,
+            reference_preview_path.as_deref(),
+            &config,
+            options.mock_models,
+            round_index,
+        )?;
         apply_plan_geometry_gate(&plan, &mut review);
         apply_render_quality_gate(&mut review, &round_dir.join("layout_map.json"))?;
         if used_fallback {
@@ -428,6 +475,26 @@ fn run_pipeline_inner(
                 errors: review.blocking_issues.clone(),
             },
         )?;
+        if !options.mock_models {
+            if let Err(error) =
+                cost.reserve("reasoner round improvement plan", EST_REASONER_PATCH_USD)
+            {
+                let reason = error.to_string();
+                append_log(&options.out_dir, &reason)?;
+                cap_reason = Some(reason);
+                break;
+            }
+        }
+        let improvement_plan = create_round_improvement_plan(
+            &review,
+            &read_text_or_empty(&round_dir.join("layout_map.json"))?,
+            &read_text_or_empty(&round_dir.join("validation_report.json"))?,
+            &reference_selection,
+            &config,
+            options.mock_models,
+            round_index,
+        )?;
+        write_json(&round_dir.join("improvement_plan.json"), &improvement_plan)?;
         rounds_completed = count_rounds(&options.out_dir)?;
         if should_replace_best_review(best_round.as_ref().map(|(_, review)| review), &review) {
             best_round = Some((round_index, review.clone()));
@@ -491,6 +558,7 @@ pub fn resume_pipeline(run_dir: PathBuf) -> Result<PipelineResult> {
             max_cost_usd: config.max_cost_usd,
             max_minutes: config.max_minutes,
             image_provider: config.image_provider,
+            reference_previews: config.reference_previews,
             mock_models: config.mock_models,
             keep_intermediate: config.keep_intermediate,
             renderer_timeout: Duration::from_secs(60),
@@ -537,10 +605,16 @@ fn load_resume_state(run_dir: &Path) -> Result<ResumeState> {
         read_json(&run_dir.join(format!("round_{best_index:03}/figure_plan.json"))).with_context(
             || format!("failed to read best round figure_plan.json from round {best_index}"),
         )?;
+    let reference_selection = if run_dir.join("reference_selection.json").exists() {
+        read_json(&run_dir.join("reference_selection.json"))?
+    } else {
+        select_reference_for_resume(&method_text)?
+    };
 
     Ok(ResumeState {
         method_text,
         plan,
+        reference_selection,
         best_round,
         previous_review,
         next_round_index: next_round_index(run_dir)?,
@@ -658,6 +732,8 @@ fn finalize_from_round(
         "layout_map.json",
         "validation_report.json",
         "renderer_status.json",
+        "reference_selection.json",
+        "improvement_plan.json",
     ] {
         let src = round_dir.join(file);
         if src.exists() {
@@ -695,11 +771,11 @@ struct FinalStatus {
 }
 
 fn count_rounds(run_dir: &Path) -> Result<u32> {
-    Ok(round_indices(run_dir)?.len() as u32)
+    Ok(completed_round_indices(run_dir)?.len() as u32)
 }
 
 fn next_round_index(run_dir: &Path) -> Result<u32> {
-    Ok(round_indices(run_dir)?
+    Ok(completed_round_indices(run_dir)?
         .into_iter()
         .max()
         .map(|index| index + 1)
@@ -752,6 +828,37 @@ fn read_text_or_empty(path: &Path) -> Result<String> {
     }
 }
 
+fn resolve_reference_preview_path(
+    selection: &ReferenceSelection,
+    mode: ReferencePreviewMode,
+) -> Result<Option<PathBuf>> {
+    if matches!(mode, ReferencePreviewMode::Off) {
+        return Ok(None);
+    }
+    let Some(path) = selection.preview_path.as_ref().map(PathBuf::from) else {
+        if matches!(mode, ReferencePreviewMode::Required) {
+            return Err(anyhow!(
+                "reference preview is required but selected reference has no preview_path"
+            ));
+        }
+        return Ok(None);
+    };
+    if path.exists() {
+        Ok(Some(path))
+    } else if matches!(mode, ReferencePreviewMode::Required) {
+        Err(anyhow!(
+            "reference preview is required but {} does not exist; run scripts/extract_reference_previews.sh first",
+            path.display()
+        ))
+    } else {
+        Ok(None)
+    }
+}
+
+fn select_reference_for_resume(method_text: &str) -> Result<ReferenceSelection> {
+    select_reference_for_method(method_text, ReferencePreviewMode::Auto)
+}
+
 fn renderer_source(source_on_success: &'static str, used_fallback: bool) -> &'static str {
     if used_fallback {
         "deterministic_fallback"
@@ -791,6 +898,7 @@ fn create_round_workspace(
     round_dir: &Path,
     round_index: u32,
     method_text: &str,
+    reference_selection: &ReferenceSelection,
     previous_round_dir: Option<&Path>,
 ) -> Result<AgentWorkspace> {
     let mut readable = vec![
@@ -805,6 +913,12 @@ fn create_round_workspace(
             "Classic method-overview template pack derived from extracted PDF/SVG figures.",
             WorkspaceFileFormat::Json,
             512_000,
+        ),
+        workspace_file(
+            "readable/reference_selection.json",
+            "Selected read-only visual reference grammar and anti-patterns for this run.",
+            WorkspaceFileFormat::Json,
+            128_000,
         ),
     ];
     if round_index > 0 {
@@ -846,6 +960,17 @@ fn create_round_workspace(
                 1_000_000,
             ),
         ]);
+        if previous_round_dir
+            .map(|dir| dir.join("improvement_plan.json").exists())
+            .unwrap_or(false)
+        {
+            readable.push(workspace_file(
+                "readable/previous_improvement_plan.json",
+                "Previous round concrete improvement plan.",
+                WorkspaceFileFormat::Json,
+                256_000,
+            ));
+        }
         if previous_round_dir
             .map(|dir| dir.join("helpers.ts").exists())
             .unwrap_or(false)
@@ -908,6 +1033,10 @@ fn create_round_workspace(
         "readable/method_templates.json",
         method_template_pack_json()?.as_bytes(),
     )?;
+    workspace.write_readable(
+        "readable/reference_selection.json",
+        &serde_json::to_vec_pretty(reference_selection)?,
+    )?;
     if let Some(previous_round_dir) = previous_round_dir {
         write_previous_readable(
             &workspace,
@@ -939,6 +1068,14 @@ fn create_round_workspace(
             "validation_report.json",
             "readable/previous_validation_report.json",
         )?;
+        if previous_round_dir.join("improvement_plan.json").exists() {
+            write_previous_readable(
+                &workspace,
+                previous_round_dir,
+                "improvement_plan.json",
+                "readable/previous_improvement_plan.json",
+            )?;
+        }
         write_previous_readable(
             &workspace,
             previous_round_dir,

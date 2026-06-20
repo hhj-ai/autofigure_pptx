@@ -64,12 +64,26 @@ Use `METHODFIG_IMAGE_MODALITIES=image,text` for OpenRouter models that return bo
 
 The MVP includes `--mock-models` for tests and local dry runs. Mock mode does not call real APIs.
 
+Reference previews are optional read-only model evidence and are checked into the template pack:
+
+```bash
+bash scripts/extract_reference_previews.sh
+```
+
+This writes preview PNGs under `templates/method_overview/reference_figures/assets/`, which is tracked with the reference pack. These previews may be attached to reasoner/vision context with `--reference-previews auto` or `required`, but they are never renderer assets and must never be embedded into the final PPTX.
+
 ## Usage
 
 For a finite real environment run with automatic output naming, use:
 
 ```bash
 bash scripts/run_real_env.sh examples/teacher_student.md
+```
+
+To require the checked-in reference preview image during a script run:
+
+```bash
+REFERENCE_PREVIEWS=required bash scripts/run_real_env.sh examples/teacher_student.md
 ```
 
 For a single command that keeps iterating in one session directory until the figure is accepted or you stop it, use:
@@ -98,9 +112,13 @@ open runs/latest/final/figure.pptx
 
 ```text
 templates/method_overview/method_templates.json
+templates/method_overview/reference_figures.json
+templates/method_overview/reference_figures/assets/*.png
 ```
 
 The pack stores abstract slots and flows derived from classic paper figures: Transformer Figure 1, SimCLR Figure 2, DDPM Figure 2, and U-Net Figure 1. It is used as layout grammar for editable PPTX shapes, text, and connectors; the renderer must not paste a source paper figure as a full-slide raster image.
+
+`reference_figures.json` adds a reference-selection layer for the agent loop. It includes classic references such as ViT, CLIP, BERT, SimCLR, plus ML conference award metadata such as NeurIPS 2025 Gated Attention. The reasoner selects one reference per run and writes `reference_selection.json`; every later round uses that selected reference as the quality target, anti-pattern list, and optional preview image rather than repeatedly injecting the whole library.
 
 To reproduce the extraction evidence:
 
@@ -121,6 +139,7 @@ cargo run -- run \
   --target-width-mm 85 \
   --max-cost-usd 3.00 \
   --max-minutes 20 \
+  --reference-previews auto \
   --image-provider none \
   --mock-models
 ```
@@ -140,11 +159,13 @@ cargo run -- schema --print
 runs/<task-slug>/<session-id>/
   input.md
   config_snapshot.json
+  reference_selection.json
   run.log
   round_000/
     workspace/
       manifest.json
       readable/
+        reference_selection.json
       writable/
         design_brief.md
         figure_plan.json
@@ -162,8 +183,10 @@ runs/<task-slug>/<session-id>/
     figure_review_overlay.png
     layout_map.json
     review.json
+    improvement_plan.json
     validation_report.json
     renderer_status.json
+    reference_selection.json
   final/
     figure.pptx
     figure.pdf
@@ -172,8 +195,10 @@ runs/<task-slug>/<session-id>/
     figure_plan.json
     draw_plan.json
     review.json
+    improvement_plan.json
     validation_report.json
     renderer_status.json
+    reference_selection.json
     status.json
     assets/
 ```
@@ -191,3 +216,5 @@ cd renderer && npm run build
 The mock end-to-end test verifies that the loop fails once, gives the next round access to the previous generated code and review artifacts, revises `figure.ts`, passes the next review, and creates final artifacts without real API calls.
 
 Acceptance is intentionally conservative. A figure is accepted only when the vision review clears the score thresholds and the local quality gate finds no collapsed components, major component overlap, degenerate edges, or obvious edge crossings in `layout_map.json`. Low color semantics or aesthetic scores also force rejection.
+
+For rejected rounds, `improvement_plan.json` must contain concrete target-level actions. The next DrawPlan optimization is rejected if it makes no material visible change to object boxes, connector routes, label boxes, text, style, additions, or removals.

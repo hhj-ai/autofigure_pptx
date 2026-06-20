@@ -4,7 +4,7 @@ use std::time::Duration;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
 use crate::pipeline::RunOptions;
-use crate::schema::{CanvasAspect, ImageProviderKind, StyleName};
+use crate::schema::{CanvasAspect, ImageProviderKind, ReferencePreviewMode, StyleName};
 
 #[derive(Debug, Parser)]
 #[command(name = "methodfig")]
@@ -42,6 +42,8 @@ pub struct RunArgs {
     pub max_minutes: u32,
     #[arg(long, value_enum, default_value_t = ImageProviderArg::Openrouter)]
     pub image_provider: ImageProviderArg,
+    #[arg(long, value_enum, default_value_t = ReferencePreviewArg::Auto)]
+    pub reference_previews: ReferencePreviewArg,
     #[arg(long)]
     pub mock_models: bool,
     #[arg(long)]
@@ -60,6 +62,7 @@ impl RunArgs {
             max_cost_usd: self.max_cost_usd,
             max_minutes: self.max_minutes,
             image_provider: self.image_provider.into(),
+            reference_previews: self.reference_previews.into(),
             mock_models: self.mock_models,
             keep_intermediate: self.keep_intermediate,
             renderer_timeout: Duration::from_secs(60),
@@ -130,6 +133,23 @@ impl From<ImageProviderArg> for ImageProviderKind {
             ImageProviderArg::OpenaiImages => ImageProviderKind::OpenAiImages,
             ImageProviderArg::Replicate => ImageProviderKind::Replicate,
             ImageProviderArg::None => ImageProviderKind::None,
+        }
+    }
+}
+
+#[derive(Copy, Clone, Debug, ValueEnum)]
+pub enum ReferencePreviewArg {
+    Auto,
+    Off,
+    Required,
+}
+
+impl From<ReferencePreviewArg> for ReferencePreviewMode {
+    fn from(value: ReferencePreviewArg) -> Self {
+        match value {
+            ReferencePreviewArg::Auto => ReferencePreviewMode::Auto,
+            ReferencePreviewArg::Off => ReferencePreviewMode::Off,
+            ReferencePreviewArg::Required => ReferencePreviewMode::Required,
         }
     }
 }

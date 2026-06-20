@@ -90,6 +90,212 @@ pub fn draw_plan_from_figure_plan(plan: &FigurePlan, style: &StyleSpec) -> DrawP
     }
 }
 
+pub fn has_material_draw_plan_change(previous: &DrawPlan, current: &DrawPlan) -> bool {
+    !draw_plan_material_changes(previous, current).is_empty()
+}
+
+pub fn draw_plan_material_changes(previous: &DrawPlan, current: &DrawPlan) -> Vec<String> {
+    let previous_by_id = previous
+        .objects
+        .iter()
+        .map(|object| (draw_object_id(object).to_string(), object))
+        .collect::<BTreeMap<_, _>>();
+    let current_by_id = current
+        .objects
+        .iter()
+        .map(|object| (draw_object_id(object).to_string(), object))
+        .collect::<BTreeMap<_, _>>();
+    let mut changes = Vec::new();
+
+    for id in previous_by_id.keys() {
+        if !current_by_id.contains_key(id) {
+            changes.push(format!("{id} removed"));
+        }
+    }
+    for id in current_by_id.keys() {
+        if !previous_by_id.contains_key(id) {
+            changes.push(format!("{id} added"));
+        }
+    }
+    for (id, previous_object) in previous_by_id {
+        let Some(current_object) = current_by_id.get(&id) else {
+            continue;
+        };
+        collect_object_material_changes(&id, previous_object, current_object, &mut changes);
+    }
+
+    changes
+}
+
+fn collect_object_material_changes(
+    id: &str,
+    previous: &DrawObject,
+    current: &DrawObject,
+    changes: &mut Vec<String>,
+) {
+    match (previous, current) {
+        (
+            DrawObject::Box {
+                bbox: previous_bbox,
+                text: previous_text,
+                role: previous_role,
+                style: previous_style,
+                ..
+            },
+            DrawObject::Box {
+                bbox: current_bbox,
+                text: current_text,
+                role: current_role,
+                style: current_style,
+                ..
+            },
+        ) => {
+            push_bbox_change(id, "bbox", *previous_bbox, *current_bbox, changes);
+            push_text_change(id, "text", previous_text, current_text, changes);
+            push_text_change(id, "role", previous_role, current_role, changes);
+            push_text_change(id, "style", previous_style, current_style, changes);
+        }
+        (
+            DrawObject::Text {
+                bbox: previous_bbox,
+                text: previous_text,
+                style: previous_style,
+                ..
+            },
+            DrawObject::Text {
+                bbox: current_bbox,
+                text: current_text,
+                style: current_style,
+                ..
+            },
+        ) => {
+            push_bbox_change(id, "bbox", *previous_bbox, *current_bbox, changes);
+            push_text_change(id, "text", previous_text, current_text, changes);
+            push_text_change(id, "style", previous_style, current_style, changes);
+        }
+        (
+            DrawObject::Connector {
+                points: previous_points,
+                from: previous_from,
+                to: previous_to,
+                style: previous_style,
+                label: previous_label,
+                ..
+            },
+            DrawObject::Connector {
+                points: current_points,
+                from: current_from,
+                to: current_to,
+                style: current_style,
+                label: current_label,
+                ..
+            },
+        ) => {
+            if !points_close(previous_points, current_points) {
+                changes.push(format!("{id} points changed"));
+            }
+            if previous_from != current_from {
+                changes.push(format!("{id} from changed"));
+            }
+            if previous_to != current_to {
+                changes.push(format!("{id} to changed"));
+            }
+            push_text_change(id, "style", previous_style, current_style, changes);
+            collect_label_changes(id, previous_label.as_ref(), current_label.as_ref(), changes);
+        }
+        (
+            DrawObject::Image {
+                bbox: previous_bbox,
+                asset_id: previous_asset_id,
+                ..
+            },
+            DrawObject::Image {
+                bbox: current_bbox,
+                asset_id: current_asset_id,
+                ..
+            },
+        ) => {
+            push_bbox_change(id, "bbox", *previous_bbox, *current_bbox, changes);
+            push_text_change(id, "asset", previous_asset_id, current_asset_id, changes);
+        }
+        (
+            DrawObject::Group {
+                bbox: previous_bbox,
+                label: previous_label,
+                style: previous_style,
+                ..
+            },
+            DrawObject::Group {
+                bbox: current_bbox,
+                label: current_label,
+                style: current_style,
+                ..
+            },
+        ) => {
+            push_bbox_change(id, "bbox", *previous_bbox, *current_bbox, changes);
+            if previous_label != current_label {
+                changes.push(format!("{id} label changed"));
+            }
+            push_text_change(id, "style", previous_style, current_style, changes);
+        }
+        _ => changes.push(format!("{id} kind changed")),
+    }
+}
+
+fn collect_label_changes(
+    id: &str,
+    previous: Option<&DrawLabel>,
+    current: Option<&DrawLabel>,
+    changes: &mut Vec<String>,
+) {
+    match (previous, current) {
+        (None, None) => {}
+        (Some(_), None) | (None, Some(_)) => changes.push(format!("{id} label changed")),
+        (Some(previous), Some(current)) => {
+            push_text_change(id, "label text", &previous.text, &current.text, changes);
+            push_bbox_change(id, "label bbox", previous.bbox, current.bbox, changes);
+        }
+    }
+}
+
+fn push_bbox_change(
+    id: &str,
+    field: &str,
+    previous: [f64; 4],
+    current: [f64; 4],
+    changes: &mut Vec<String>,
+) {
+    if !bbox_close(previous, current) {
+        changes.push(format!("{id} {field} changed"));
+    }
+}
+
+fn push_text_change(
+    id: &str,
+    field: &str,
+    previous: &str,
+    current: &str,
+    changes: &mut Vec<String>,
+) {
+    if previous != current {
+        changes.push(format!("{id} {field} changed"));
+    }
+}
+
+fn bbox_close(previous: [f64; 4], current: [f64; 4]) -> bool {
+    previous
+        .iter()
+        .zip(current)
+        .all(|(left, right)| (*left - right).abs() < 0.001)
+}
+
+fn points_close(previous: &[[f64; 2]], current: &[[f64; 2]]) -> bool {
+    previous.len() == current.len()
+        && previous.iter().zip(current).all(|(left, right)| {
+            (left[0] - right[0]).abs() < 0.001 && (left[1] - right[1]).abs() < 0.001
+        })
+}
+
 pub fn repair_draw_plan_geometry(plan: &mut DrawPlan) {
     repair_draw_plan_geometry_inner(plan, None);
 }
@@ -102,10 +308,32 @@ pub fn polish_model_draw_plan_geometry(plan: &mut DrawPlan) {
     polish_model_draw_plan_geometry_inner(plan, &HashSet::new());
 }
 
+pub fn normalize_draw_plan_bounds(plan: &mut DrawPlan) {
+    for object in &mut plan.objects {
+        match object {
+            DrawObject::Box { bbox, .. }
+            | DrawObject::Text { bbox, .. }
+            | DrawObject::Image { bbox, .. }
+            | DrawObject::Group { bbox, .. } => {
+                *bbox = shift_box_inside_canvas(*bbox);
+            }
+            DrawObject::Connector { points, label, .. } => {
+                for point in points {
+                    *point = clamp_point(*point);
+                }
+                if let Some(label) = label {
+                    label.bbox = shift_box_inside_canvas(label.bbox);
+                }
+            }
+        }
+    }
+}
+
 fn polish_model_draw_plan_geometry_inner(
     plan: &mut DrawPlan,
     protected_note_ids: &HashSet<String>,
 ) {
+    normalize_draw_plan_bounds(plan);
     plan.objects
         .retain(|object| !is_phase_only_text_annotation(object));
     remove_asymmetric_branch_annotations(plan);
@@ -128,6 +356,7 @@ fn polish_model_draw_plan_geometry_inner(
     remove_duplicate_inference_text_when_note_component_exists(plan);
     move_inference_note_boxes_out_of_flow_corridors(plan);
     snap_connector_labels_to_final_routes(plan);
+    normalize_draw_plan_bounds(plan);
 }
 
 pub fn polish_model_draw_plan_geometry_with_figure_plan(
@@ -149,6 +378,7 @@ pub fn polish_model_draw_plan_geometry_with_figure_plan(
     polish_model_draw_plan_geometry_inner(plan, &protected_note_ids);
     upsert_meaningful_annotations_from_figure_plan(plan, figure_plan);
     remove_duplicate_inference_text_when_note_component_exists(plan);
+    normalize_draw_plan_bounds(plan);
 }
 
 fn normalize_figure_plan_component_objects(plan: &mut DrawPlan, figure_plan: &FigurePlan) {
@@ -4494,6 +4724,42 @@ fn normalize_box(bbox: [f64; 4]) -> [f64; 4] {
     [x1.min(x2), y1.min(y2), x1.max(x2), y1.max(y2)]
 }
 
+fn shift_box_inside_canvas(bbox: [f64; 4]) -> [f64; 4] {
+    if bbox.iter().all(|value| value.is_finite())
+        && bbox.iter().all(|value| (0.0..=1.0).contains(value))
+        && bbox[2] > bbox[0]
+        && bbox[3] > bbox[1]
+    {
+        return bbox;
+    }
+    let x1 = finite_or(bbox[0], 0.0);
+    let y1 = finite_or(bbox[1], 0.0);
+    let x2 = finite_or(bbox[2], x1 + 0.12);
+    let y2 = finite_or(bbox[3], y1 + 0.08);
+    let left = x1.min(x2);
+    let right = x1.max(x2);
+    let top = y1.min(y2);
+    let bottom = y1.max(y2);
+    let width = (right - left).clamp(0.02, 0.96);
+    let height = (bottom - top).clamp(0.02, 0.96);
+    let center_x = finite_or((left + right) / 2.0, 0.5).clamp(width / 2.0, 1.0 - width / 2.0);
+    let center_y = finite_or((top + bottom) / 2.0, 0.5).clamp(height / 2.0, 1.0 - height / 2.0);
+    [
+        center_x - width / 2.0,
+        center_y - height / 2.0,
+        center_x + width / 2.0,
+        center_y + height / 2.0,
+    ]
+}
+
+fn finite_or(value: f64, fallback: f64) -> f64 {
+    if value.is_finite() {
+        value
+    } else {
+        fallback
+    }
+}
+
 fn union_bbox<I>(boxes: I) -> Option<[f64; 4]>
 where
     I: IntoIterator<Item = [f64; 4]>,
@@ -4766,7 +5032,10 @@ fn points_to_box(points: &[[f64; 2]]) -> [f64; 4] {
 }
 
 fn clamp_point(point: [f64; 2]) -> [f64; 2] {
-    [point[0].clamp(0.0, 1.0), point[1].clamp(0.0, 1.0)]
+    [
+        finite_or(point[0], 0.5).clamp(0.0, 1.0),
+        finite_or(point[1], 0.5).clamp(0.0, 1.0),
+    ]
 }
 
 fn push_distinct(points: &mut Vec<[f64; 2]>, point: [f64; 2]) {

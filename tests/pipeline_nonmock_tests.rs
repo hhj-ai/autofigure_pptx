@@ -3,7 +3,7 @@ use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 use methodfig::pipeline::{run_pipeline, RunOptions};
-use methodfig::schema::{CanvasAspect, ImageProviderKind, StyleName};
+use methodfig::schema::{CanvasAspect, ImageProviderKind, ReferencePreviewMode, StyleName};
 
 fn env_lock() -> &'static Mutex<()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -69,6 +69,7 @@ fn non_mock_pipeline_requires_configured_reasoner() {
         max_cost_usd: 3.0,
         max_minutes: 20,
         image_provider: ImageProviderKind::None,
+        reference_previews: ReferencePreviewMode::Auto,
         mock_models: false,
         keep_intermediate: true,
         renderer_timeout: Duration::from_secs(20),
@@ -105,6 +106,7 @@ fn non_mock_pipeline_requires_configured_coder_before_api_calls() {
         max_cost_usd: 3.0,
         max_minutes: 20,
         image_provider: ImageProviderKind::None,
+        reference_previews: ReferencePreviewMode::Auto,
         mock_models: false,
         keep_intermediate: true,
         renderer_timeout: Duration::from_secs(20),
@@ -141,6 +143,7 @@ fn non_mock_pipeline_enforces_cost_cap_before_external_calls() {
         max_cost_usd: 0.01,
         max_minutes: 20,
         image_provider: ImageProviderKind::None,
+        reference_previews: ReferencePreviewMode::Auto,
         mock_models: false,
         keep_intermediate: true,
         renderer_timeout: Duration::from_secs(20),

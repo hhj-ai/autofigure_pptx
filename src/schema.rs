@@ -27,6 +27,16 @@ pub enum ImageProviderKind {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub enum ReferencePreviewMode {
+    #[serde(rename = "auto")]
+    Auto,
+    #[serde(rename = "off")]
+    Off,
+    #[serde(rename = "required")]
+    Required,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub enum CanvasAspect {
     #[serde(rename = "paper-wide")]
     PaperWide,
@@ -674,6 +684,51 @@ pub struct Review {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct ReferenceSelection {
+    #[serde(default = "default_reference_selection_version")]
+    pub version: String,
+    pub selected_reference_id: String,
+    pub selected_reference_name: String,
+    pub source_paper: String,
+    pub source_url: String,
+    pub preview_path: Option<String>,
+    pub preview_mode: ReferencePreviewMode,
+    pub why_fit: String,
+    pub adaptation_rules: Vec<String>,
+    pub anti_patterns: Vec<String>,
+    pub quality_targets: Vec<String>,
+}
+
+fn default_reference_selection_version() -> String {
+    "0.1".to_string()
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct RoundImprovementPlan {
+    #[serde(default = "default_round_improvement_plan_version")]
+    pub version: String,
+    pub round_index: u32,
+    pub reference_id: String,
+    pub summary: String,
+    pub actions: Vec<ImprovementAction>,
+    pub preserve: Vec<String>,
+    pub rejected_as_unusable: bool,
+}
+
+fn default_round_improvement_plan_version() -> String {
+    "0.1".to_string()
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct ImprovementAction {
+    pub target_id: Option<String>,
+    pub change_type: String,
+    pub issue: String,
+    pub expected_visible_effect: String,
+    pub success_check: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct ReviewScores {
     pub semantic_fidelity: u8,
     pub story_clarity: u8,
@@ -924,5 +979,15 @@ pub fn review_schema_json() -> Result<String> {
 
 pub fn patch_plan_schema_json() -> Result<String> {
     let schema = schema_for!(PatchPlan);
+    Ok(serde_json::to_string_pretty(&schema)?)
+}
+
+pub fn reference_selection_schema_json() -> Result<String> {
+    let schema = schema_for!(ReferenceSelection);
+    Ok(serde_json::to_string_pretty(&schema)?)
+}
+
+pub fn round_improvement_plan_schema_json() -> Result<String> {
+    let schema = schema_for!(RoundImprovementPlan);
     Ok(serde_json::to_string_pretty(&schema)?)
 }

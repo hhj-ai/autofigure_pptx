@@ -8,20 +8,29 @@ use crate::llm::openai_compatible::OpenAiCompatibleProvider;
 use crate::llm::{ChatMessage, ChatProvider, ChatRequest};
 use crate::prompts::{
     CODER_DRAW_PLAN_INITIAL, CODER_DRAW_PLAN_REVISION, DRAW_PLAN_OPTIMIZER, REASON_INITIAL_PLANNER,
-    REASON_PATCH_PLANNER, TOP_TIER_FIGURE_DIRECTIVE, VISION_REVIEWER,
+    REASON_PATCH_PLANNER, REFERENCE_SELECTOR, ROUND_IMPROVEMENT_PLANNER, TOP_TIER_FIGURE_DIRECTIVE,
+    VISION_REVIEWER,
 };
 use crate::schema::{
-    draw_plan_schema_json, figure_plan_schema_json, patch_plan_schema_json, review_schema_json,
-    validate_draw_plan, CanvasAspect, DrawObject, DrawPlan, FigurePlan, LayoutRegion,
-    PatchOperation, PatchOperationType, PatchPlan, PatchStopReason, Review, StyleName,
+    draw_plan_schema_json, figure_plan_schema_json, patch_plan_schema_json,
+    reference_selection_schema_json, review_schema_json, round_improvement_plan_schema_json,
+    validate_draw_plan, CanvasAspect, DrawObject, DrawPlan, FigurePlan, ImprovementAction,
+    LayoutRegion, PatchOperation, PatchOperationType, PatchPlan, PatchStopReason,
+    ReferencePreviewMode, ReferenceSelection, Review, RoundImprovementPlan, StyleName,
     VisualWeight,
 };
 use crate::style::StyleSpec;
-use crate::tools::draw_plan::{generate_draw_plan_typescript, preserve_semantic_draw_objects};
+use crate::tools::draw_plan::{
+    generate_draw_plan_typescript, has_material_draw_plan_change, normalize_draw_plan_bounds,
+    preserve_semantic_draw_objects,
+};
 use crate::tools::generated_code::{normalize_generated_code_bundle, GeneratedCodeBundle};
 use crate::tools::pptx_codegen::generate_typescript;
 use crate::tools::render::scan_generated_typescript;
-use crate::tools::template_library::method_template_pack_json;
+use crate::tools::template_library::{
+    method_template_pack_json, reference_pack_json, select_reference_for_method,
+    selected_reference_json,
+};
 
 pub fn validate_required_model_config(config: &AppConfig, mock_models: bool) -> Result<()> {
     if mock_models {
@@ -39,11 +48,65 @@ pub fn validate_required_model_config(config: &AppConfig, mock_models: bool) -> 
     Ok(())
 }
 
+pub fn create_reference_selection(
+    method: &str,
+    preview_mode: ReferencePreviewMode,
+    config: &AppConfig,
+    mock_models: bool,
+) -> Result<ReferenceSelection> {
+    if mock_models {
+        return select_reference_for_method(method, preview_mode);
+    }
+    if !config.reasoner.is_configured() {
+        return Err(anyhow!(
+            "reasoner model is not configured for reference selection"
+        ));
+    }
+    let provider = OpenAiCompatibleProvider::new(config.reasoner.clone());
+    let request = ChatRequest {
+        temperature: 0.0,
+        messages: vec![
+            ChatMessage {
+                role: "system".to_string(),
+                content: REFERENCE_SELECTOR.to_string(),
+            },
+            ChatMessage {
+                role: "user".to_string(),
+                content: build_reference_selection_prompt(method, preview_mode)?,
+            },
+        ],
+    };
+    let text = block_on(provider.complete(request))?;
+    let mut selection: ReferenceSelection = serde_json::from_str(strip_json_fence(&text))
+        .with_context(|| "reasoner did not return valid ReferenceSelection JSON")?;
+    selection.preview_mode = preview_mode;
+    Ok(selection)
+}
+
+pub fn build_reference_selection_prompt(
+    method: &str,
+    preview_mode: ReferencePreviewMode,
+) -> Result<String> {
+    let schema = reference_selection_schema_json()?;
+    let pack = reference_pack_json()?;
+    Ok(format!(
+        "Select exactly one reference from reference_figures.json for the method below.\n\
+Return strict ReferenceSelection JSON only: no markdown, no prose, no schema wrapper.\n\
+Set version to \"0.1\" and preview_mode to \"{}\".\n\
+Use the reference as read-only layout/style evidence. Do not copy source artwork and do not ask the renderer to use preview images as output assets.\n\n\
+ReferenceSelection JSON Schema:\n{schema}\n\n\
+reference_figures.json:\n{pack}\n\n\
+Method Markdown:\n{method}",
+        reference_preview_mode_name(preview_mode)
+    ))
+}
+
 pub fn create_initial_plan(
     method: &str,
     style: StyleName,
     aspect: CanvasAspect,
     target_width_mm: u32,
+    reference_selection: &ReferenceSelection,
     config: &AppConfig,
     mock_models: bool,
 ) -> Result<FigurePlan> {
@@ -56,7 +119,8 @@ pub fn create_initial_plan(
         ));
     }
     let provider = OpenAiCompatibleProvider::new(config.reasoner.clone());
-    let user_prompt = build_initial_plan_prompt(method, style, aspect, target_width_mm)?;
+    let user_prompt =
+        build_initial_plan_prompt(method, style, aspect, target_width_mm, reference_selection)?;
     let request = ChatRequest {
         temperature: 0.1,
         messages: vec![
@@ -81,9 +145,10 @@ pub fn build_initial_plan_prompt(
     style: StyleName,
     aspect: CanvasAspect,
     target_width_mm: u32,
+    reference_selection: &ReferenceSelection,
 ) -> Result<String> {
     let schema = figure_plan_schema_json()?;
-    let method_templates = method_template_pack_json()?;
+    let selected_reference = selected_reference_json(reference_selection)?;
     Ok(format!(
         "Create exactly one FigurePlan object for the method below.\n\
 Return JSON only: no markdown, no prose, no schema wrapper, no comments.\n\
@@ -91,15 +156,15 @@ Required top-level keys: version, canvas, story, layout, components, edges, anno
 Every stable id must be globally unique across layout.regions, components, edges, annotations, and assets; do not reuse a component id as an edge or asset id.\n\
 Set version to \"0.1\". Set canvas.aspect to \"{}\" and canvas.target_width_mm to {target_width_mm}.\n\
 Use design.style \"{}\". Keep generated assets small and local only; semantic labels must remain editable PPTX text.\n\
-Before creating the plan, apply method_templates.json selection_rules. If a rule matches the method, adapt its preferred template slots/flows as the layout grammar. Treat the matching rule's avoid list as hard anti-patterns unless the method explicitly requires them. Record the chosen template id in story.visual_focus or annotation text only if it helps the renderer; do not copy source artwork.\n\n\
+Use the Selected visual reference as layout grammar and quality target. Adapt its slots, flows, anti_patterns, and quality_targets. Do not copy source artwork. If preview_path is present, treat it as a read-only preview only. The renderer must not use reference preview images as assets.\n\n\
 {}\n\n\
-method_templates.json:\n{}\n\n\
+Selected visual reference (ReferenceSelection):\n{}\n\n\
 FigurePlan JSON Schema:\n{schema}\n\n\
 Method Markdown:\n{method}",
         aspect_json_name(aspect),
         style_json_name(style),
         TOP_TIER_FIGURE_DIRECTIVE,
-        method_templates
+        selected_reference
     ))
 }
 
@@ -234,6 +299,9 @@ pub fn revise_draw_plan_from_feedback(
     layout_map: &str,
     validation_report: &str,
     overlay_path: &Path,
+    reference_selection: &ReferenceSelection,
+    improvement_plan_json: &str,
+    reference_preview_path: Option<&Path>,
     config: &AppConfig,
     mock_models: bool,
     round_index: u32,
@@ -255,17 +323,42 @@ pub fn revise_draw_plan_from_feedback(
         layout_map,
         &review_json,
         validation_report,
+        reference_selection,
+        improvement_plan_json,
     )?;
-    let text = block_on(OpenAiCompatibleProvider::complete_vision(
+    let vision_images = vision_images_with_optional_reference(overlay_path, reference_preview_path);
+    let text = block_on(OpenAiCompatibleProvider::complete_vision_with_images(
         config.vision.clone(),
         DRAW_PLAN_OPTIMIZER,
         &prompt,
-        overlay_path,
+        &vision_images,
     ))?;
     let mut draw_plan: DrawPlan = serde_json::from_str(strip_json_fence(&text))
         .with_context(|| "DrawPlan optimizer did not return valid DrawPlan JSON")?;
     preserve_semantic_draw_objects(previous_draw_plan, &mut draw_plan);
+    normalize_draw_plan_bounds(&mut draw_plan);
     validate_draw_plan(&draw_plan)?;
+    if !has_material_draw_plan_change(previous_draw_plan, &draw_plan) {
+        let retry_prompt = format!(
+            "{prompt}\n\nThe previous DrawPlan optimizer output was rejected because it made no material change to bbox, connector points, label bbox, text, style, object additions, or object removals. Return a corrected DrawPlan that implements the RoundImprovementPlan with visible changes."
+        );
+        let retry_text = block_on(OpenAiCompatibleProvider::complete_vision_with_images(
+            config.vision.clone(),
+            DRAW_PLAN_OPTIMIZER,
+            &retry_prompt,
+            &vision_images,
+        ))?;
+        draw_plan = serde_json::from_str(strip_json_fence(&retry_text))
+            .with_context(|| "DrawPlan optimizer retry did not return valid DrawPlan JSON")?;
+        preserve_semantic_draw_objects(previous_draw_plan, &mut draw_plan);
+        normalize_draw_plan_bounds(&mut draw_plan);
+        validate_draw_plan(&draw_plan)?;
+        if !has_material_draw_plan_change(previous_draw_plan, &draw_plan) {
+            return Err(anyhow!(
+                "DrawPlan optimizer returned no material visible change after retry"
+            ));
+        }
+    }
     Ok(draw_plan)
 }
 
@@ -274,14 +367,17 @@ pub fn build_draw_plan_revision_prompt(
     layout_map: &str,
     review_json: &str,
     validation_report_json: &str,
+    reference_selection: &ReferenceSelection,
+    improvement_plan_json: &str,
 ) -> Result<String> {
     let schema = draw_plan_schema_json()?;
-    let method_templates = method_template_pack_json()?;
+    let selected_reference = selected_reference_json(reference_selection)?;
     Ok(format!(
         "Revise the editable primitive DrawPlan for the next round.\n\
 Return exactly one DrawPlan object. Do not return TypeScript, SVG, markdown, prose, comments, or a schema wrapper.\n\
 The current rendered overlay image is attached. Treat it like AutoFigure-Edit's optimizer evidence: compare the visual overlay, layout_map coordinates, local validation errors, reviewer feedback, and current DrawPlan code/state.\n\n\
-You are allowed to make substantial layout changes when the current figure is weak. First apply method_templates.json selection_rules, then adapt the preferred template slots/flows over preserving a bad local layout. Treat the matching rule's avoid list as hard anti-patterns: if the current figure contains one, remove or redesign it instead of merely moving it. These templates are derived from extracted PDF/SVG method-overview figures from classic papers. Use them as editable layout grammar only; do not copy the source figure artwork or paste a full-page raster.\n\n\
+Use the Selected visual reference as read-only layout/style evidence. If reference preview evidence is attached after the current overlay, use it only to judge composition quality; do not copy the source artwork and do not add it as a DrawPlan image. These references are derived from extracted PDF/SVG method-overview figures from classic or ML conference award papers. Treat the selected reference anti_patterns as hard: if the current figure contains one, remove or redesign it instead of merely moving it.\n\n\
+You must implement the RoundImprovementPlan. The returned DrawPlan must materially change at least one bbox, connector point list, connector label bbox, text, style, object addition, or object removal unless the Review already passes.\n\n\
 You are a visual optimizer, not a semantic replanner. Do not invent new semantic modules, duplicate outputs, extra loss boxes, or new branches that are absent from the current semantic state. Do not expand an inference note into a separate inference subgraph unless such boxes/connectors already exist in the DrawPlan.\n\n\
 Do not add an output-to-student task-loss feedback edge when a task_loss box or output-to-loss edge already exists. If the semantic state contains teacher-to-student latent residual supervision as an edge, prefer a direct dashed residual edge instead of creating a separate residual box.\n\n\
 Please carefully compare and optimize these TWO MAJOR ASPECTS:\n\
@@ -299,7 +395,8 @@ Keep stable ids for objects that remain semantic parts of the figure. Remove onl
 All bbox values and connector points must be normalized [0,1]. Keep objects inside the canvas safe area.\n\
 Do not add full-slide raster images; semantic content must remain native shapes/text/connectors.\n\n\
 DrawPlan JSON Schema:\n{schema}\n\n\
-method_templates.json:\n{method_templates}\n\n\
+Selected visual reference (ReferenceSelection):\n{selected_reference}\n\n\
+RoundImprovementPlan:\n{improvement_plan_json}\n\n\
 Current DrawPlan JSON:\n{previous_draw_plan_json}\n\n\
 layout_map.json:\n{layout_map}\n\n\
 Review JSON:\n{review_json}\n\n\
@@ -468,6 +565,8 @@ fn box_height(bbox: [f64; 4]) -> f64 {
 pub fn review_rendered_figure(
     plan: &FigurePlan,
     round_dir: &Path,
+    reference_selection: &ReferenceSelection,
+    reference_preview_path: Option<&Path>,
     config: &AppConfig,
     mock_models: bool,
     round_index: u32,
@@ -483,24 +582,35 @@ pub fn review_rendered_figure(
         .unwrap_or_else(|_| "{}".to_string());
     let layout_map = std::fs::read_to_string(round_dir.join("layout_map.json"))
         .unwrap_or_else(|_| "{}".to_string());
-    let user_text = build_review_prompt(&plan_json, &draw_plan_json, &layout_map)?;
+    let user_text = build_review_prompt(
+        &plan_json,
+        &draw_plan_json,
+        &layout_map,
+        reference_selection,
+    )?;
     let image_path = round_dir.join(format!(
         "figure_{}mm_preview.png",
         plan.canvas.target_width_mm
     ));
-    let text = block_on(OpenAiCompatibleProvider::complete_vision(
+    let vision_images = vision_images_with_optional_reference(&image_path, reference_preview_path);
+    let text = block_on(OpenAiCompatibleProvider::complete_vision_with_images(
         config.vision.clone(),
         VISION_REVIEWER,
         &user_text,
-        &image_path,
+        &vision_images,
     ))?;
     let review = parse_review_text(&text).or_else(|first_error| {
-        let retry_user_text = build_review_retry_prompt(&plan_json, &draw_plan_json, &layout_map)?;
-        let retry_text = block_on(OpenAiCompatibleProvider::complete_vision(
+        let retry_user_text = build_review_retry_prompt(
+            &plan_json,
+            &draw_plan_json,
+            &layout_map,
+            reference_selection,
+        )?;
+        let retry_text = block_on(OpenAiCompatibleProvider::complete_vision_with_images(
             config.vision.clone(),
             VISION_REVIEWER,
             &retry_user_text,
-            &image_path,
+            &vision_images,
         ))?;
         parse_review_text(&retry_text).with_context(|| {
             format!(
@@ -515,8 +625,10 @@ pub fn build_review_prompt(
     plan_json: &str,
     draw_plan_json: &str,
     layout_map: &str,
+    reference_selection: &ReferenceSelection,
 ) -> Result<String> {
     let schema = review_schema_json()?;
+    let selected_reference = selected_reference_json(reference_selection)?;
     Ok(format!(
         "Review this paper method figure. Return exactly one Review object.\n\
 Return JSON only: no markdown, no prose, no comments.\n\
@@ -524,9 +636,11 @@ Scores must include every field from the schema, including semantic_fidelity and
 Keep string values short and do not embed quotation marks inside string content.\n\n\
 DrawPlan is the rendered source of truth for visible editable objects. Use FigurePlan for semantic intent, but judge object presence, removal, routing, and placement against DrawPlan and layout_map.\n\
 Do not report FigurePlan annotations as missing when they are absent from DrawPlan; assume redundant or marginal annotations may be intentionally removed before rendering.\n\n\
-Respect PDF-derived template reading order when FigurePlan/layout_map clearly follows a classic method-overview grammar. For example, a SimCLR-style bottom-center source branching upward to two paths and an upper alignment objective is acceptable; do not penalize it solely for not being top-down. Penalize only if arrows or spacing make that reading order unclear.\n\n\
+Use the Selected visual reference as the quality target. Respect its reading order and anti-patterns when the current DrawPlan is trying to follow it. If an optional reference preview image is attached, it is read-only evidence and must not be treated as an output asset.\n\n\
+Every rejection must include localized_issues or at least one blocking issue that names concrete target ids from DrawPlan/layout_map. The suggested_direction must be actionable and describe a visible bbox, connector route, label, spacing, or style change.\n\n\
 For wps_editability, inspect DrawPlan/layout_map rather than guessing from the PNG. If the visible semantic figure is composed of native boxes, text, and connectors with no full-slide raster image, assign wps_editability 9 or 10 unless there is concrete evidence of non-editable text, missing objects, or invalid geometry.\n\n\
 Review JSON Schema:\n{schema}\n\n\
+Selected visual reference (ReferenceSelection):\n{selected_reference}\n\n\
 FigurePlan:\n{plan_json}\n\n\
 DrawPlan:\n{draw_plan_json}\n\n\
 layout_map.json:\n{layout_map}"
@@ -537,8 +651,10 @@ pub fn build_review_retry_prompt(
     plan_json: &str,
     draw_plan_json: &str,
     layout_map: &str,
+    reference_selection: &ReferenceSelection,
 ) -> Result<String> {
     let schema = review_schema_json()?;
+    let selected_reference = selected_reference_json(reference_selection)?;
     Ok(format!(
         "The previous answer was not valid JSON. Return the same Review object again.\n\
 Return strict JSON only: no markdown, no prose, no comments, and no code fences.\n\
@@ -546,13 +662,160 @@ Keep each string value short and avoid embedded quotation marks inside the text.
 Scores must include every field from the schema, including semantic_fidelity and wps_editability, each as an integer from 1 to 10.\n\n\
 DrawPlan is the rendered source of truth for visible editable objects. Use FigurePlan for semantic intent, but judge object presence, removal, routing, and placement against DrawPlan and layout_map.\n\
 Do not report FigurePlan annotations as missing when they are absent from DrawPlan.\n\n\
-Respect PDF-derived template reading order when FigurePlan/layout_map clearly follows a classic method-overview grammar, including a SimCLR-style bottom-center source branching upward to two paths and an upper alignment objective. Penalize only if arrows or spacing make that reading order unclear.\n\n\
+Use the Selected visual reference as the quality target. Every rejection must include localized_issues or concrete target ids in blocking_issues, with actionable suggested_direction text.\n\n\
 For wps_editability, inspect DrawPlan/layout_map rather than guessing from the PNG. If the visible semantic figure is composed of native boxes, text, and connectors with no full-slide raster image, assign wps_editability 9 or 10 unless there is concrete evidence of non-editable text, missing objects, or invalid geometry.\n\n\
 Review JSON Schema:\n{schema}\n\n\
+Selected visual reference (ReferenceSelection):\n{selected_reference}\n\n\
 FigurePlan:\n{plan_json}\n\n\
 DrawPlan:\n{draw_plan_json}\n\n\
 layout_map.json:\n{layout_map}"
     ))
+}
+
+pub fn create_round_improvement_plan(
+    review: &Review,
+    layout_map: &str,
+    validation_report: &str,
+    reference_selection: &ReferenceSelection,
+    config: &AppConfig,
+    mock_models: bool,
+    round_index: u32,
+) -> Result<RoundImprovementPlan> {
+    if mock_models {
+        return Ok(mock_round_improvement_plan(
+            review,
+            reference_selection,
+            round_index,
+        ));
+    }
+    if !config.reasoner.is_configured() {
+        return Err(anyhow!(
+            "reasoner model is not configured for round improvement planning"
+        ));
+    }
+    let provider = OpenAiCompatibleProvider::new(config.reasoner.clone());
+    let request = ChatRequest {
+        temperature: 0.0,
+        messages: vec![
+            ChatMessage {
+                role: "system".to_string(),
+                content: ROUND_IMPROVEMENT_PLANNER.to_string(),
+            },
+            ChatMessage {
+                role: "user".to_string(),
+                content: build_round_improvement_prompt(
+                    &serde_json::to_string_pretty(review)?,
+                    layout_map,
+                    validation_report,
+                    reference_selection,
+                    round_index,
+                )?,
+            },
+        ],
+    };
+    let text = block_on(provider.complete(request))?;
+    let plan: RoundImprovementPlan = serde_json::from_str(strip_json_fence(&text))
+        .with_context(|| "reasoner did not return valid RoundImprovementPlan JSON")?;
+    validate_round_improvement_plan(&plan, review)?;
+    Ok(plan)
+}
+
+pub fn build_round_improvement_prompt(
+    review_json: &str,
+    layout_map: &str,
+    validation_report: &str,
+    reference_selection: &ReferenceSelection,
+    round_index: u32,
+) -> Result<String> {
+    let schema = round_improvement_plan_schema_json()?;
+    let selected_reference = selected_reference_json(reference_selection)?;
+    Ok(format!(
+        "Create the next-round improvement plan for round {round_index}.\n\
+Return exactly one RoundImprovementPlan JSON object. Use actions as an array.\n\
+If Review.passed is false, actions must be non-empty. Each action must name a target_id from layout_map when possible, or use change_type \"reference_replan\" for a template-level change.\n\
+Do not give vague advice. Each expected_visible_effect must state what will visibly change in bbox, connector points, label bbox, text, style, object addition, or object removal.\n\n\
+RoundImprovementPlan JSON Schema:\n{schema}\n\n\
+Selected visual reference (ReferenceSelection):\n{selected_reference}\n\n\
+Review JSON:\n{review_json}\n\n\
+layout_map.json:\n{layout_map}\n\n\
+validation_report.json:\n{validation_report}"
+    ))
+}
+
+fn mock_round_improvement_plan(
+    review: &Review,
+    reference_selection: &ReferenceSelection,
+    round_index: u32,
+) -> RoundImprovementPlan {
+    let mut actions = Vec::new();
+    if !review.passed {
+        for issue in &review.localized_issues {
+            actions.push(ImprovementAction {
+                target_id: Some(issue.target_id.clone()),
+                change_type: "localized_geometry_or_style".to_string(),
+                issue: issue.issue.clone(),
+                expected_visible_effect: issue.suggested_direction.clone(),
+                success_check: format!(
+                    "{} no longer appears in review/layout_map issues",
+                    issue.target_id
+                ),
+            });
+        }
+        if actions.is_empty() {
+            for issue in &review.blocking_issues {
+                actions.push(ImprovementAction {
+                    target_id: Some("global_layout".to_string()),
+                    change_type: "reference_replan".to_string(),
+                    issue: issue.clone(),
+                    expected_visible_effect: "Apply selected reference anti-patterns to make a visible layout or routing change".to_string(),
+                    success_check: "next DrawPlan material diff is non-empty and the blocking issue is reduced".to_string(),
+                });
+            }
+        }
+    }
+    RoundImprovementPlan {
+        version: "0.1".to_string(),
+        round_index,
+        reference_id: reference_selection.selected_reference_id.clone(),
+        summary: if review.passed {
+            "Review passed; preserve current design.".to_string()
+        } else {
+            "Concrete next-round fixes derived from review and selected reference.".to_string()
+        },
+        actions,
+        preserve: reference_selection.quality_targets.clone(),
+        rejected_as_unusable: false,
+    }
+}
+
+fn validate_round_improvement_plan(plan: &RoundImprovementPlan, review: &Review) -> Result<()> {
+    if !review.passed && plan.actions.is_empty() {
+        return Err(anyhow!(
+            "RoundImprovementPlan for rejected review must include at least one action"
+        ));
+    }
+    for action in &plan.actions {
+        if action
+            .target_id
+            .as_deref()
+            .unwrap_or_default()
+            .trim()
+            .is_empty()
+            && action.change_type != "reference_replan"
+        {
+            return Err(anyhow!(
+                "RoundImprovementPlan action must include target_id or reference_replan"
+            ));
+        }
+        if action.expected_visible_effect.trim().is_empty()
+            || action.success_check.trim().is_empty()
+        {
+            return Err(anyhow!(
+                "RoundImprovementPlan action must include visible effect and success check"
+            ));
+        }
+    }
+    Ok(())
 }
 
 pub fn create_patch_plan(
@@ -996,6 +1259,27 @@ fn style_json_name(style: StyleName) -> &'static str {
         StyleName::CvprClean => "cvpr-clean",
         StyleName::NeuripsMinimal => "neurips-minimal",
     }
+}
+
+fn reference_preview_mode_name(mode: ReferencePreviewMode) -> &'static str {
+    match mode {
+        ReferencePreviewMode::Auto => "auto",
+        ReferencePreviewMode::Off => "off",
+        ReferencePreviewMode::Required => "required",
+    }
+}
+
+fn vision_images_with_optional_reference<'a>(
+    primary: &'a Path,
+    reference: Option<&'a Path>,
+) -> Vec<&'a Path> {
+    let mut images = vec![primary];
+    if let Some(reference) = reference {
+        if reference.exists() {
+            images.push(reference);
+        }
+    }
+    images
 }
 
 fn block_on<T>(future: impl std::future::Future<Output = Result<T>>) -> Result<T> {

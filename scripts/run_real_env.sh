@@ -12,6 +12,7 @@ target_width_mm="${TARGET_WIDTH_MM:-85}"
 max_cost_usd="${MAX_COST_USD:-10000}"
 max_minutes="${MAX_MINUTES:-60}"
 max_iterations="${MAX_ITERATIONS:-3}"
+reference_previews="${REFERENCE_PREVIEWS:-auto}"
 
 if [[ ! -f "$method_path" ]]; then
   echo "method file not found: $method_path" >&2
@@ -59,6 +60,7 @@ echo "method: $method_path"
 echo "task: $slug"
 echo "session: $session_id"
 echo "run dir: $out_dir"
+echo "reference_previews: $reference_previews"
 
 if [[ -f "$out_dir/config_snapshot.json" ]]; then
   cmd=(cargo run -- resume --run "$out_dir")
@@ -73,6 +75,7 @@ else
     --max-iterations "$max_iterations"
     --max-cost-usd "$max_cost_usd"
     --max-minutes "$max_minutes"
+    --reference-previews "$reference_previews"
     --image-provider none
     --keep-intermediate
   )

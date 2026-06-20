@@ -47,6 +47,41 @@ fn draw_plan_roundtrips_box_connector_and_label_geometry() {
 }
 
 #[test]
+fn model_draw_plan_polish_normalizes_out_of_bounds_model_geometry() {
+    let mut plan = minimal_draw_plan(vec![
+        DrawObject::Text {
+            id: "ann_task_eq".to_string(),
+            bbox: [1.08, -0.04, 1.28, 0.06],
+            text: "L_task = CE(y, y_hat)".to_string(),
+            style: "caption".to_string(),
+            z: 30,
+        },
+        DrawObject::Connector {
+            id: "e_task_eq".to_string(),
+            points: vec![[-0.10, 0.50], [1.15, 1.10]],
+            from: None,
+            to: None,
+            style: "normal_flow".to_string(),
+            label: Some(DrawLabel {
+                text: "task loss".to_string(),
+                bbox: [0.92, 1.04, 1.12, 1.12],
+            }),
+            z: 10,
+        },
+    ]);
+
+    polish_model_draw_plan_geometry(&mut plan);
+
+    validate_draw_plan(&plan)
+        .expect("model-authored out-of-bounds geometry should be normalized before validation");
+    let ann_bbox = text_box(&plan, "ann_task_eq");
+    assert!(
+        ann_bbox[2] - ann_bbox[0] > 0.05 && ann_bbox[3] - ann_bbox[1] > 0.03,
+        "normalization should shift boxes inside the canvas without collapsing them"
+    );
+}
+
+#[test]
 fn draw_plan_from_figure_plan_uses_accent_style_for_loss_components() {
     let figure_plan: FigurePlan = serde_json::from_value(json!({
         "version": "0.1",

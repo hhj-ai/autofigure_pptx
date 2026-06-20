@@ -1,0 +1,260 @@
+{
+  "version": "0.1",
+  "purpose": "Read-only visual reference pack for method-overview figure planning. Entries describe abstract layout/style grammar and optional local preview evidence; they are not renderer assets.",
+  "copyright_policy": "Do not paste source paper figures as full-slide images. Use only the abstract slots, flows, style grammar, anti-patterns, and quality targets to produce editable native PPTX shapes/text/connectors.",
+  "preview_policy": "Preview PNGs are stored under templates/method_overview/reference_figures/assets/ so they can be versioned with the reference pack and attached as read-only model evidence. Renderer code must never load them as figure assets.",
+  "preview_root": "templates/method_overview/reference_figures/assets",
+  "references": [
+    {
+      "id": "simclr_contrastive_y_branch",
+      "name": "Two-view contrastive Y-branch",
+      "family": "classic_method_overview",
+      "selection_tags": ["teacher", "student", "distillation", "residual", "contrastive", "two view", "alignment"],
+      "source": {
+        "paper": "A Simple Framework for Contrastive Learning of Visual Representations",
+        "authors": "Ting Chen, Simon Kornblith, Mohammad Norouzi, Geoffrey Hinton",
+        "year": 2020,
+        "figure": "Figure 2",
+        "pdf_url": "https://arxiv.org/pdf/2002.05709",
+        "award_url": null
+      },
+      "preview": {
+        "local_path": "templates/method_overview/reference_figures/assets/simclr_contrastive_y_branch.png",
+        "source_page": 2,
+        "figure_bbox_page_norm": [0.53, 0.07, 0.89, 0.32]
+      },
+      "layout_pattern": {
+        "reading_order": "bottom_center_to_two_branches_to_top_alignment",
+        "slots": [
+          {"id": "source", "role": "shared_source", "bbox": [0.45, 0.76, 0.55, 0.90]},
+          {"id": "left_branch", "role": "branch_model_or_view", "bbox": [0.12, 0.24, 0.30, 0.62]},
+          {"id": "right_branch", "role": "branch_model_or_view", "bbox": [0.70, 0.24, 0.88, 0.62]},
+          {"id": "agreement", "role": "alignment_objective", "bbox": [0.34, 0.06, 0.66, 0.18]}
+        ],
+        "flows": [
+          {"from": "source", "to": "left_branch", "style": "stochastic_branch"},
+          {"from": "source", "to": "right_branch", "style": "stochastic_branch"},
+          {"from": "left_branch", "to": "agreement", "style": "objective_alignment"},
+          {"from": "right_branch", "to": "agreement", "style": "objective_alignment"}
+        ]
+      },
+      "style_grammar": [
+        "Treat teacher and student as two correlated branches when adapting to distillation.",
+        "Keep the agreement or residual objective centered between branch endpoints.",
+        "Use the avoid list as hard anti-patterns when review feedback repeats."
+      ],
+      "anti_patterns": [
+        "bottom-heavy separate inference lane",
+        "residual as standalone node",
+        "floating phase labels",
+        "long input detours",
+        "standalone inference note component",
+        "asymmetric branch annotations",
+        "connector-overlapping labels"
+      ],
+      "quality_rubric": [
+        "Teacher and student branches are visibly balanced.",
+        "The supervision objective is direct and readable.",
+        "Inference-only notes stay compact and outside main flow corridors."
+      ]
+    },
+    {
+      "id": "vit_patch_transformer",
+      "name": "ViT patch-to-token transformer pipeline",
+      "family": "classic_architecture",
+      "selection_tags": ["vision transformer", "patch", "token", "embedding", "transformer encoder", "classification"],
+      "source": {
+        "paper": "An Image is Worth 16x16 Words: Transformers for Image Recognition at Scale",
+        "authors": "Alexey Dosovitskiy et al.",
+        "year": 2020,
+        "figure": "Figure 1",
+        "pdf_url": "https://arxiv.org/pdf/2010.11929",
+        "award_url": null
+      },
+      "preview": {
+        "local_path": "templates/method_overview/reference_figures/assets/vit_patch_transformer.png",
+        "source_page": 3,
+        "figure_bbox_page_norm": [0.12, 0.14, 0.88, 0.46]
+      },
+      "layout_pattern": {
+        "reading_order": "left_to_right_patch_sequence_to_stack_to_head",
+        "slots": [
+          {"id": "image", "role": "input_image", "bbox": [0.04, 0.36, 0.16, 0.64]},
+          {"id": "patch_grid", "role": "patchification", "bbox": [0.18, 0.32, 0.34, 0.68]},
+          {"id": "token_sequence", "role": "flattened_tokens", "bbox": [0.36, 0.42, 0.52, 0.58]},
+          {"id": "transformer_stack", "role": "stacked_encoder", "bbox": [0.56, 0.22, 0.76, 0.78]},
+          {"id": "head", "role": "prediction_head", "bbox": [0.82, 0.40, 0.96, 0.60]}
+        ],
+        "flows": [
+          {"from": "image", "to": "patch_grid", "style": "main_flow"},
+          {"from": "patch_grid", "to": "token_sequence", "style": "main_flow"},
+          {"from": "token_sequence", "to": "transformer_stack", "style": "main_flow"},
+          {"from": "transformer_stack", "to": "head", "style": "main_flow"}
+        ]
+      },
+      "style_grammar": [
+        "Use repeated small patches/tokens only as simplified native rectangles, not dense pixels.",
+        "Collapse repeated transformer blocks into one stacked group at 85 mm width.",
+        "Keep class/output head visually smaller than the central encoder stack."
+      ],
+      "anti_patterns": [
+        "dense tiny unreadable token grids",
+        "diagonal patch-to-token spaghetti",
+        "oversized output head",
+        "decorative raster input occupying the full canvas"
+      ],
+      "quality_rubric": [
+        "Patchification and tokenization are visually distinct.",
+        "Transformer stack is the main vertical hierarchy.",
+        "All labels remain readable at paper width."
+      ]
+    },
+    {
+      "id": "clip_dual_encoder_contrastive",
+      "name": "CLIP dual encoder contrastive alignment",
+      "family": "classic_architecture",
+      "selection_tags": ["clip", "image text", "dual encoder", "contrastive", "alignment", "vision language"],
+      "source": {
+        "paper": "Learning Transferable Visual Models From Natural Language Supervision",
+        "authors": "Alec Radford et al.",
+        "year": 2021,
+        "figure": "Figure 1",
+        "pdf_url": "https://arxiv.org/pdf/2103.00020",
+        "award_url": null
+      },
+      "preview": {
+        "local_path": "templates/method_overview/reference_figures/assets/clip_dual_encoder_contrastive.png",
+        "source_page": 2,
+        "figure_bbox_page_norm": [0.05, 0.10, 0.95, 0.58]
+      },
+      "layout_pattern": {
+        "reading_order": "two_balanced_towers_to_shared_similarity_matrix",
+        "slots": [
+          {"id": "image_inputs", "role": "input_batch", "bbox": [0.05, 0.18, 0.18, 0.44]},
+          {"id": "text_inputs", "role": "input_batch", "bbox": [0.05, 0.56, 0.18, 0.82]},
+          {"id": "image_encoder", "role": "paired_encoder", "bbox": [0.26, 0.20, 0.42, 0.42]},
+          {"id": "text_encoder", "role": "paired_encoder", "bbox": [0.26, 0.58, 0.42, 0.80]},
+          {"id": "embedding_space", "role": "shared_embedding", "bbox": [0.50, 0.30, 0.66, 0.70]},
+          {"id": "contrastive_objective", "role": "alignment_objective", "bbox": [0.74, 0.36, 0.94, 0.64]}
+        ],
+        "flows": [
+          {"from": "image_inputs", "to": "image_encoder", "style": "main_flow"},
+          {"from": "text_inputs", "to": "text_encoder", "style": "main_flow"},
+          {"from": "image_encoder", "to": "embedding_space", "style": "main_flow"},
+          {"from": "text_encoder", "to": "embedding_space", "style": "main_flow"},
+          {"from": "embedding_space", "to": "contrastive_objective", "style": "objective_alignment"}
+        ]
+      },
+      "style_grammar": [
+        "Use two towers as balanced counterparts with matching sizes and parallel arrows.",
+        "Make the shared embedding/alignment objective the visual meeting point.",
+        "Use subtle color coding for modalities while keeping arrows dark and readable."
+      ],
+      "anti_patterns": [
+        "unbalanced branches",
+        "one modality dominating the other",
+        "crossing image/text arrows",
+        "matrix or objective labels overlapping connectors"
+      ],
+      "quality_rubric": [
+        "The two modalities read as symmetric counterparts.",
+        "Alignment objective is obvious without long explanatory notes.",
+        "No branch label touches a connector."
+      ]
+    },
+    {
+      "id": "bert_pretrain_finetune",
+      "name": "BERT pretraining-to-finetuning task layout",
+      "family": "classic_architecture",
+      "selection_tags": ["bert", "pretrain", "fine tune", "masked language model", "next sentence", "encoder stack"],
+      "source": {
+        "paper": "BERT: Pre-training of Deep Bidirectional Transformers for Language Understanding",
+        "authors": "Jacob Devlin, Ming-Wei Chang, Kenton Lee, Kristina Toutanova",
+        "year": 2018,
+        "figure": "Figure 1",
+        "pdf_url": "https://arxiv.org/pdf/1810.04805",
+        "award_url": null
+      },
+      "preview": {
+        "local_path": "templates/method_overview/reference_figures/assets/bert_pretrain_finetune.png",
+        "source_page": 2,
+        "figure_bbox_page_norm": [0.08, 0.10, 0.92, 0.54]
+      },
+      "layout_pattern": {
+        "reading_order": "bottom_tokens_to_shared_stack_to_task_heads",
+        "slots": [
+          {"id": "token_inputs", "role": "sequence_input", "bbox": [0.08, 0.72, 0.92, 0.88]},
+          {"id": "encoder_stack", "role": "shared_encoder", "bbox": [0.24, 0.28, 0.76, 0.66]},
+          {"id": "pretrain_heads", "role": "training_objectives", "bbox": [0.08, 0.08, 0.38, 0.22]},
+          {"id": "finetune_heads", "role": "task_heads", "bbox": [0.62, 0.08, 0.92, 0.22]}
+        ],
+        "flows": [
+          {"from": "token_inputs", "to": "encoder_stack", "style": "main_flow"},
+          {"from": "encoder_stack", "to": "pretrain_heads", "style": "objective_alignment"},
+          {"from": "encoder_stack", "to": "finetune_heads", "style": "main_flow"}
+        ]
+      },
+      "style_grammar": [
+        "Use a central shared encoder stack with task heads branching above or beside it.",
+        "Keep repeated layers collapsed; show task differences through compact head labels.",
+        "Use consistent token-row geometry for sequence inputs."
+      ],
+      "anti_patterns": [
+        "drawing every transformer layer",
+        "large paragraph-style task explanations",
+        "task heads floating without clear link to shared encoder"
+      ],
+      "quality_rubric": [
+        "Shared encoder reuse is clear.",
+        "Pretraining and downstream task heads are visually separated.",
+        "Token inputs do not crowd the main stack."
+      ]
+    },
+    {
+      "id": "neurips_2025_gated_attention_award",
+      "name": "NeurIPS 2025 award style: gated attention ablation architecture",
+      "family": "ml_conference_award",
+      "selection_tags": ["gated attention", "attention sink", "softmax attention", "llm architecture", "ablation", "scaling"],
+      "source": {
+        "paper": "Gated Attention for Large Language Models: Non-linearity, Sparsity, and Attention-Sink-Free",
+        "authors": "Zihan Qiu et al.",
+        "year": 2025,
+        "figure": "award reference",
+        "pdf_url": null,
+        "award_url": "https://blog.neurips.cc/2025/11/26/announcing-the-neurips-2025-best-paper-awards/"
+      },
+      "preview": {
+        "local_path": "templates/method_overview/reference_figures/assets/neurips_2025_gated_attention_award.png",
+        "source_page": null,
+        "figure_bbox_page_norm": null
+      },
+      "layout_pattern": {
+        "reading_order": "baseline_block_to_inserted_gate_to_effects",
+        "slots": [
+          {"id": "baseline_attention", "role": "baseline_module", "bbox": [0.06, 0.34, 0.26, 0.62]},
+          {"id": "gate_insert", "role": "method_modification", "bbox": [0.36, 0.30, 0.58, 0.66]},
+          {"id": "effects", "role": "empirical_effects", "bbox": [0.70, 0.24, 0.94, 0.72]}
+        ],
+        "flows": [
+          {"from": "baseline_attention", "to": "gate_insert", "style": "main_flow"},
+          {"from": "gate_insert", "to": "effects", "style": "evidence_flow"}
+        ]
+      },
+      "style_grammar": [
+        "Highlight the minimal architectural intervention rather than drawing a huge full model.",
+        "Use compact evidence chips for stability, sparsity, and attention-sink reduction.",
+        "Keep comparison/ablation labels close to the modified block."
+      ],
+      "anti_patterns": [
+        "full transformer stack with no highlighted change",
+        "too many ablation branches",
+        "results chips detached from the module they justify"
+      ],
+      "quality_rubric": [
+        "The intervention location is obvious.",
+        "Evidence/result summaries support the visual claim.",
+        "The figure remains architecture-first, not a table pasted into a diagram."
+      ]
+    }
+  ]
+}
