@@ -290,6 +290,200 @@ fn draw_plan_renderer_draws_connector_labels_above_boxes() {
     );
 }
 
+#[test]
+fn draw_plan_renderer_applies_style_tokens_and_tracks_edge_endpoints() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let round_dir = temp.path().join("round_000");
+    let renderer_root = default_renderer_root().expect("renderer root");
+    let style = style_by_name(StyleName::WpsClean);
+    let draw_plan = methodfig::schema::DrawPlan {
+        version: "0.2".to_string(),
+        canvas: methodfig::schema::Canvas {
+            aspect: CanvasAspect::PaperWide,
+            target_width_mm: 85,
+            safe_margin: 0.06,
+        },
+        style_tokens: BTreeMap::from([
+            ("primary".to_string(), "AA0000".to_string()),
+            ("accent".to_string(), "00AA00".to_string()),
+            ("neutral_fill".to_string(), "F0F0F0".to_string()),
+            ("text".to_string(), "111111".to_string()),
+        ]),
+        objects: vec![
+            methodfig::schema::DrawObject::Box {
+                id: "main".to_string(),
+                bbox: [0.10, 0.25, 0.28, 0.48],
+                text: "Main".to_string(),
+                role: "main".to_string(),
+                style: "primary_module".to_string(),
+                z: 20,
+            },
+            methodfig::schema::DrawObject::Box {
+                id: "loss".to_string(),
+                bbox: [0.42, 0.25, 0.60, 0.48],
+                text: "Loss".to_string(),
+                role: "loss".to_string(),
+                style: "accent_module".to_string(),
+                z: 21,
+            },
+            methodfig::schema::DrawObject::Box {
+                id: "neutral".to_string(),
+                bbox: [0.70, 0.25, 0.88, 0.48],
+                text: "Neutral".to_string(),
+                role: "context".to_string(),
+                style: "regular_module".to_string(),
+                z: 22,
+            },
+            methodfig::schema::DrawObject::Connector {
+                id: "e_main_loss".to_string(),
+                points: vec![[0.28, 0.36], [0.42, 0.36]],
+                from: Some("main".to_string()),
+                to: Some("loss".to_string()),
+                style: "dash_supervision".to_string(),
+                label: None,
+                z: 10,
+            },
+        ],
+    };
+    let code = generate_draw_plan_typescript(
+        &draw_plan,
+        &style,
+        &round_dir,
+        &renderer_root,
+        &BTreeMap::new(),
+    )
+    .expect("draw plan code should generate");
+
+    run_node_renderer(
+        &code,
+        &round_dir,
+        &renderer_root,
+        Duration::from_secs(20),
+        false,
+    )
+    .expect("renderer should complete");
+
+    let slide_xml = Command::new("unzip")
+        .arg("-p")
+        .arg(round_dir.join("figure.pptx"))
+        .arg("ppt/slides/slide1.xml")
+        .output()
+        .expect("unzip should run");
+    assert!(slide_xml.status.success());
+    let slide_xml = String::from_utf8(slide_xml.stdout).expect("slide xml should be utf8");
+    assert!(
+        slide_xml.contains("AA0000"),
+        "primary token should reach PPTX XML"
+    );
+    assert!(
+        slide_xml.contains("00AA00"),
+        "accent token should reach PPTX XML"
+    );
+    assert!(
+        slide_xml.contains("F0F0F0"),
+        "neutral_fill token should reach PPTX XML"
+    );
+    assert!(
+        slide_xml.contains("111111"),
+        "text token should reach PPTX XML"
+    );
+
+    let layout_map: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(round_dir.join("layout_map.json")).expect("layout map should exist"),
+    )
+    .expect("layout map should parse");
+    let edge = layout_map["objects"]
+        .as_array()
+        .expect("objects is array")
+        .iter()
+        .find(|object| object["id"] == "e_main_loss" && object["kind"] == "edge")
+        .expect("edge layout entry exists");
+    assert_eq!(edge["from"], "main");
+    assert_eq!(edge["to"], "loss");
+}
+
+#[test]
+fn draw_plan_renderer_tracks_text_metrics_and_scales_font_for_target_width() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let round_dir = temp.path().join("round_000");
+    let renderer_root = default_renderer_root().expect("renderer root");
+    let style = style_by_name(StyleName::WpsClean);
+    let draw_plan = methodfig::schema::DrawPlan {
+        version: "0.2".to_string(),
+        canvas: methodfig::schema::Canvas {
+            aspect: CanvasAspect::PaperWide,
+            target_width_mm: 85,
+            safe_margin: 0.06,
+        },
+        style_tokens: BTreeMap::new(),
+        objects: vec![methodfig::schema::DrawObject::Box {
+            id: "main".to_string(),
+            bbox: [0.18, 0.25, 0.58, 0.55],
+            text: "Student LM".to_string(),
+            role: "main".to_string(),
+            style: "primary_module".to_string(),
+            z: 20,
+        }],
+    };
+    let code = generate_draw_plan_typescript(
+        &draw_plan,
+        &style,
+        &round_dir,
+        &renderer_root,
+        &BTreeMap::new(),
+    )
+    .expect("draw plan code should generate");
+
+    run_node_renderer(
+        &code,
+        &round_dir,
+        &renderer_root,
+        Duration::from_secs(20),
+        false,
+    )
+    .expect("renderer should complete");
+
+    let layout_map: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(round_dir.join("layout_map.json")).expect("layout map should exist"),
+    )
+    .expect("layout map should parse");
+    let object = layout_map["objects"]
+        .as_array()
+        .expect("objects is array")
+        .iter()
+        .find(|object| object["id"] == "main" && object["kind"] == "component")
+        .expect("component exists");
+    assert_eq!(object["text"], "Student LM");
+    let font_size = object["font_size_pt"]
+        .as_f64()
+        .expect("font_size_pt should be recorded");
+    let margin = object["margin_in"]
+        .as_f64()
+        .expect("margin_in should be recorded");
+    assert!(
+        font_size > style.font_sizes.module_label * 1.3,
+        "font should be scaled for 85mm target width: {font_size}"
+    );
+    assert!(
+        margin < 0.05,
+        "component margin should be adaptive instead of fixed 0.05in: {margin}"
+    );
+
+    let slide_xml = Command::new("unzip")
+        .arg("-p")
+        .arg(round_dir.join("figure.pptx"))
+        .arg("ppt/slides/slide1.xml")
+        .output()
+        .expect("unzip should run");
+    assert!(slide_xml.status.success());
+    let slide_xml = String::from_utf8(slide_xml.stdout).expect("slide xml should be utf8");
+    let expected_sz = format!("sz=\"{}\"", (font_size * 100.0).round() as i64);
+    assert!(
+        slide_xml.contains(&expected_sz),
+        "PPTX XML should contain scaled font size {expected_sz}"
+    );
+}
+
 fn object_bbox(layout_map: &serde_json::Value, id: &str) -> [f64; 4] {
     let object = layout_map["objects"]
         .as_array()

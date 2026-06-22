@@ -1,6 +1,7 @@
 use methodfig::schema::{ReferencePreviewMode, ReferenceSelection};
 use methodfig::tools::template_library::{
-    reference_pack_json, select_reference_for_method, selected_reference_json,
+    complete_reference_selection_from_pack, reference_pack_json, select_reference_for_method,
+    selected_reference_json,
 };
 use std::path::Path;
 
@@ -118,4 +119,34 @@ fn selected_reference_json_is_small_and_excludes_full_reference_pack() {
     assert!(selected.contains("preview_path"));
     assert!(!selected.contains("\"references\""));
     assert!(!selected.contains("full-slide raster"));
+}
+
+#[test]
+fn reference_selection_completion_restores_missing_preview_path_from_pack() {
+    let mut selection = ReferenceSelection {
+        version: "0.1".to_string(),
+        selected_reference_id: "simclr_contrastive_y_branch".to_string(),
+        selected_reference_name: "Two-view contrastive Y-branch".to_string(),
+        source_paper: "A Simple Framework for Contrastive Learning of Visual Representations"
+            .to_string(),
+        source_url: "https://arxiv.org/pdf/2002.05709".to_string(),
+        preview_path: None,
+        preview_mode: ReferencePreviewMode::Required,
+        why_fit: "teacher student distillation".to_string(),
+        adaptation_rules: vec![],
+        anti_patterns: vec![],
+        quality_targets: vec![],
+    };
+
+    complete_reference_selection_from_pack(&mut selection, ReferencePreviewMode::Required)
+        .expect("selection should complete from local pack");
+
+    assert_eq!(selection.preview_mode, ReferencePreviewMode::Required);
+    assert_eq!(
+        selection.preview_path.as_deref(),
+        Some("templates/method_overview/reference_figures/assets/simclr_contrastive_y_branch.png")
+    );
+    assert!(!selection.adaptation_rules.is_empty());
+    assert!(!selection.anti_patterns.is_empty());
+    assert!(!selection.quality_targets.is_empty());
 }

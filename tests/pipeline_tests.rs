@@ -1,14 +1,15 @@
 use std::fs;
 use std::time::Duration;
 
-use methodfig::pipeline::should_replace_best_review;
 use methodfig::pipeline::{
     renderer_uses_generated_code_bundle, resume_pipeline, revision_source_round_index,
     run_pipeline, select_renderer_code, RunOptions,
 };
+use methodfig::pipeline::{should_replace_best_review, should_replace_best_round_quality};
 use methodfig::schema::{
     CanvasAspect, ImageProviderKind, ReferencePreviewMode, Review, ReviewScores, StyleName,
 };
+use methodfig::tools::review::{QualityIssue, QualityReport};
 
 #[test]
 fn mock_pipeline_fails_once_patches_then_writes_final_artifacts() {
@@ -54,6 +55,7 @@ fn mock_pipeline_fails_once_patches_then_writes_final_artifacts() {
     assert!(out_dir.join("final/figure.png").exists());
     assert!(out_dir.join("final/figure_plan.json").exists());
     assert!(out_dir.join("final/review.json").exists());
+    assert!(out_dir.join("final/regression_report.json").exists());
 }
 
 #[test]
@@ -118,6 +120,94 @@ fn best_review_selection_replaces_with_stronger_blocker_free_round() {
     let better = review_with_scores(false, 7, 6, vec![]);
 
     assert!(should_replace_best_review(Some(&current), &better));
+}
+
+#[test]
+fn best_round_quality_keeps_higher_quality_round_over_later_review_score() {
+    let current_review = review_with_scores(false, 5, 5, vec!["route detour".to_string()]);
+    let later_review = review_with_scores(false, 9, 9, vec!["short edge".to_string()]);
+    let current_quality = quality_report_with_issues(
+        40,
+        vec![
+            ("excessive_internal_whitespace", "major"),
+            ("excessive_internal_whitespace", "major"),
+            ("text_wrap_risk", "major"),
+            ("route_detour", "major"),
+        ],
+    );
+    let later_quality = quality_report_with_issues(
+        0,
+        vec![
+            ("excessive_internal_whitespace", "major"),
+            ("excessive_internal_whitespace", "major"),
+            ("text_wrap_risk", "major"),
+            ("route_detour", "major"),
+            ("degenerate_edge", "blocking"),
+            ("degenerate_edge", "blocking"),
+        ],
+    );
+
+    assert!(
+        !should_replace_best_round_quality(
+            Some((&current_review, &current_quality)),
+            (&later_review, &later_quality)
+        ),
+        "quality_report must protect a better local render from a later higher-review regression"
+    );
+}
+
+#[test]
+fn best_round_quality_replaces_when_quality_score_improves() {
+    let current_review = review_with_scores(false, 7, 7, vec!["crowding".to_string()]);
+    let later_review = review_with_scores(false, 6, 6, vec!["minor detour".to_string()]);
+    let current_quality = quality_report_with_issues(
+        15,
+        vec![
+            ("component_crowding", "major"),
+            ("degenerate_edge", "blocking"),
+        ],
+    );
+    let later_quality = quality_report_with_issues(70, vec![("route_detour", "major")]);
+
+    assert!(
+        should_replace_best_round_quality(
+            Some((&current_review, &current_quality)),
+            (&later_review, &later_quality)
+        ),
+        "local quality improvement should replace best even if review score is slightly lower"
+    );
+}
+
+#[test]
+fn best_round_quality_rejects_score_gain_that_adds_blockers() {
+    let current_review = review_with_scores(false, 5, 5, vec!["one blocker".to_string()]);
+    let later_review = review_with_scores(false, 8, 8, vec!["two blockers".to_string()]);
+    let current_quality = quality_report_with_issues(
+        64,
+        vec![
+            ("component_overlap", "blocking"),
+            ("component_crowding", "major"),
+            ("component_crowding", "major"),
+            ("component_crowding", "major"),
+            ("excessive_internal_whitespace", "major"),
+        ],
+    );
+    let later_quality = quality_report_with_issues(
+        70,
+        vec![
+            ("label_overlaps_component", "blocking"),
+            ("edge_crossing", "blocking"),
+            ("component_crowding", "major"),
+        ],
+    );
+
+    assert!(
+        !should_replace_best_round_quality(
+            Some((&current_review, &current_quality)),
+            (&later_review, &later_quality)
+        ),
+        "a higher diagnostic score must not replace best-so-far when it increases blocking issues"
+    );
 }
 
 #[test]
@@ -220,6 +310,49 @@ fn resume_pipeline_continues_rejected_run_directory() {
     assert_eq!(status["accepted"], true);
 }
 
+#[test]
+fn resume_pipeline_without_final_respects_existing_iteration_cap() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let method_path = temp.path().join("method.md");
+    let out_dir = temp.path().join("run");
+    fs::write(
+        &method_path,
+        "# Method\n\nA teacher supervises a student, but one iteration is not enough.",
+    )
+    .expect("write method");
+
+    let initial = run_pipeline(RunOptions {
+        method_path,
+        out_dir: out_dir.clone(),
+        style: StyleName::WpsClean,
+        aspect: CanvasAspect::PaperWide,
+        target_width_mm: 85,
+        max_iterations: 1,
+        max_cost_usd: 3.0,
+        max_minutes: 20,
+        image_provider: ImageProviderKind::None,
+        reference_previews: ReferencePreviewMode::Auto,
+        mock_models: true,
+        keep_intermediate: true,
+        renderer_timeout: Duration::from_secs(20),
+    })
+    .expect("initial capped run");
+
+    assert!(!initial.accepted);
+    assert!(out_dir.join("round_000/review.json").exists());
+    fs::remove_dir_all(out_dir.join("final")).expect("simulate interrupted run without final");
+
+    let resumed = resume_pipeline(out_dir.clone()).expect("resume should finalize capped run");
+
+    assert!(!resumed.accepted);
+    assert_eq!(resumed.rounds, 1);
+    assert!(!resumed.run_dir.join("round_001").exists());
+    let status: serde_json::Value =
+        serde_json::from_slice(&fs::read(resumed.run_dir.join("final/status.json")).unwrap())
+            .unwrap();
+    assert_eq!(status["accepted"], false);
+}
+
 fn review_with_scores(
     passed: bool,
     semantic_fidelity: u8,
@@ -243,6 +376,28 @@ fn review_with_scores(
         localized_issues: vec![],
         accepted_assets: vec![],
         rejected_assets: vec![],
+    }
+}
+
+fn quality_report_with_issues(score: u32, issue_specs: Vec<(&str, &str)>) -> QualityReport {
+    QualityReport {
+        version: "0.1".to_string(),
+        passed: issue_specs
+            .iter()
+            .all(|(_, severity)| *severity != "blocking" && *severity != "major"),
+        score,
+        issues: issue_specs
+            .into_iter()
+            .enumerate()
+            .map(|(index, (issue_type, severity))| QualityIssue {
+                issue_id: format!("quality_{index:03}"),
+                issue_type: issue_type.to_string(),
+                severity: severity.to_string(),
+                target_ids: vec!["target".to_string()],
+                evidence: format!("{issue_type} evidence"),
+                suggested_action: "fix target geometry".to_string(),
+            })
+            .collect(),
     }
 }
 

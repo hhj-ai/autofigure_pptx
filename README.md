@@ -166,6 +166,10 @@ runs/<task-slug>/<session-id>/
       manifest.json
       readable/
         reference_selection.json
+        previous_quality_report.json      # round_001+ only
+        previous_issue_binding.json       # round_001+ only
+        previous_issue_history.json       # round_001+ only
+        previous_repair_report.json       # round_001+ only
       writable/
         design_brief.md
         figure_plan.json
@@ -175,6 +179,7 @@ runs/<task-slug>/<session-id>/
     figure_plan.json
     draw_plan.json
     assets/
+    renderer_payload.json
     figure.ts
     figure.pptx
     figure.pdf
@@ -184,6 +189,10 @@ runs/<task-slug>/<session-id>/
     layout_map.json
     review.json
     improvement_plan.json
+    quality_report.json
+    issue_binding.json
+    issue_history.json
+    repair_report.json
     validation_report.json
     renderer_status.json
     reference_selection.json
@@ -196,6 +205,10 @@ runs/<task-slug>/<session-id>/
     draw_plan.json
     review.json
     improvement_plan.json
+    quality_report.json
+    issue_binding.json
+    issue_history.json
+    repair_report.json
     validation_report.json
     renderer_status.json
     reference_selection.json
@@ -205,6 +218,8 @@ runs/<task-slug>/<session-id>/
 
 Open `final/figure.pptx` in WPS Presentation to edit labels, boxes, arrows, colors, and small image assets. The renderer intentionally uses ordinary PPTX objects and avoids SmartArt, animations, 3D effects, glow, heavy shadows, cloud fonts, and full-figure raster images.
 
+`layout_map.json` records rendered object IDs, bboxes, connector points, edge endpoints, and text metrics such as `text`, `font_size_pt`, and `margin_in` for editable text-bearing objects. The repair loop uses these metrics to catch paper-width typography problems such as oversized empty boxes and crowded neighboring modules, then binds the feedback to concrete DrawPlan IDs for the next round.
+
 ## Development Checks
 
 ```bash
@@ -213,8 +228,8 @@ cargo test
 cd renderer && npm run build
 ```
 
-The mock end-to-end test verifies that the loop fails once, gives the next round access to the previous generated code and review artifacts, revises `figure.ts`, passes the next review, and creates final artifacts without real API calls.
+The mock end-to-end test verifies that the loop fails once, gives the next round access to the previous generated code, review artifacts, structured quality report, issue binding, issue history, and repair report, revises `figure.ts`, passes the next review, and creates final artifacts without real API calls.
 
 Acceptance is intentionally conservative. A figure is accepted only when the vision review clears the score thresholds and the local quality gate finds no collapsed components, major component overlap, degenerate edges, or obvious edge crossings in `layout_map.json`. Low color semantics or aesthetic scores also force rejection.
 
-For rejected rounds, `improvement_plan.json` must contain concrete target-level actions. The next DrawPlan optimization is rejected if it makes no material visible change to object boxes, connector routes, label boxes, text, style, additions, or removals.
+For rejected rounds, `improvement_plan.json` must contain concrete target-level actions. `quality_report.json` and `issue_binding.json` bind local and vision issues to object ids; `issue_history.json` carries repeated active issues into the next prompt. The next DrawPlan optimization is rejected if it makes no material visible change to object boxes, connector routes, label boxes, text, style, additions, or removals.

@@ -5,6 +5,11 @@ export interface LayoutObject {
   kind: "component" | "edge" | "annotation" | "region" | "label" | "image";
   bbox: NormalizedBox;
   points?: Array<[number, number]>;
+  from?: string;
+  to?: string;
+  text?: string;
+  font_size_pt?: number;
+  margin_in?: number;
 }
 
 export interface LayoutMap {

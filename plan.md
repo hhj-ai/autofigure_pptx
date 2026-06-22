@@ -135,6 +135,27 @@
 - 2026-06-19：推荐方案是改成 artifact workspace loop：每轮建立 `round_N/workspace/`，把允许读取的文件显式放入 manifest；reasoner 输出 `DesignBrief` + 完整 `FigurePlan`，而不是只输出 patch 字符串；coder 在受限 API 下生成 `figure.ts` 或结构化 `DrawPlan`，必须使用 stable IDs 写 `layout_map.json`；validator 只做安全/可编辑/几何校验并返回机器可执行错误，不再重排布局。若校验失败，把错误和 overlay 一起交回模型下一轮。这样模型有自主规划权，但仍不能访问网络、env、child process 或任意 fs。
 - 2026-06-19：备选方案 A：最小改动，删除 `teacher_student` canonicalization 的重写行为，仅保留 normalize/validate，并实现真实 coder model 调用。优点是快；缺点是仍受现有 `FigurePlan` schema 表达力限制，复杂结构的线段、标签避让、分组和 stage 语义仍难写清。备选方案 B：推荐的 artifact workspace loop，新增 `DesignBrief/DrawPlan` 和受控文件 manifest，重构 patch 为 full-plan revise。优点是符合“给模型更自主读写文件”的目标；缺点是改动较大，需要更多测试。备选方案 C：让模型直接写完整 PptxGenJS TypeScript，Rust 只做 safety scan。优点是自由度最大；缺点是 editable/layout_map/可恢复性更难保证，容易变成不可审计脚本。
 - 2026-06-19：下一步如果用户确认推荐方案 B，实施计划应先写失败测试：证明 patch 后 regions 不再被 canonicalization 覆盖；证明非 mock coder 会被真实调用；证明 workspace manifest 只暴露允许文件；证明模型修订后的 `FigurePlan`/`DrawPlan` 能改变 `layout_map.json`；证明输出 PPTX 仍只含 native shapes/text 和小资产图片。然后再拆代码：schema 扩展、agent workspace、真实 coder provider、renderer API 收窄、review feedback 结构化、旧 mock 更新。
+- 2026-06-20：按用户反馈“框内文字空隙多、框和框挤在一起”做 TDD 修复。根因不是 vision 模型完全看不出来，而是旧 `layout_map.json` 只记录外框 bbox，没有 text/font/margin 元数据；`quality_report` 只拦截 overlap/edge/under-utilization，无法把“非重叠但视觉拥挤”和“大框短字留白过多”稳定绑定到 object id。新增失败测试：`quality_report_flags_component_crowding_without_overlap`、`quality_report_flags_excessive_internal_whitespace_from_text_metadata`、`draw_plan_renderer_tracks_text_metrics_and_scales_font_for_target_width`，确认旧实现失败。随后修改 `renderer/src/runtime.ts` 和 `renderer/src/safe_api.ts`，让渲染器按目标论文宽度放大 PPTX 字号、使用自适应 text margin，并在 `layout_map.json` 为 component/label/annotation 写入 `text`、`font_size_pt`、`margin_in`。修改 `src/tools/review.rs`，新增 `component_crowding` 与 `excessive_internal_whitespace` 质量 issue，按目标宽度毫米间距和估算文字占比给下一轮模型提供可执行反馈。修改 `src/prompts.rs`、`src/agent.rs` 和 `tests/prompt_tests.rs`，要求 vision/reasoner/DrawPlan optimizer 使用这些元数据，而不是只给泛泛审美建议。
+- 2026-06-20：目标测试通过：`cargo test --test review_tests quality_report_flags`、`cargo test --test render_region_layout_tests draw_plan_renderer_tracks_text_metrics_and_scales_font_for_target_width`、`cargo test --test prompt_tests` 均通过。全量 `cargo test` 通过；`cargo fmt --check` 首次只报 `src/tools/review.rs` 两处换行格式，运行 `cargo fmt` 后 `cargo fmt --check` 通过；`cd renderer && npm run build` 通过；`git diff --check` 通过。同步更新 `README.md`，说明 `layout_map.json` 现在记录 `text`、`font_size_pt`、`margin_in`，这些字段会被 repair loop 用于检测 paper-width 字体/留白/拥挤问题。
+- 2026-06-20：按 `.env` 真实 smoke 运行 `SESSION_ID=spacing_text_smoke_20260620_225008 REFERENCE_PREVIEWS=required MAX_ITERATIONS=2 MAX_MINUTES=30 bash scripts/run_real_env.sh examples/teacher_student.md`。运行在同一 session 目录迭代到 round_001，结束状态 `accepted=false`、`reason=cap reached before acceptance`，这是 2 轮上限导致的未接受，不是执行失败。`final/figure.pptx` 通过 `unzip -t`；`final/renderer_status.json` 为 `source=model_generated_code`、`used_fallback=false`。`final/layout_map.json` 的 component 均写出 `text`、`font_size_pt`、`margin_in`，模块源字号约 `19.1pt`，对应 85mm paper-width 可读；`final/quality_report.json` 产生 `component_crowding`（`student_tower` 与 `student_latent` 目标宽度间距 1.5mm）和 `degenerate_edge`。`final/issue_binding.json` 将新 `component_crowding` 绑定到具体 target ids；`final/improvement_plan.json` 产生可执行动作，要求把 `student_latent` 与 `student_tower` 拉开到至少约 3mm 并修复 `e_student_latent`。这验证了“视觉模型看得出来”的问题现在会被本地量化并传入下一轮模型，而不是只留下泛泛审美反馈。
+- 2026-06-20：人工查看上述 smoke 的 `final/figure.png`，发现直接按 `1/scale` 把 85mm 目标宽度字号从 9pt 放大到约 19.1pt 太激进，窄框中出现 `Student (compact)`、`Output ŷ` 等硬折行。修正 `renderer/src/runtime.ts` 的字号策略为 `1/sqrt(scale)` 的保守 paper-width 补偿，仍比旧 9pt 明显增大，但避免把窄框撑爆。同步调整 `draw_plan_renderer_tracks_text_metrics_and_scales_font_for_target_width` 的断言，从强制 `>1.8x` 改为 `>1.3x`。复测 `cargo test --test render_region_layout_tests draw_plan_renderer_tracks_text_metrics_and_scales_font_for_target_width`、`cargo test --test review_tests quality_report_flags` 和 `cd renderer && npm run build` 均通过。
+- 2026-06-20：第二次 `.env` smoke（`spacing_text_smoke_20260620_225702`）验证新字号约 `13.1pt`，最终 PNG 不再出现 19pt 版本的严重硬折行；`final/quality_report.json` 捕获 `teacher_model` 的 `excessive_internal_whitespace`，`improvement_plan.json` 给出收紧 teacher bbox 的具体动作。人工查看 PNG 后发现 `student_model` 仍有明显大框留白但因文字稍长越过旧 `0.08` 阈值未被本地 gate 捕获；将 `excessive_internal_whitespace` 改为两段阈值：超大框 `area > 0.08 && text_fill < 0.12`，中等框保持 `area > 0.055 && text_fill < 0.08`。复测 `cargo test --test review_tests quality_report_flags` 通过；`cargo fmt` 已运行修正格式。
+- 2026-06-20：阈值提高后首次全量 `cargo test` 暴露 mock pipeline 无法收敛：mock optimizer 收紧大空框后，旧 `under_utilized` 用外接 bbox 面积判定，把横向铺开的紧凑流程误判为空间不足；`max_iterations=0` until-pass 测试进入长循环，已手动中断。修正 `src/tools/review.rs`：`under_utilized` 现在只拦截横向和纵向都缩成小团的图，横向铺开但高度紧凑的流程不再被罚；新增 `quality_report_allows_wide_compact_horizontal_flow` 回归测试。修正 `src/agent.rs` 的 mock optimizer，让面积大于 `0.065` 且高度大于 `0.22` 的空框在 mock revision 中收紧，覆盖 multimodal encoder/fusion/head 空框。验证：`cargo test --test review_tests quality_report`、`cargo test --test pipeline_tests`、全量 `cargo test` 均通过；测试过程中 LibreOffice 仍打印一次历史上见过的外部 `DeploymentException`，但所有测试 exit 0。
+- 2026-06-20：最终 `.env` smoke 运行 `SESSION_ID=spacing_text_smoke_20260620_230959 REFERENCE_PREVIEWS=required MAX_ITERATIONS=2 MAX_MINUTES=30 bash scripts/run_real_env.sh examples/teacher_student.md`。运行完成在同一 session 目录迭代到 round_001，状态 `accepted=false`、`reason=cap reached before acceptance`、`review_passed=false`；`final/figure.pptx` 通过 `unzip -t`；`final/renderer_status.json` 为 `source=model_generated_code`、`used_fallback=false`。关键结果：`final/quality_report.json` 为 `passed=true`、`score=100`、`issues=[]`，说明本地新增的框内留白/框间距/字号门禁已通过；`final/layout_map.json` 记录所有 component 的 `text`、`font_size_pt=13.1`、`margin_in`。人工查看 `final/figure.png`，确认没有第一版 19.1pt 带来的严重硬折行，框内留白明显少于旧输出。最终未接受来自 vision review 的更高层 composition/arrow routing 问题，如 residual box 与 answer box overlap、annotation 压线、input-to-teacher connector 穿过 student zone；这些问题已经进入 `review.json` 和 `improvement_plan.json`，但 2 轮 smoke 的上限前未完全修完。
+
+## 2026-06-21 visual collision and arrow-through-component gates
+
+- 用户目标：
+  - 继续排查当前绘图质量差的根因并迭代优化，跑几轮真实 smoke，确保每一轮都有有效提升。
+- 当前证据：
+  - 上一轮最终 smoke 的 `quality_report.json` 已经通过，但 vision review 仍指出明显问题：`latent_residual` 与 `answer` 有可见碰撞、`anno_residual` 压在 `e_residual_student` 上、`e_input_teacher` 横穿 `student` 区域。
+  - 这说明本地 quality gate 仍漏掉视觉模型能看到的基础几何问题，导致下一轮修复依赖 vision 自然语言，而不是稳定的 issue_id/target_ids。
+  - 当前环境没有保留上一轮 `runs/latest` 和 `spacing_text_smoke_20260620_230959` 目录，只保留了源码和部分新 run 目录；因此本轮以源码和合成 layout_map 测试复现这些失败模式，并会重新跑 `.env` smoke 生成当前证据。
+- 计划：
+  - 给 `tests/review_tests.rs` 增加红测：小面积但毫米级可见的 component collision、edge 穿过非端点 component、annotation/label 压 connector stroke。
+  - 修改 `src/tools/review.rs`：降低 component overlap 的可见碰撞漏检，新增 `edge_crosses_component` gate，增强 `label_overlaps_edge` 对线穿过 label 的检测。
+  - 更新 prompt/issue 建议，让 `QualityReport` 中的 collision/crossing 问题能进入下一轮 `RoundImprovementPlan`。
+  - 跑 `cargo fmt --check`、目标测试、全量 `cargo test`、`cd renderer && npm run build`、`git diff --check`，再跑真实 `.env` multi-round smoke 检查每轮是否产生 material changes 和 issue 下降。
 
 ## 2026-06-19 high-level redesign draft
 
@@ -1909,3 +1930,3271 @@ round_000/
 - 剩余风险：
   - 这次真实 smoke 因 `MAX_ITERATIONS=2` 到 cap 未 accepted；它验证的是 required-preview、两轮循环、同目录输出和 artifact 完整性，不是最终视觉质量收敛。
   - `final/renderer_status.json` 选到 best-so-far 的 `round_000` deterministic fallback；`round_001` 已证明 model-generated code path 可运行，但 best-round 选择策略仍可能偏向带 fallback blocker 的高分轮次，后续可单独优化。
+
+## 2026-06-20 issue-bound incremental repair loop
+
+- 用户目标：
+  - 当前后期绘图改动很小，且重来容易原地打转；每轮 coding model 应先读取上一轮代码、DrawPlan、layout_map、review 和具体问题，再做增量修复。
+  - 模板只能作为软参考，不能把布局槽位写死；reasoning model 需要把历史图像模板、当前渲染图和上一轮代码/问题对应起来。
+  - 每轮反馈必须产出有用建议，并绑定到具体对象、线条、标签或代码位置，避免泛泛“提高美观”。
+- 已读约束：
+  - `AGENTS.md` 要求改动前先读项目上下文，并持续更新 `plan.md`。
+  - 输出仍必须是 editable PPTX native shapes/text/connectors，不能整页 raster 化。
+  - `goal.md`/`plan.md`/`AGENTS.md` 要保留进项目上下文，不能加入 ignore。
+  - 真实路径优先使用 `.env` 中 LLM 配置做 smoke，但不能打印密钥。
+- 当前结构观察：
+  - `src/pipeline.rs` 已有同目录 resume、reference selection、`improvement_plan.json`，但没有结构化 `quality_report.json`、`issue_history.json`、`issue_binding.json`、`repair_report.json`。
+  - `src/agent.rs` 的 DrawPlan revision prompt 只看到上一轮 DrawPlan/review/layout/validation/improvement，没有上一轮 generated code，也没有结构化质量问题历史。
+  - `src/tools/review.rs` 只有字符串型 `render_quality_issues`，不利于把问题绑定回具体对象。
+  - `generate_draw_plan_typescript` 把完整 payload 写进 generated TS；虽然 runtime 会用 env 覆盖 out_dir，但模型上下文仍可能看到旧 round 的 embedded payload。
+  - `renderer/src/runtime.ts` 没有把 `draw_plan.style_tokens` 合入 palette，也没有在 `layout_map.json` 的 edge 里记录 `from/to`。
+  - connector polish 会把非常短的直线扩成 dogleg，可能制造无意义折线和重叠。
+- 计划修改文件：
+  - `src/tools/review.rs`：新增结构化 `QualityReport`/`QualityIssue`，保留旧字符串 gate 兼容。
+  - `src/pipeline.rs`：写入并传递 `quality_report.json`、`issue_history.json`、`issue_binding.json`、`repair_report.json`，final 同步这些产物。
+  - `src/agent.rs`：revision prompt 和 coder prompt 增加 previous code、quality report、issue history、issue binding，明确 issue-bound incremental repair。
+  - `src/tools/draw_plan.rs`、`src/tools/render.rs`、`renderer/src/runtime.ts`、`renderer/src/safe_api.ts`：payload 外置、style token 生效、edge from/to 进入 layout map、修正短 connector dogleg。
+  - `README.md` 和相关测试：同步输出结构和回归测试。
+- 验证方法：
+  - 先补红测覆盖结构化报告、prompt 上下文、workspace artifact、payload 外置、style token、短线不 dogleg。
+  - 再跑 `cargo fmt --check`、重点测试、必要时全量 `cargo test`、`cd renderer && npm run build`、`git diff --check`。
+- 已完成实现：
+  - `src/tools/review.rs` 新增 `QualityReport`/`QualityIssue`，旧 `render_quality_issues` 继续返回字符串 blocking issues，但来源改为结构化报告。
+  - `src/pipeline.rs` 每轮新增 `quality_report.json`、`issue_binding.json`、`issue_history.json`、`repair_report.json`，并复制到 `final/`；第二轮 workspace 会读取上一轮这些产物和上一轮 `figure.ts`。
+  - `src/agent.rs` 的 DrawPlan revision prompt 增加 previous generated code、QualityReport、IssueHistory、IssueBinding，并明确模板/参考图只是软证据；coder prompt 也要求围绕 issue_id 或 repeated issue_key 做最小增量修复。
+  - `src/tools/draw_plan.rs` 把 DrawPlan renderer payload 写成 `renderer_payload.json`，generated TS 改为通过 trusted runtime 的 `createDrawPlanRuntimeFromEnv()` 读取当前 round payload，不再嵌入整份 payload 和旧 out_dir。
+  - `src/tools/render.rs` 执行 Node renderer 时设置 `METHODFIG_RENDER_PAYLOAD_PATH` 和 `METHODFIG_RENDER_OUT_DIR`。
+  - `renderer/src/runtime.ts` 开始使用 `draw_plan.style_tokens` 覆盖 primary/accent/neutral/text/background 等 palette，并在 `layout_map.json` 的 edge 上记录 `from/to`。
+  - `src/tools/draw_plan.rs` 停止把短直 connector 扩成四点 dogleg，避免为了过短而制造重叠和绕线。
+  - `README.md` 输出目录和开发验收说明已补充新 artifacts。
+- 已完成测试：
+  - `cargo fmt` 通过。
+  - `cd renderer && npm run build` 通过。
+  - `cargo test --test review_tests -- --nocapture` 通过。
+  - `cargo test --test prompt_tests -- --nocapture` 通过。
+  - `cargo test --test pipeline_fallback_tests --test render_fallback_tests -- --nocapture` 通过。
+  - `cargo test --test draw_plan_tests model_draw_plan_polish_keeps_short_direct_connectors_without_dogleg -- --nocapture` 通过。
+  - `cargo test --test workspace_pipeline_tests -- --nocapture` 通过。
+  - `cargo test --test render_region_layout_tests draw_plan_renderer_applies_style_tokens_and_tracks_edge_endpoints -- --nocapture` 通过。
+  - `cargo fmt --check` 通过。
+- 最终验证：
+  - 跑全量 `cargo test` 和 `git diff --check`，确认没有其他回归。
+  - `cargo test` 全量通过。
+  - `git diff --check` 通过。
+  - `git status --short --branch` 仅显示本轮预期修改文件，没有额外生成物。
+
+## 2026-06-20 real smoke for issue-bound loop
+
+- 用户目标：
+  - 跑一轮实际 `.env` non-mock 小测试，确认上一轮 issue-bound incremental repair 改动在真实模型路径下没有问题。
+  - 如果真实 smoke 暴露问题，直接调整代码并复测。
+- 本次验证策略：
+  - 使用 `examples/teacher_student.md`，`REFERENCE_PREVIEWS=required`，确保参考 preview 真正进入模型上下文。
+  - 使用 `MAX_ITERATIONS=2`，让 rejected round 后的下一轮能实际读取上一轮代码、quality report、issue binding、issue history 和 repair report。
+  - 检查 `final/figure.pptx` zip 完整性、`renderer_status.json`、`quality_report.json`、`issue_binding.json`、`issue_history.json`、`repair_report.json`、以及 `round_001/workspace/readable/*` 是否存在。
+- 第一次真实 smoke：
+  - 命令：`SESSION_ID=issue_bound_smoke_20260620_162629 REFERENCE_PREVIEWS=required MAX_ITERATIONS=2 MAX_MINUTES=30 bash scripts/run_real_env.sh examples/teacher_student.md`
+  - run dir：`runs/teacher-student-distillation-with-latent-residuals/issue_bound_smoke_20260620_162629`
+  - 第 0 轮已生成 `figure.pptx`、`layout_map.json`、`quality_report.json`、`issue_binding.json`、`issue_history.json`、`repair_report.json`。
+  - 失败点：真实 reasoner 返回的 `RoundImprovementPlan` 有 action 缺少 `target_id`，旧 validator 报 `RoundImprovementPlan action must include target_id or reference_replan` 并中断 run。
+- 已修复：
+  - `src/agent.rs` 新增 `normalize_round_improvement_plan`，对真实模型漏填 `target_id`、空 `success_check`、空 `expected_visible_effect`、空 actions 做保底补全。
+  - 缺 `target_id` 时优先从 localized review issue 推断具体对象，否则使用 `global_layout`。
+  - `build_round_improvement_prompt` 增加要求：localized action 不能留空 target；多对象问题无法选择单一对象时用 `global_layout`。
+  - 新增单元测试覆盖缺 `target_id` 和空 actions 的 normalization。
+- 修复后验证：
+  - `cargo fmt` 通过。
+  - `cargo test agent::tests::round_improvement_normalization -- --nocapture` 通过。
+- 继续真实 smoke：
+  - resume 同一目录：`RUN_DIR=runs/teacher-student-distillation-with-latent-residuals/issue_bound_smoke_20260620_162629 MAX_ITERATIONS=2 MAX_MINUTES=30 REFERENCE_PREVIEWS=required bash scripts/run_real_env.sh examples/teacher_student.md`
+  - 结果：同一目录追加到 `round_002`，`accepted=false`、`rounds=3`、`reason="cap reached before acceptance"`，这是 cap 结果；没有再因 `RoundImprovementPlan` 缺 `target_id` 中断。
+  - `final/figure.pptx` 通过 `unzip -t`；final artifacts 含 `quality_report.json`、`issue_binding.json`、`issue_history.json`、`repair_report.json`。
+  - `round_001` 和 `round_002` workspace 均存在 previous quality/binding/history/repair/code artifacts。
+  - `round_002/final renderer_status.json` 为 `source="model_generated_code"`、`used_fallback=false`。
+- 第二个 1 轮真实 smoke：
+  - 命令：`SESSION_ID=issue_bound_prompt_smoke_20260620_164116 REFERENCE_PREVIEWS=required MAX_ITERATIONS=1 MAX_MINUTES=20 bash scripts/run_real_env.sh examples/teacher_student.md`
+  - 结果：正常完成并写出 final artifacts，`accepted=false` 是 1 轮 cap 结果。
+  - 暴露问题：initial coder 仍可能手写无效 renderer，错误为读取未公开 payload/style token，导致 deterministic fallback；pipeline 未崩，但 `renderer_status.json` 为 `used_fallback=true`。
+  - 已修复/收紧：`src/prompts.rs` 的 coder prompt 明确初始轮优先返回 trusted reference runtime entrypoint，不手写 PPTX renderer，不直接读取 `payload/draw_plan/style_tokens`，不复制 runtime color/layout 逻辑；`tests/prompt_tests.rs` 增加回归。
+  - 验证：`cargo test --test prompt_tests coder_prompts_limit_runtime_to_documented_draw_plan_api -- --nocapture` 通过。
+- 第三个 1 轮真实 smoke：
+  - 命令：`SESSION_ID=issue_bound_strict_coder_smoke_20260620_164612 REFERENCE_PREVIEWS=required MAX_ITERATIONS=1 MAX_MINUTES=20 bash scripts/run_real_env.sh examples/teacher_student.md`
+  - 暴露问题：真实 reasoner 选中合法 `simclr_contrastive_y_branch`，但返回 `preview_path=null`；`REFERENCE_PREVIEWS=required` 因此失败。
+  - 已修复：`src/tools/template_library.rs` 新增 `complete_reference_selection_from_pack`，按 `selected_reference_id` 从本地 reference pack 回填 preview path 和缺失 grammar；`src/agent.rs` 在真实 reference selection 后调用该补全。
+  - 验证：`cargo test --test reference_library_tests reference_selection_completion_restores_missing_preview_path_from_pack -- --nocapture` 通过。
+- 最终真实 smoke：
+  - 命令：`SESSION_ID=issue_bound_reference_completion_smoke_20260620_164849 REFERENCE_PREVIEWS=required MAX_ITERATIONS=1 MAX_MINUTES=20 bash scripts/run_real_env.sh examples/teacher_student.md`
+  - 结果：正常完成，`accepted=false`、`rounds=1`、`reason="cap reached before acceptance"`，这是 1 轮 cap 结果。
+  - `reference_selection.json` 已自动回填 `preview_path="templates/method_overview/reference_figures/assets/simclr_contrastive_y_branch.png"`，`preview_mode="required"`。
+  - `final/figure.pptx` 通过 `unzip -t`。
+  - final artifacts 完整：`figure.pptx`、`figure.pdf`、`figure.png`、`figure.ts`、`draw_plan.json`、`review.json`、`improvement_plan.json`、`quality_report.json`、`issue_binding.json`、`issue_history.json`、`repair_report.json`。
+  - `final/renderer_status.json` 为 `source="model_generated_code"`、`used_fallback=false`。
+  - `round_000/figure.model_error.log` 不存在。
+- 最终本地验证：
+  - `cargo fmt --check` 通过。
+  - `cd renderer && npm run build` 通过。
+  - `git diff --check` 通过。
+  - `cargo test` 全量通过；LibreOffice 在部分导出测试中向 stderr 打出外部 `DeploymentException` 文本，但测试退出码为 0，所有相关测试通过。
+
+## 2026-06-21 visual collision and arrow-through-component gates
+
+- 用户目标：
+  - 先规划再实现，重点解决“视觉模型明明应该看得出来，但每轮仍给不出有效改动”的问题。
+  - 当前根因不是单纯 prompt 不够，而是本地结构化质量门漏掉了肉眼可见的基础几何错误，导致 `QualityReport` 可以通过，后续 reasoner/coder 收到的强约束不够具体。
+- 根因确认：
+  - `component_overlap` 只按 normalized area 和面积比例卡阈值，上一轮 `answer` / `latent_residual` 这种约 `2.6 x 2.8 mm` 的真实碰撞会因为面积小被漏掉。
+  - `label_overlaps_edge` 只用线段 bbox 与 label bbox 的面积占比，细 connector 压过 annotation/text 时面积仍很小，容易漏报。
+  - 旧逻辑没有检测 connector 是否穿过非端点组件，所以 `e_input_teacher` 穿过 `student` 这类问题只能依赖视觉模型自由描述，不能稳定进入 issue-bound repair。
+- 红测：
+  - 新增 `quality_report_flags_small_but_visible_component_collision`，复现小面积但可见的组件碰撞。
+  - 新增 `quality_report_flags_edge_crossing_through_unrelated_component`，复现 connector 穿过非 source/target 组件。
+  - 新增 `quality_report_flags_thin_connector_running_through_annotation`，复现 annotation 被细 connector 穿过。
+  - 修复前运行 `cargo test --test review_tests quality_report_flags_ -- --nocapture`，三个新增用例按预期失败，已有 whitespace/crowding 用例仍通过。
+- 已完成实现：
+  - `src/tools/review.rs` 增加基于目标纸宽毫米尺度的 overlap 判定：只要横纵重叠都达到约 1 mm 且有实际比例，就输出 blocking `component_overlap`。
+  - `src/tools/review.rs` 增加线段裁剪检查，connector 穿过非端点 component 的 shrunken interior 时输出 blocking `edge_crosses_component`，target ids 绑定到 offending edge 和 crossed component。
+  - `src/tools/review.rs` 改进 label/annotation 与 edge 的碰撞检测：保留旧面积判定，同时用 line clipping 判断 connector stroke 是否穿过扩展后的 label bbox。
+  - `src/agent.rs` 的 DrawPlan revision 和 RoundImprovementPlan prompt 现在明确要求对 `component_overlap`、`edge_crosses_component`、`label_overlaps_edge` 给出绑定具体 id 的局部移动、缩放或 reroute。
+  - `tests/prompt_tests.rs` 增加 prompt 契约检查，防止这些 issue 类型以后被删掉。
+- 已完成验证：
+  - `cargo test --test review_tests quality_report_flags_ -- --nocapture` 通过。
+  - `cargo test --test review_tests -- --nocapture` 通过，22 个 review 测试全绿。
+  - `cargo test --test prompt_tests draw_plan_revision_prompt_uses_autofigure_style_visual_optimization_contract -- --nocapture` 通过。
+- 全量验证暴露的回归与修复：
+  - `cargo test` 首次全量运行时，`resume_pipeline_uses_existing_run_directory` 失败；新 `edge_crosses_component` gate 拦住了 mock multimodal fusion 布局里的真实问题：`vision_to_fusion` 水平穿过非端点组件 `text_encoder`。
+  - 复现 run 显示 `round_001/quality_report.json` 中 blocker 为 `edge_crosses_component`，说明不是误报，而是旧 multimodal mock 布局把两个 encoder 和 fusion/head 排成一行，导致两路输入合流语义被画成穿框直线。
+  - 新增 `draw_plan_from_multimodal_fusion_stacks_inputs_without_connector_through_encoder`，要求 multimodal fusion 的 vision/text 输入上下分开，fusion/head 保持右侧主路径，且 `vision_to_fusion` 不穿过 `text_encoder`。
+  - `src/tools/draw_plan.rs` 新增 `packed_multimodal_fusion_boxes`：只在 `Template::MultimodalFusion` 且为精确四节点 mock 结构时触发，把两个 encoder 放成上下两路输入，fusion/head 放右侧；其他自由 reasoner 结构仍走原有通用 pack。
+  - 首次修复后又触发 `component_crowding`，因为上下输入间距只有约 `1.5 mm`；已把上下输入中心进一步拉开，使间距越过质量门。
+  - `cargo test --test draw_plan_tests draw_plan_from_multimodal_fusion_stacks_inputs_without_connector_through_encoder -- --nocapture` 通过。
+  - `cargo test --test pipeline_tests resume_pipeline_uses_existing_run_directory -- --nocapture` 通过。
+- 完整本地验证：
+  - `cargo fmt --check` 首次提示 `src/tools/draw_plan.rs` 新 helper 调用需要标准换行；已运行 `cargo fmt` 修正。
+  - `cargo test` 全量通过，包括新增的 68 个 `draw_plan_tests` 中的 multimodal 回归测试、22 个 `review_tests` 和 workspace/pipeline 测试。
+  - `cd renderer && npm run build` 通过。
+  - `cargo fmt --check` 通过。
+  - `git diff --check` 通过。
+- 剩余验证：
+  - 再跑真实 `.env` required-preview 多轮 smoke，检查每一轮是否在同一 run dir 下产生 issue-bound、非空、可见的修复动作，并确认 final PPTX zip 完整。
+
+## 2026-06-21 real smoke after visual gates
+
+- 真实 `.env` smoke：
+  - 命令：`SESSION_ID=visual_collision_smoke_20260621_013130 REFERENCE_PREVIEWS=required MAX_ITERATIONS=4 MAX_MINUTES=45 bash scripts/run_real_env.sh examples/teacher_student.md`
+  - run dir：`runs/teacher-student-distillation-with-latent-residuals/visual_collision_smoke_20260621_013130`
+  - 结果：`accepted=false`、4 轮、`reason="cap reached before acceptance"`。
+  - 同目录完成 `round_000` 到 `round_003`，没有重开目录。
+  - 每轮 `renderer_status.json` 都是 `source="model_generated_code"`、`used_fallback=false`。
+  - `unzip -t final/figure.pptx` 通过，PPTX zip 完整。
+- smoke 结论：
+  - 新增质量 gate 生效：`quality_report.json` 能稳定给出带具体 target ids 的 `component_overlap`、`component_crowding`、`edge_crosses_component`、`edge_crossing`、`route_detour`、`excessive_internal_whitespace`。
+  - 但 reasoner 第 0 轮 `reference_replan` 错误建议把单一 `latent_residual_obj` 拆成 `teacher_residual_obj` 和 `student_residual_obj`。之后 vision review 连续指出应合并回单一 residual objective，但第 2、3 轮的 `repair_report.material_changes` 基本重复，说明 planner/coder 仍会重复失败策略。
+  - final PNG 仍然很差：大 residual/task-loss 盒子压在顶部，input 被挤到底部，connector 穿框，局部 label 仍贴线；这次不能算视觉质量收敛。
+- 根因：
+  - `polish_model_draw_plan_geometry_with_figure_plan` 是 non-mock 真实路径，它只做温和 polish，没有运行强 canonical 的 `repair_teacher_student_lanes`。
+  - 真实 DrawPlan 中新增了 `teacher_residual_obj` / `student_residual_obj`，但 FigurePlan 明确只有一个 `latent_residual_obj` residual 组件。
+  - `remove_connectors_absent_from_figure_plan` 只会删除“两个端点都属于 FigurePlan 组件但边不存在”的 connector；连到模型新增 split residual box 的 connector 不会被删。
+  - `add_missing_connectors_from_figure_plan` 又会因为同名错误 connector 已存在而跳过 canonical edge，导致错误结构持续进入下一轮。
+- 已完成修复：
+  - 新增测试 `model_draw_plan_polish_with_figure_plan_removes_split_residual_boxes`，复现同名 residual connector 被接到 `teacher_residual_obj` 的失败模式。
+  - `src/tools/draw_plan.rs` 新增 `prune_residual_boxes_absent_from_figure_plan`，仅在 `Template::TeacherStudent` 且 FigurePlan 已声明 residual/latent 组件时触发。
+  - 该函数删除未在 FigurePlan 声明的 residual/latent-like box，并删除连接到这些 extra boxes 的 connector；随后现有 `add_missing_connectors_from_figure_plan` 会补回 canonical edges。
+  - 这个修复只作用于 FigurePlan-aware non-mock polish 路径，不影响无 FigurePlan 的 `polish_model_draw_plan_geometry`，避免把模板坐标硬套到所有模型输出。
+- 已完成验证：
+  - 修复前 `cargo test --test draw_plan_tests model_draw_plan_polish_with_figure_plan_removes_split_residual_boxes -- --nocapture` 按预期失败。
+  - 修复后该测试通过。
+  - `cargo test --test draw_plan_tests -- --nocapture` 通过，69 个 DrawPlan 测试全绿。
+  - `cargo test --test workspace_pipeline_tests -- --nocapture` 通过。
+  - `cargo test` 全量通过。
+  - `cd renderer && npm run build` 通过。
+  - `cargo fmt --check` 通过。
+  - `git diff --check` 通过。
+- 剩余验证：
+  - 再跑一轮真实 `.env` smoke，确认 split residual 不再进入 round/final DrawPlan，并检查质量 issue 是否减少。
+
+## 2026-06-21 split residual prune smoke
+
+- 真实 `.env` smoke：
+  - 命令：`SESSION_ID=split_residual_prune_smoke_20260621_014545 REFERENCE_PREVIEWS=required MAX_ITERATIONS=3 MAX_MINUTES=35 bash scripts/run_real_env.sh examples/teacher_student.md`
+  - run dir：`runs/teacher-student-distillation-with-latent-residuals/split_residual_prune_smoke_20260621_014545`
+  - 结果：`accepted=false`、3 轮、`reason="cap reached before acceptance"`。
+  - 每轮 `renderer_status.json` 都是 `source="model_generated_code"`、`used_fallback=false`。
+  - `unzip -t final/figure.pptx` 通过。
+- 验证结果：
+  - `round_000`、`round_001`、`round_002` 的 `draw_plan.json` 都不再包含 `teacher_residual_obj` 或 `student_residual_obj`，证明 FigurePlan-aware prune 生效。
+  - `quality_report` 从第 0 轮 9 个 issues / score 0，降到第 1 轮 2 个 issues / score 70；第 2 轮回升到 4 个 issues / score 30。
+  - final 选中 best-so-far 结果，`final/quality_report.json` 只剩两个 `component_crowding`：`comp_task_loss` / `comp_inference_note` 横向间距 1.6mm，`comp_output` / `comp_inference_note` 纵向间距 1.0mm。
+  - final PNG 明显优于上一轮 smoke：主结构可读，split residual 消失，输入、teacher、student、task loss、prediction 关系基本能看懂。
+- 剩余问题：
+  - final 仍未 accepted；`Inference-only` 与 task-loss/output 附近拥挤，`Prediction` 在窄框内发生不自然换行。
+  - 本地 quality gate 目前能抓 crowding，但还没有专门抓“长单词在窄框里被硬换行”的文本可读性问题。
+  - 第 2 轮相对第 1 轮有局部回退，说明 reasoner/coder 仍可能过度修改；best-so-far 会保护 final，但“每一轮单调提升”还没有严格保证。
+- 下一步建议：
+  - 增加 `text_wrap_risk` quality issue：基于 layout_map 的 `text`、`font_size_pt`、`margin_in` 和 bbox 宽度估算最长词是否能在单行内显示，避免 `Prediction` 这类窄框硬换行。
+  - 在 issue history 中增加 “regressed_from_best” 或 “do_not_repeat_failed_strategy” 约束，让 round N+1 明确不得重新引入上一轮已经减少的 quality issue。
+  - 对 final 的两个 crowding issue，可通过将 `comp_inference_note` 移到 output 下方或右下 gutter，并缩小 task-loss label 来进一步收敛。
+
+## 2026-06-21 text wrap readability gate
+
+- 根因：
+  - `split_residual_prune_smoke_20260621_014545` 的 final PNG 中，`Prediction` 被窄输出框硬拆成两行，肉眼可读性差。
+  - 当时 `final/quality_report.json` 只剩 crowding，没有抓到长 token 在窄框里被 awkward wrap 的问题。
+  - 旧 `internal_whitespace_ratio` 只衡量空隙和填充率，不能证明最长词能在 textbox 宽度内单行显示。
+- 红测：
+  - 新增 `quality_report_flags_single_word_wrap_risk_from_text_metadata`，用 smoke final 的 `comp_output` 几何、`text="Prediction"`、`font_size_pt=13.1`、`margin_in=0.035` 复现问题。
+  - 修复前该测试失败，说明旧本地 gate 漏报。
+- 已完成实现：
+  - `src/tools/review.rs` 新增 `text_wrap_risk`，基于 layout_map 中的 `text`、`font_size_pt`、`margin_in`、bbox 宽度和 target paper width，估算最长 token 的纸面宽度。
+  - 当最长 token 需要的宽度超过内容宽度时，输出 major `text_wrap_risk`，绑定到具体 component id，并提示 widen bbox / shorten label / lower font size。
+  - `src/agent.rs` 的 DrawPlan revision 和 RoundImprovementPlan prompt 增加 `text_wrap_risk` 契约，要求下一轮明确给出 width、label 或 font-size 的可见变化。
+  - `tests/prompt_tests.rs` 增加 `text_wrap_risk` 和 `longest token` 契约检查。
+- 已完成验证：
+  - `cargo test --test review_tests quality_report_flags_single_word_wrap_risk_from_text_metadata -- --nocapture` 修复后通过。
+  - `cargo test --test review_tests -- --nocapture` 通过，23 个 review 测试全绿。
+  - `cargo test --test prompt_tests draw_plan_revision_prompt_uses_autofigure_style_visual_optimization_contract -- --nocapture` 通过。
+  - `cargo test` 全量通过。
+  - `cd renderer && npm run build` 通过。
+  - `cargo fmt --check` 通过。
+  - `git diff --check` 通过。
+- 剩余验证：
+  - 跑真实 `.env` smoke，确认 `text_wrap_risk` 能进入 round/final feedback，并观察 `Prediction` 窄框硬换行是否减少。
+
+## 2026-06-21 text wrap smoke and annotation-over-component gate
+
+- 真实 `.env` smoke：
+  - 命令：`SESSION_ID=text_wrap_gate_smoke_20260621_015915 REFERENCE_PREVIEWS=required MAX_ITERATIONS=3 MAX_MINUTES=35 bash scripts/run_real_env.sh examples/teacher_student.md`
+  - run dir：`runs/teacher-student-distillation-with-latent-residuals/text_wrap_gate_smoke_20260621_015915`
+  - 结果：`accepted=false`、3 轮、`reason="cap reached before acceptance"`。
+  - `round_000` renderer 使用 deterministic fallback；`round_001`、`round_002` 和 `final` 均为 `source="model_generated_code"`、`used_fallback=false`。
+  - `unzip -t final/figure.pptx` 通过。
+- 验证结果：
+  - `quality_report` issue 数从第 0 轮 26 个降到第 1 轮 12 个，再降到第 2 轮 2 个；说明质量 gate 给出的反馈能推动整体布局改善。
+  - 第 1 轮出现 `text_wrap_risk`：`residual_objective` 的 `Residual` token 需要约 `9.6 mm`，但可用宽度约 `9.4 mm`。
+  - 第 2 轮和 final 中 `text_wrap_risk` 消失，证明新增 gate 能被 loop 消化。
+- 新暴露问题：
+  - final 仍未 accepted，剩余问题是 `student_pred` 与 `residual_objective` 间距仅约 `1.5 mm`，以及 `ann_residual_eq` 与 `e_student_pred` 重叠。
+  - 人工检查 PNG 后发现更直接的视觉问题：`ann_residual_eq` 的大 annotation bbox 覆盖了 `Prediction Head` 组件区域，但旧 gate 只报告 `label_overlaps_edge`，没有把 annotation 压住 component text 作为 blocking issue 暴露给 reasoner。
+- 红测：
+  - 新增 `quality_report_flags_annotation_covering_component_text`，用 smoke final 的 `ann_residual_eq` 和 `student_pred` bbox 复现 annotation 覆盖 component 的问题。
+  - 修复前该测试失败，证明旧结构化质量门没有稳定表达“标签/注释压住组件文字”。
+- 已完成实现：
+  - `src/tools/review.rs` 在 label/annotation 检查中增加 `label_overlaps_component`：当 label/annotation 与 component 有毫米级可见重叠，且覆盖比例达到阈值时输出 blocking issue。
+  - 新 issue 绑定 label/annotation id 和 component id，提示将 label 或 annotation 移出 component bbox，避免 editable text 覆盖模块文字。
+  - `src/agent.rs` 的 DrawPlan revision 和 RoundImprovementPlan prompt 增加 `label_overlaps_component` 契约，要求模型只移动/缩放命名 bbox 或 reroute 命名 label/connector。
+  - `tests/prompt_tests.rs` 增加 `label_overlaps_component` prompt 契约检查。
+- 已完成验证：
+  - `cargo test --test review_tests quality_report_flags_annotation_covering_component_text -- --nocapture` 通过。
+  - `cargo test --test review_tests -- --nocapture` 通过，24 个 review 测试全绿。
+  - `cargo test --test prompt_tests draw_plan_revision_prompt_uses_autofigure_style_visual_optimization_contract -- --nocapture` 通过。
+  - `cargo fmt` 已运行。
+  - `cargo test` 全量通过。
+  - `cd renderer && npm run build` 通过。
+  - `cargo fmt --check` 通过。
+  - `git diff --check` 通过。
+- 剩余验证：
+  - 再跑真实 `.env` smoke，确认 `label_overlaps_component` 能进入反馈并促使模型把 residual equation annotation 移出 `Prediction Head` 等组件区域。
+
+## 2026-06-21 label/component gate smoke and route polish
+
+- 真实 `.env` smoke：
+  - 命令：`SESSION_ID=label_component_gate_smoke_20260621_021048 REFERENCE_PREVIEWS=required MAX_ITERATIONS=3 MAX_MINUTES=35 bash scripts/run_real_env.sh examples/teacher_student.md`
+  - run dir：`runs/teacher-student-distillation-with-latent-residuals/label_component_gate_smoke_20260621_021048`
+  - 结果：`accepted=false`、3 轮、`reason="cap reached before acceptance"`。
+  - 所有轮次和 final 的 `renderer_status.json` 都是 `source="model_generated_code"`、`used_fallback=false`。
+  - `unzip -t final/figure.pptx` 通过。
+- 验证结果：
+  - `quality_report` issue 数从第 0 轮 29 个降到第 1 轮 4 个，再到第 2 轮 3 个。
+  - `label_overlaps_component` 在第 0/1 轮出现，到第 2 轮消失，证明新增 gate 能进入真实 loop 并被模型处理。
+  - 上一轮 text-wrap smoke 中的 residual equation 压 `Prediction Head` 问题没有复现。
+- 新暴露问题：
+  - final 仍有 `component_overlap`：`student_head` 与 `output` 在右边界发生约 `1.7 x 3.8 mm` 可见重叠。
+  - final 仍有 `edge_crosses_component`：`e_task_label` 穿过 `student_latent`。
+  - final 仍有 `degenerate_edge`：`e_output` 过短。
+  - 人工检查 PNG 后确认根因是 coder/reasoner 的动作没有完全兑现：计划里要求把 output 移到 `[0.93, 0.60, 0.99, 0.66]`，实际 layout_map 仍是 `[0.90, 0.58, 1.00, 0.68]`；右移越过画布后被 clamp，导致 overlap 和短边保留。
+- 红测：
+  - 新增 `model_draw_plan_polish_compacts_right_edge_output_without_overlap_or_degenerate_edge`，复现右边界 output 与 head 压框、`e_output` 太短的问题。
+  - 新增 `model_draw_plan_polish_reroutes_task_label_edge_around_student_latent`，复现 task-label 线穿过 `student_latent` 的问题。
+  - 修复前两个测试均失败，说明旧 DrawPlan polish 没有对齐新的质量门。
+- 已完成实现：
+  - `src/tools/draw_plan.rs` 新增 `repair_right_edge_output_collisions`：当 output-like 目标位于右边界且与来源重叠或连接过短时，把短文本 output 压成紧凑小节点，并在必要时把来源盒子左移，保证画布内仍有非退化连接长度。
+  - `src/tools/draw_plan.rs` 新增 `reroute_connectors_around_intermediate_boxes`：当 connector 穿过非端点组件时，生成上/下/左/右避障折线候选，选择不穿组件且较短的路由。
+  - 通用避障跳过 objective-to-main residual feedback，让已有 `reroute_objective_feedback_away_from_reverse_shared_segments` 专门规则最终裁决这类反馈边。
+  - `component_overlap_gate_fails` 与 review gate 对齐，能抓到小面积但毫米级可见的 box overlap，避免 review 报错而 polish 不处理。
+- 已完成验证：
+  - 两个新增 draw_plan 回归测试修复后通过。
+  - `cargo test --test draw_plan_tests -- --nocapture` 通过，71 个 DrawPlan 测试全绿。
+  - `cargo test` 全量通过。
+  - `cd renderer && npm run build` 通过。
+  - `cargo fmt --check` 通过。
+  - `git diff --check` 通过。
+
+## 2026-06-21 post-route-polish smoke
+
+- 真实 `.env` smoke：
+  - 命令：`SESSION_ID=post_route_polish_smoke_20260621_022824 REFERENCE_PREVIEWS=required MAX_ITERATIONS=3 MAX_MINUTES=35 bash scripts/run_real_env.sh examples/teacher_student.md`
+  - run dir：`runs/teacher-student-distillation-with-latent-residuals/post_route_polish_smoke_20260621_022824`
+  - 结果：`accepted=false`、3 轮、`reason="cap reached before acceptance"`。
+  - 所有轮次和 final 的 `renderer_status.json` 都是 `source="model_generated_code"`、`used_fallback=false`。
+  - `unzip -t final/figure.pptx` 通过。
+- 验证结果：
+  - 上一轮 smoke 中的 `student_head/output` overlap、`e_task_label/student_latent` crossing、`degenerate_edge` 没有再出现。
+  - issue 数为 11 -> 6 -> 4；仍然有下降，但第 2 轮未 accepted。
+  - final 剩余 issues：`comp_task_loss` 的 excessive whitespace；`anno_teacher_label` 压到 `comp_task_loss`；`edge_teacher_to_residual` / `edge_residual_to_student` 与 `edge_student_to_task_loss` 两处 edge crossing。
+- 剩余根因：
+  - 质量门已经能给出具体 blocker，但 DrawPlan polish 还没有“压缩 oversized short-label loss/objective box”的兜底；`comp_task_loss` 仍可成为大空框。
+  - annotation 移出组件的本地 polish 仍不够强；`Large LM` 这种 branch label 会在 box 边界处产生毫米级重叠。
+  - edge crossing 目前主要依赖 reasoner/coder 按 feedback reroute，本地只有“避开组件”的路由，没有“避开其他 connector”的通用路由。
+- 下一步建议：
+  - 增加 conservative `compact_oversized_loss_or_objective_boxes`，只对 role/text 明确是 loss/objective 且文本很短的大空框触发。
+  - 增加 `move_annotations_off_components`，优先把 branch/context annotation 移到组件 union 外侧的最近空白。
+  - 增加 `reroute_connectors_around_crossing_edges`，仅在结构化 `edge_crossing` 或本地检测到 crossing 时触发，候选路线需要同时避开组件和已有 connector。
+
+## 2026-06-21 annotation / crossing polish continuation
+
+- 本轮继续从真实 `.env` smoke 失败样例出发，而不是重写模板。
+- 新增回归覆盖：
+  - `model_draw_plan_polish_compacts_oversized_short_loss_box`：短 loss/objective 文本不应留在大空框内。
+  - `model_draw_plan_polish_moves_figure_plan_annotation_off_component`：FigurePlan upsert 的 annotation 不能压住 component。
+  - `model_draw_plan_polish_moves_figure_plan_annotation_off_connector`：FigurePlan upsert 的 annotation 不能盖住 connector。
+  - `model_draw_plan_polish_moves_model_authored_annotations_off_components`：模型自己写出的 annotation 也必须移出组件。
+  - `model_draw_plan_polish_moves_connector_label_off_endpoint_component`：connector label 不能贴在端点组件内。
+  - `model_draw_plan_polish_reroutes_connector_around_crossing_edges`：本地 polish 要能绕开 connector crossing。
+  - `model_draw_plan_polish_separates_vertical_output_from_head`：右侧 output 与 head 纵向贴边时需要留 gutter。
+- 已完成实现：
+  - `src/tools/draw_plan.rs` 增加 loss/objective 紧凑化、annotation 避开 component/edge、connector label 避开 component、connector-crossing reroute、output/head 间距兜底。
+  - 这些规则都基于当前 DrawPlan 的 ids、bbox 和 connector endpoints，不把固定 teacher-student 模板坐标强行写死。
+- 验证：
+  - `cargo test --test draw_plan_tests -- --nocapture` 通过，78 个 DrawPlan 测试全绿。
+  - `cargo test` 全量通过。
+  - `cd renderer && npm run build` 通过。
+  - `cargo fmt --check` 通过。
+  - `git diff --check` 通过。
+
+## 2026-06-21 post annotation / label polish smoke
+
+- 真实 `.env` smoke：
+  - 命令：`SESSION_ID=post_model_annotation_label_polish_smoke_20260621_031500 REFERENCE_PREVIEWS=required MAX_ITERATIONS=3 MAX_MINUTES=35 bash scripts/run_real_env.sh examples/teacher_student.md`
+  - run dir：`runs/teacher-student-distillation-with-latent-residuals/post_model_annotation_label_polish_smoke_20260621_031500`
+  - 结果：`accepted=false`、3 轮、`reason="cap reached before acceptance"`。
+  - 所有轮次和 final 的 `renderer_status.json` 都是 `source="model_generated_code"`、`used_fallback=false`。
+  - `unzip -t final/figure.pptx` 通过。
+- 验证结果：
+  - issue 数从 `round_000` 的 22 个降到 `round_001` 的 8 个，再到 `round_002/final` 的 7 个。
+  - 上一轮重点问题 `label_overlaps_component` 和 `edge_crosses_component` 在 `round_001` 消失，说明 annotation/label/穿框兜底确实进入真实 loop 并产生有效改善。
+- 新暴露问题：
+  - final 仍未 accepted，剩余问题为 `inference_note` 的 `text_wrap_risk`、`student_head/teacher_enc` 和 `task_loss/latent_residual` 的 crowding、`e_teacher_proj` 短边、`e_proj_residual` 穿 `teacher_enc`、以及两处 connector crossing。
+  - final PNG 证明核心根因是模型生成了“上下贴住的 teacher context stack + residual 竖向回流 + task loss 反馈线”组合；旧 router 能避开单个 box，但不会稳定处理这种多条 supervision/main/task 线的局部死结。
+- 已完成修复：
+  - 新增 `model_draw_plan_polish_repairs_stacked_teacher_residual_smoke_layout`，用 final 几何复现 note 过窄、loss stack 贴边、teacher stack 短边、teacher residual 穿主输出、task-loss feedback 穿 student residual 等问题。
+  - `src/tools/draw_plan.rs` 增加 `widen_short_context_note_boxes_for_text`，为 `Inference: student only` 这类 note 盒提供最小可读宽度。
+  - 增加 `separate_crowded_loss_or_objective_boxes`，对横向重叠且纵向间距不足的 loss/objective stack 留出可见 gutter。
+  - 增加 `separate_stacked_context_boxes`，对上下贴住的 context stack 先横向避开 main module，再补上下间距，避免短边和穿框。
+  - 调整 connector stability：main/output 线比 supervision/residual 线更稳定，避免把主流程绕坏。
+  - 增加 `reroute_supervision_connectors_around_main_edges`，当 supervision/residual 线穿过 main/output 线时，优先使用外侧 rail 绕行。
+  - 增加 `reroute_task_loss_connectors_around_supervision_edges`，当 task/loss feedback 穿过已有 connector 时，先找完全无冲突路线；若局部几何无严格候选，则至少清掉当前 blocker 和 student-residual 保护线，避免原样保留最刺眼的穿线。
+- 已完成验证：
+  - 新回归测试修复前失败，修复后通过。
+  - `cargo test --test draw_plan_tests -- --nocapture` 通过，79 个 DrawPlan 测试全绿。
+  - `cargo test` 全量通过。
+  - `cd renderer && npm run build` 通过。
+  - `cargo fmt --check` 通过。
+  - `git diff --check` 通过。
+- 剩余验证：
+  - 继续跑真实 `.env` smoke，确认 stacked teacher/residual/task-loss 兜底在实际 loop 中是否减少 final blockers。
+
+## 2026-06-21 quality-aware best-so-far and final smokes
+
+- 真实 `.env` smoke：
+  - 命令：`SESSION_ID=post_stack_route_polish_smoke_20260621_034500 REFERENCE_PREVIEWS=required MAX_ITERATIONS=3 MAX_MINUTES=35 bash scripts/run_real_env.sh examples/teacher_student.md`
+  - run dir：`runs/teacher-student-distillation-with-latent-residuals/post_stack_route_polish_smoke_20260621_034500`
+  - 结果：`accepted=false`、3 轮、`reason="cap reached before acceptance"`，PPTX zip 完整，所有轮次 `source="model_generated_code"`、`used_fallback=false`。
+- 结果与根因：
+  - `round_000` 为 score 40 / 4 issues，`round_001` 退到 score 15 / 5 issues，`round_002/final` 退到 score 0 / 6 issues。
+  - final 选中了质量更差的 `round_002`，说明 best-so-far 只按 vision review 排名，未把本地 `quality_report.score/issues` 纳入最终选择。
+  - 这会直接破坏“后续轮可以尝试，但不能覆盖更好结果”的目标。
+- 已完成修复：
+  - `src/pipeline.rs` 增加 `BestRound { index, review, quality_report }`，run 和 resume 都保留 quality report。
+  - 新增 `should_replace_best_round_quality`：排序优先级为 `quality_report.passed`、`quality_report.score`、blocking/major/total issue 数，再回退到原 review rank。
+  - final selection 和 revision source 都改用 quality-aware best round；保留原 `should_replace_best_review` 以兼容旧 review-only 测试。
+  - `tests/pipeline_tests.rs` 新增：
+    - `best_round_quality_keeps_higher_quality_round_over_later_review_score`
+    - `best_round_quality_replaces_when_quality_score_improves`
+- 验证：
+  - 新增 pipeline tests 通过。
+  - `cargo test --test pipeline_tests -- --nocapture` 通过。
+  - `cargo test` 全量通过。
+  - `cd renderer && npm run build` 通过。
+  - `cargo fmt --check` 通过。
+  - `git diff --check` 通过。
+- 真实 `.env` best-so-far smoke：
+  - 命令：`SESSION_ID=post_quality_best_smoke_20260621_041500 REFERENCE_PREVIEWS=required MAX_ITERATIONS=3 MAX_MINUTES=35 bash scripts/run_real_env.sh examples/teacher_student.md`
+  - run dir：`runs/teacher-student-distillation-with-latent-residuals/post_quality_best_smoke_20260621_041500`
+  - 结果：`accepted=false`、3 轮、PPTX zip 完整，所有轮次和 final 均为 `source="model_generated_code"`、`used_fallback=false`。
+  - 三轮和 final 都是 score 85 / 1 issue，final quality 与 `round_000`、`round_001`、`round_002` 一致；没有再发生“final 选中更差 quality round”的问题。
+  - final 仅剩 `component_crowding`：`latent_residual_supervision` 与 `inference_only` 纵向间距 1.3mm。
+- 针对剩余 note/loss crowding 的修复：
+  - 新增 `model_draw_plan_polish_moves_inference_note_away_from_loss_crowding`，复现 `Inference only` note 与 `Latent Residual` 贴得太近的问题。
+  - `src/tools/draw_plan.rs` 增加 `move_context_notes_away_from_loss_boxes`：context/note 与 loss/objective 横向重叠且纵向间距不足时，先尝试上/下移出 0.055 归一化 gutter，空间不足再左右侧移。
+  - `cargo test --test draw_plan_tests -- --nocapture` 通过，80 个 DrawPlan 测试全绿。
+  - `cargo test` 全量通过；测试期间 LibreOffice 子进程打印过一次 deployment exception，但对应测试和主进程最终通过。
+  - `cd renderer && npm run build` 通过。
+  - `cargo fmt --check` 通过。
+  - `git diff --check` 通过。
+- 最后 1 轮真实 smoke：
+  - 命令：`SESSION_ID=post_note_crowding_smoke_20260621_043500 REFERENCE_PREVIEWS=required MAX_ITERATIONS=1 MAX_MINUTES=20 bash scripts/run_real_env.sh examples/teacher_student.md`
+  - run dir：`runs/teacher-student-distillation-with-latent-residuals/post_note_crowding_smoke_20260621_043500`
+  - 结果：`accepted=false`、1 轮、PPTX zip 完整，`source="model_generated_code"`、`used_fallback=false`。
+  - 该随机初稿没有复现上一轮的 note/loss 单一 crowding，而是产生了 8 个新 issue：whitespace、student/residual crowding、label/component overlap、label/edge overlap、degenerate edge。结构化 quality gate 能正确抓到这些问题，但 1 轮 smoke 不能证明 note/loss crowding 修复在真实随机样例中触发。
+  - 当前状态：
+  - 明显改善：大面积重叠、线穿框、annotation 压字、final 选中更差轮的问题都有本地回归和实现兜底。
+  - 仍未彻底解决：模型仍会随机生成新的差布局；每轮单调提升还没有强约束，只能靠 quality-aware best-so-far 保护 final。
+  - 下一步如果继续做，应在 improvement plan/coder prompt 中加入 regression budget：下一轮不得增加 blocker 数、不得降低 `quality_report.score`，否则自动回退到 best round 并只允许对当前 blockers 做局部 patch。
+
+## 2026-06-21 regression budget / latest-attempt context implementation
+
+- 用户目标：
+  - 不希望每轮都重构、原地打转；coding/vision/reasoning 模型应先读上一轮代码和问题，再做局部有效修改。
+  - 视觉模型如果给足 prompt 应该能识别重叠、空白、拥挤等低级问题；每轮 feedback 必须有可执行约束。
+- 本轮发现的实际问题：
+  - best-so-far 能保护 final，但下一轮如果从 best round 回滚重修，prompt 只看到 best round，容易丢失刚刚失败的 latest attempt 负例。
+  - `quality_report.score` 旧权重太容易归零，差图之间没有足够排序信号；真实 smoke 中 8-10 个 issue 都是 0 分。
+  - best round 排序一开始按 score 优先，会把“score 更高但 blocking 更多”的轮次选成 final，违背 regression budget。
+  - 初始 reasoner 偶尔生成 edge 指向不存在 component 的 FigurePlan，导致首轮还没写出 `figure_plan.json` 就中断，无法进入 loop。
+- 已完成实现：
+  - `src/pipeline.rs`
+    - 新增 `regression_report.json`，记录 `source_round_index`、`quality_score`、`score_delta`、`blocking_delta`、`major_delta`、`issue_delta`、`regressed_issue_types`、`resolved_issue_types` 和下一轮 budget。
+    - final copy list 增加 `regression_report.json`。
+    - workspace 增加 `readable/previous_regression_report.json`。
+    - 当 revision source 回滚到较早 best round 时，新增 latest attempt context：`latest_attempt_review.json`、`latest_attempt_quality_report.json`、`latest_attempt_regression_report.json`、`latest_attempt_issue_binding.json`、`latest_attempt_improvement_plan.json`、`latest_attempt_draw_plan.json`、`latest_attempt_code/figure.ts`。
+    - 给 DrawPlan optimizer 和 coder 的 regression context 现在同时包含 revision source budget 和 latest attempt 负例。
+    - best-so-far 排序改为 `passed -> blocking 数 -> major 数 -> score -> issue 数 -> vision review rank`，避免 score 提升掩盖 blocker 增加。
+    - regression status 改为预算优先：只要 blocking/major 增加或 score 降低，就标 `regressed`。
+  - `src/agent.rs`
+    - `build_round_improvement_prompt`、`build_draw_plan_revision_prompt`、`build_revised_code_prompt` 都加入 `QualityReport`、`IssueHistory`、`IssueBinding`、`RegressionReport/RegressionContext`。
+    - prompt 明确要求：改动必须绑定 issue_id/target_id；如果 latest attempt evidence 存在，要把它当负例，不重复失败几何/代码策略。
+  - `src/tools/review.rs`
+    - `quality_report.score` 改为更细粒度诊断分：blocking/major/minor penalty 为 12/6/2；acceptance 逻辑不变，任何 blocking/major 仍不通过。
+  - `src/tools/validate.rs`
+    - `normalize_plan_for_render` 增加 edge endpoint 修复：edge 如果误指向单组件 region，改写到该 component；无法解析的缺失 endpoint edge 直接删除，避免首轮中断。
+- 已完成测试：
+  - `tests/prompt_tests.rs`
+    - 覆盖 round improvement / DrawPlan revision prompt 必须包含 RegressionReport/RegressionContext、budget、latest_attempt evidence。
+  - `tests/workspace_pipeline_tests.rs`
+    - 覆盖 round/final 写出 `regression_report.json`，第二轮 workspace 写出 `previous_regression_report.json`。
+  - `tests/pipeline_tests.rs`
+    - 覆盖 score 更高但 blocking 更多的轮次不能替换 best-so-far。
+  - `tests/review_tests.rs`
+    - 覆盖多 severe issue 时 score 仍保留非零排序信号。
+  - `tests/plan_normalize_tests.rs`
+    - 覆盖 edge 指向 region 的修复和无法解析 endpoint 的删除。
+- 真实 `.env` smoke 记录：
+  - 失败 smoke：
+    - 命令：`SESSION_ID=post_regression_budget_smoke_20260621_055500 REFERENCE_PREVIEWS=required MAX_ITERATIONS=3 MAX_MINUTES=40 bash scripts/run_real_env.sh examples/teacher_student.md`
+    - 结果：首轮前失败，`FigurePlan validation failed: edge teacher_head_to_residual references missing to component residual_signal_region`。
+    - 处理：新增 `normalize_plan_for_render` edge endpoint 容错。
+  - 旧 score smoke：
+    - 命令：`SESSION_ID=post_regression_budget_smoke_20260621_061000 REFERENCE_PREVIEWS=required MAX_ITERATIONS=3 MAX_MINUTES=40 bash scripts/run_real_env.sh examples/teacher_student.md`
+    - 结果：3 轮跑通但未 accepted，PPTX zip 完整。
+    - 发现：三轮 score 都是 0，final 正确回滚到 issue 更少的 round，但 score 对 regression budget 不够有用。
+  - score granularity smoke：
+    - 命令：`SESSION_ID=post_regression_budget_score_smoke_20260621_063000 REFERENCE_PREVIEWS=required MAX_ITERATIONS=3 MAX_MINUTES=40 bash scripts/run_real_env.sh examples/teacher_student.md`
+    - 结果：`round_000 score=64/blockers=1/majors=4`，`round_001 score=52/blockers=4/majors=0`，`round_002 score=70/blockers=2/majors=1`。
+    - 发现：`round_002` score 更高但 blockers 更多，旧 best ranking 错选了 `round_002`；随后修复 blocker-first ranking。
+  - 最终 blocker-first smoke：
+    - 命令：`SESSION_ID=post_regression_budget_blocker_rank_smoke_20260621_064500 REFERENCE_PREVIEWS=required MAX_ITERATIONS=3 MAX_MINUTES=40 bash scripts/run_real_env.sh examples/teacher_student.md`
+    - run dir：`runs/teacher-student-distillation-with-latent-residuals/post_regression_budget_blocker_rank_smoke_20260621_064500`
+    - 结果：`accepted=false`、3 轮、`reason="cap reached before acceptance"`。
+    - 质量变化：`round_000 score=46/issues=7/blockers=2/majors=5` -> `round_001 score=64/issues=5/blockers=1/majors=4` -> `round_002/final score=88/issues=2/blockers=0/majors=2`。
+    - `round_002/final` 剩余两个 issue 都是 `component_crowding`，没有 blocker。
+    - `round_002/final` 的 `renderer_status.json` 为 `source="model_generated_code"`、`used_fallback=false`。
+    - `unzip -t final/figure.pptx` 通过。
+- 最终本地验证：
+  - `cargo test` 通过。
+  - `cd renderer && npm run build` 通过。
+  - `cargo fmt --check` 通过。
+  - `git diff --check` 通过。
+- 剩余问题：
+  - 3 轮 smoke 仍未 accepted，最后只剩 `component_crowding`，说明 crowding 的局部修复还需要继续加强。
+  - 首轮有一次 coder 失败后走 deterministic fallback，但最终轮是 model-generated code，且 final PPTX 完整可编辑。
+
+## 2026-06-21 residual hub, connector route, and review false-positive fixes
+
+- 本轮继续处理真实 smoke 中最后暴露的问题：
+  - `post_regression_budget_blocker_rank_smoke_20260621_064500/final` 只剩两个 `component_crowding`：`latent_residual` 被夹在 teacher/student 分支之间。
+  - 后续 `post_residual_hub_crowding_smoke_20260621_071500` 中，本地 `quality_report` 已出现 `round_001/final score=100/issues=0/passed=true`，但 vision review 仍拒绝，原因集中在 residual connector 过度折线、`task_loss` 卡在 student output/main module 中间，以及 `training_label` phase-only annotation 缺失误报。
+- 已完成实现：
+  - `src/tools/draw_plan.rs`
+    - 新增 residual/supervision objective hub 局部移动逻辑：当 residual hub 与两侧 teacher/student branch crowding 时，将其移动到 branch gap 外侧的安全候选位置，而不是整图重排。
+    - 新增 `move_task_loss_boxes_out_of_output_main_corridors`：当 `task_loss` 夹在 output 与 main module 的窄通道里时，优先移到 output 右侧并保持短直连。
+    - 新增 `straighten_residual_alignment_rails`：对真正的 latent residual alignment edge 使用单条水平 rail，并把 label 放到 rail 上/下方，避免 4 段折线和 label 压线。
+    - 限定 residual rail 规则不作用于 objective/loss feedback edge，避免破坏既有 loss/objective 回流测试。
+  - `src/tools/review.rs`
+    - 新增 `sanitize_review_false_positives`，只过滤“缺失 phase-only FigurePlan annotation”这类既定策略误报。
+    - 过滤条件要求出现 missing/absent/omitted 等缺失语义，并且命中 `training_label`、`inference_label`、`anno_training` 等 phase-only id 或 FigurePlan phase annotation 语义；真实的 overlap/crowding/edge routing 问题不会被吞掉。
+  - `src/agent.rs`
+    - `review_rendered_figure` 在解析 vision Review 后调用 false-positive sanitizer，再进入 plan geometry gate 和 render quality gate。
+    - review prompt/retry prompt 明确说明：`Training/Inference/Testing/training_label/inference_label` 这类 phase-only annotation 可以被折叠到附近模块或按设计省略，不能仅因缺失而拒收；只有可编辑 DrawPlan 里真实缺少 phase 语义时才报告。
+  - `tests/draw_plan_tests.rs`
+    - 新增 residual hub crowding 回归。
+    - 新增 smoke review 几何回归，覆盖 `task_loss` 从 output/main corridor 移出、`student_to_output` 直连、`output_to_loss` 直连、`latent_residual` 单水平 rail 且 label 离线。
+  - `tests/review_tests.rs`
+    - 新增 false-positive sanitizer 回归：纯粹 `Missing training_label annotation from FigurePlan` 会被移除并重新按阈值通过；`training_label overlaps...` 和 `training_loss` 的真实问题会保留。
+  - `tests/prompt_tests.rs`
+    - 固定 review prompt 中的 phase-only annotation 约束。
+- 已完成本地验证：
+  - `cargo fmt --check` 通过。
+  - `cargo test --test draw_plan_tests -- --nocapture` 通过，82 个 DrawPlan 测试全绿。
+  - `cargo test --test review_tests -- --nocapture` 通过。
+  - `cargo test --test prompt_tests -- --nocapture` 通过。
+  - `cargo test --test pipeline_tests -- --nocapture` 通过。
+  - `cargo test` 全量通过。
+  - `cd renderer && npm run build` 通过。
+- 剩余验证：
+  - 需要再跑真实 `.env` smoke，确认新的 route/hub/sanitizer 是否能让最终 accepted，或者至少保证 final 继续选择 blocker-free、quality 高的轮次。
+
+## 2026-06-21 smoke-driven semantic cleanup and residual crossing fix
+
+- 真实 `.env` smoke：
+  - 命令：`SESSION_ID=post_route_review_sanitize_smoke_20260621_073500 REFERENCE_PREVIEWS=required MAX_ITERATIONS=3 MAX_MINUTES=40 bash scripts/run_real_env.sh examples/teacher_student.md`
+  - run dir：`runs/teacher-student-distillation-with-latent-residuals/post_route_review_sanitize_smoke_20260621_073500`
+  - 结果：`accepted=false`、3 轮、final PPTX zip 完整，所有轮次和 final 均为 `source="model_generated_code"`、`used_fallback=false`。
+- 本次 smoke 的实际改善：
+  - `round_000`：`score=16/issues=12/blockers=2/majors=10`。
+  - `round_001`：`score=82/issues=2/blockers=1/majors=1`，相对首轮减少 10 个 quality issue，blocking 减 1，major 减 9。
+  - `round_002`：`score=82/issues=2/blockers=1/majors=1`，换成另一组同级问题。
+  - `final` 正确保留 `round_001` 作为 best-so-far，而不是覆盖成第三轮，说明 quality-aware final selection 生效。
+  - `training_label` 缺失误报没有再出现。
+- 新发现的根因：
+  - `comp_student_predict` 的文本被模型污染成 `Student Predict + Task Loss`，但图中已经有独立 `comp_task_loss`，导致语义重复和单职责破坏。
+  - `comp_task_output` 在右边界处宽度只有 0.13，`Prediction` 最长 token 在 85mm 目标宽度下仍有 wrap risk。
+  - `edge_latent_to_residual_loss` 的 residual 横线被 `edge_student_encode_to_predict` 的主路竖线穿过，旧 generic crossing repair 没有稳定选择 residual/objective edge 作为局部修复对象。
+- 已完成实现：
+  - `src/tools/draw_plan.rs`
+    - 新增 `remove_embedded_task_loss_text_from_main_boxes`：当图里已有独立 task-loss box 时，清理 main/student/predict 模块文本中的 `Task Loss` 片段，避免把 loss 语义合进主模块。
+    - 新增 `widen_output_boxes_for_long_tokens`：按最长 token 估算 output box 最小宽度，优先在画布内以中心扩宽，并重新吸附相关 connector 端点。
+    - 新增 `reroute_residual_objective_connectors_around_main_crossings`：只针对 residual/supervision 到 objective/loss 的 connector 与 main route 交叉，生成外侧 rail 候选并通过 box/connector 冲突过滤，避免影响普通 supervision 或 task-loss feedback。
+  - `tests/draw_plan_tests.rs`
+    - 新增 `model_draw_plan_polish_unmerges_task_loss_and_reroutes_residual_crossing_from_smoke`，复现本次 final 几何，修复前失败，修复后通过。
+- 已完成验证：
+  - 新回归测试修复前失败，修复后通过。
+  - `cargo test --test draw_plan_tests -- --nocapture` 通过，83 个 DrawPlan 测试全绿。
+  - `cargo test --test review_tests -- --nocapture` 通过。
+  - `cargo test --test prompt_tests -- --nocapture` 通过。
+  - `cargo test --test pipeline_tests -- --nocapture` 通过。
+  - `cargo fmt --check` 通过。
+  - `cargo test` 全量通过。
+  - `cd renderer && npm run build` 通过。
+- 剩余验证：
+  - 需要再跑真实 `.env` smoke，观察新的语义清理/输出扩宽/residual reroute 是否把 final 从 `score=82` 继续推高，或暴露下一类局部 blocker。
+
+## 2026-06-21 short-content box compaction and final smoke
+
+- 第二次真实 smoke 结果：
+  - 命令：`SESSION_ID=post_semantic_route_cleanup_smoke_20260621_081500 REFERENCE_PREVIEWS=required MAX_ITERATIONS=3 MAX_MINUTES=40 bash scripts/run_real_env.sh examples/teacher_student.md`
+  - run dir：`runs/teacher-student-distillation-with-latent-residuals/post_semantic_route_cleanup_smoke_20260621_081500`
+  - 结果：`accepted=false`、3 轮、final PPTX zip 完整，所有轮次和 final 均为 `source="model_generated_code"`、`used_fallback=false`。
+  - `round_000`：`score=64/issues=6/blockers=0/majors=6`，已经没有上一轮的 `Task Loss` 合并、`Prediction` wrap risk 或 residual/main crossing。
+  - `round_001` 和 `round_002`：`score=82/issues=2/blockers=1/majors=1`，分数更高但引入 `edge_crosses_component` blocker，`regression_report.status="regressed"`。
+  - `final` 正确保留无 local blocker 的 `round_000`，没有选择高分但有 blocker 的 round，证明 blocker-first best-so-far 和 regression budget 生效。
+- 新发现的根因：
+  - final 图里 `Teacher (Large LM)`、`Student (Compact)`、`Output` 都是短文本但占用超大框，导致内部空白大、任务损失/latent residual/输出之间的通道被挤压。
+  - 这类问题不是新模板选择问题，而是 DrawPlan optimizer 对短文本主模块缺少“面积上限”约束。
+- 已完成实现：
+  - `src/tools/draw_plan.rs`
+    - 新增 `compact_oversized_short_content_boxes`：只处理短文本且面积明显过大的 context/main/output/module box；跳过 input、loss/objective/residual/supervision，避免破坏语义节点。
+    - 压缩后重新 realign connector endpoints，保持当前布局方向和稳定 id，不重排整图。
+  - `tests/draw_plan_tests.rs`
+    - 新增 `model_draw_plan_polish_compacts_oversized_short_main_boxes_from_smoke`，复现该 smoke final 几何，确保 teacher/student/output 盒面积被收紧，并给 task-loss/residual 留出可见 gutter。
+- 已完成验证：
+  - 新回归测试修复前失败，修复后通过。
+  - `cargo test --test draw_plan_tests -- --nocapture` 通过，84 个 DrawPlan 测试全绿。
+  - `cargo test` 全量通过。
+  - `cd renderer && npm run build` 通过。
+  - `cargo fmt --check` 通过。
+  - `git diff --check` 通过。
+- 最后 1 轮真实 smoke：
+  - 命令：`SESSION_ID=post_compact_short_boxes_smoke_20260621_084500 REFERENCE_PREVIEWS=required MAX_ITERATIONS=1 MAX_MINUTES=20 bash scripts/run_real_env.sh examples/teacher_student.md`
+  - run dir：`runs/teacher-student-distillation-with-latent-residuals/post_compact_short_boxes_smoke_20260621_084500`
+  - 结果：`accepted=false`、1 轮、final PPTX zip 完整。
+  - 本地 quality：`score=88/issues=2/blockers=0/majors=2`，剩余为 `input_text` 的 internal whitespace 和 `task_output/task_loss` crowding。
+  - 限制：该轮 renderer 使用 `source="deterministic_fallback"`、`used_fallback=true`，因此只能证明 pipeline/fallback/render/quality gate 没坏，不能证明 model-generated TypeScript 完全通过。
+- 当前剩余问题：
+  - 还没有一次 3 轮真实 smoke 达到 accepted。
+  - 最新 1 轮 smoke 暴露 coder 偶发 TypeScript 失败，需要后续单独提高 coder prompt/contract 或把 fallback round 的诊断更早反馈给 coder。
+  - 局部几何质量已有明显改善：多次 smoke 中 final 能避免有 blocker 的回退轮，且本地质量最好达到 `score=88/blockers=0`。
+
+## 2026-06-21 runtime contract feedback, annotation cleanup, and route quality gates
+
+- 本轮目标：
+  - 继续实现上一轮规划，重点解决真实 smoke 中“fallback 掩盖模型代码错误”“重复/游离 annotation 重叠”“本地 quality gate 对绕线路由和远离 edge 的 label 漏报”的问题。
+  - 避免每轮重构，采用 smoke 暴露一个具体坏模式就加一个最小回归和局部修复的方式。
+- 根因 1：coder 生成了未公开 runtime API 调用。
+  - 证据：`post_compact_short_boxes_smoke_20260621_084500/round_000/figure.model_error.log` 中 `TypeError: runtime.getDrawPlan is not a function`。
+  - 修复：
+    - `src/tools/render.rs` 新增 `validate_generated_runtime_contract`，静态拒绝 `.getDrawPlan(`、`.getSlide(`、`.getPptx(`、`.getPresentation(`、`.track(`、`.write(` 等未公开 API。
+    - `src/pipeline.rs` 把上一轮和 latest attempt 的 `figure.model_error.log` 暴露到 regression context 和 workspace readable 文件，确保 coder 下一轮能读到真实失败原因。
+    - `src/prompts.rs`、`src/agent.rs` 明确要求 generated `figure.ts` 只使用 `createDrawPlanRuntimeFromEnv()` + `runtime.renderDrawPlan()`。
+  - 回归测试：
+    - `runtime_contract_rejects_undocumented_runtime_methods_before_node_execution`
+    - `renderer_retries_deterministic_fallback_when_model_uses_unsupported_runtime_api`
+    - `resume_workspace_exposes_previous_renderer_error_to_coder`
+- 根因 2：FigurePlan annotation 回填会把坏 annotation 加回来。
+  - 证据：真实 final 里 `anno_training_only` 和 `anno_task_loss` 堆在顶部，`inference_only_note` 在主 corridor 中；`student_encoder` 已写有 `inference-only`，`teacher_encoder` 已写有 `training only`。
+  - 修复：
+    - `src/tools/draw_plan.rs` 新增 `remove_redundant_phase_loss_and_inference_notes`。
+    - 只在 phase 文本已经出现在语义 box 中时删除外部 phase annotation，避免误删 `training only` 作为唯一语义提示的旧用例。
+    - 当 student/main box 已经包含 `inference-only/student only` 时，删除重复 inference note box/text 及其 incident connector。
+    - 删除 generic `Task Loss` text annotation，避免它作为无锚点浮动文本；真正的 `Task Loss` box 和 connector label 不受影响。
+  - 回归测试：
+    - `model_draw_plan_polish_removes_redundant_phase_loss_and_inference_notes_from_smoke`
+    - 同时确认 `model_draw_plan_polish_preserves_inference_text_annotation_outside_student_label` 和 task-loss box/edge 测试不回退。
+- 根因 3：本地 quality gate 对 composition 级坏味道不够硬。
+  - 证据：`post_annotation_cleanup_smoke_20260621_101500` 中 `round_001/round_002` 的 `quality_report` 均为 `score=100/issues=[]`，但 vision 仍指出：
+    - 4 点折线路由绕远；
+    - connector label 漂在远离所属 edge 的空白处；
+    - 约 2.7mm 的 input/loss gutter 对 paper-width figure 仍显拥挤。
+  - 修复：
+    - `src/tools/review.rs` 将水平 component crowding 阈值从 2.5mm 提高到 3.2mm。
+    - 新增 4 点 dogleg 识别；对 fan-in merge 目标做豁免，避免误伤 multimodal encoder -> fusion 的合法汇聚路由。
+    - 新增 `label_far_from_edge`，只对目标 edge 非 fan-in merge 的 connector label 生效，阈值调为 0.16 normalized，以保留普通模板标签但抓住真实漂移 label。
+    - `src/agent.rs`、`src/prompts.rs` 将 `route_detour`、`label_far_from_edge` 写入 DrawPlan revision 和 RoundImprovementPlan 合同。
+  - 回归测试：
+    - `quality_report_flags_smoke_dogleg_far_label_and_narrow_gutter`
+    - `pipeline_tests` 中 `max_iterations=0` until-pass 重新通过，证明 mock optimizer 不再长循环。
+- 根因 4：aux/reference inference note connector 会制造无意义 route_detour。
+  - 证据：`post_quality_gate_smoke_20260621_104500/final` 保留 best round，但剩余 local issue 中 `edge_inference_hint` 是从 student 到 context note 的 4 点 dashed/reference 说明边。
+  - 修复：
+    - `src/tools/draw_plan.rs` 新增 `remove_auxiliary_inference_note_connectors`：仅删除指向 standalone inference note 且 id/style/label 表现为 `hint`、`reference` 或 dashed 的说明性 connector。
+    - 保留真正的 data-flow inference component edge，避免破坏 `pipeline` 模板中需要 connectable inference node 的场景。
+  - 回归测试：
+    - `model_draw_plan_polish_removes_auxiliary_inference_note_connectors_from_smoke`
+    - `model_draw_plan_polish_converts_note_text_components_to_connectable_boxes` 继续通过。
+- 真实 `.env` smoke：
+  - `post_runtime_contract_feedback_smoke_20260621_091500`
+    - 命令：`SESSION_ID=post_runtime_contract_feedback_smoke_20260621_091500 REFERENCE_PREVIEWS=required MAX_ITERATIONS=2 MAX_MINUTES=30 bash scripts/run_real_env.sh examples/teacher_student.md`
+    - 结果：`accepted=false`、2 轮、cap 前未接受；两轮均 `source="model_generated_code"`、`used_fallback=false`，无 `figure.model_error.log`。
+    - 质量：`round_000 score=64/issues=5/blockers=1/majors=4` -> `round_001/final score=76/issues=4/blockers=0/majors=4`，证明 runtime contract 后真实 model-generated code 不再 fallback，且有正向提升。
+  - `post_annotation_cleanup_smoke_20260621_101500`
+    - 命令：`SESSION_ID=post_annotation_cleanup_smoke_20260621_101500 REFERENCE_PREVIEWS=required MAX_ITERATIONS=3 MAX_MINUTES=45 bash scripts/run_real_env.sh examples/teacher_student.md`
+    - 结果：`accepted=false`、3 轮；全部 `source="model_generated_code"`、`used_fallback=false`，final PPTX `unzip -t` 通过。
+    - 质量：`round_000 score=76/issues=2` -> `round_001 score=100/issues=0` -> `round_002 score=100/issues=0`。
+    - 发现：虽然 local quality 过了，vision 仍拒绝 4 点绕路、label 漂移和窄 gutter，直接促成后续 quality gate 扩展。
+  - `post_quality_gate_smoke_20260621_104500`
+    - 命令：`SESSION_ID=post_quality_gate_smoke_20260621_104500 REFERENCE_PREVIEWS=required MAX_ITERATIONS=3 MAX_MINUTES=45 bash scripts/run_real_env.sh examples/teacher_student.md`
+    - 结果：`accepted=false`、3 轮；全部 `source="model_generated_code"`、`used_fallback=false`，final PPTX `unzip -t` 通过。
+    - 质量：`round_000/final score=82/issues=3/blockers=0/majors=3`；`round_001/002 score=76/issues=3/blockers=1/majors=2` 且 `regression_report.status="regressed"`。
+    - 结论：新 gate 生效，`route_detour`、`component_crowding`、`degenerate_edge` 都进入机器可读反馈；best-so-far 选择正确保留无 blocker 的 `round_000`，没有采用后续回归轮。
+- 已完成验证：
+  - `cargo test --test draw_plan_tests -- --nocapture` 通过，86 个 DrawPlan 测试全绿。
+  - `cargo test --test review_tests -- --nocapture` 通过。
+  - `cargo test --test prompt_tests -- --nocapture` 通过。
+  - `cargo test --test pipeline_tests -- --nocapture` 通过。
+  - `cargo test` 全量通过；过程中 LibreOffice 仍偶发打印 `DeploymentException`，但测试 exit 0。
+  - `cd renderer && npm run build` 通过。
+  - `cargo fmt --check` 通过。
+  - `git diff --check` 通过。
+- 当前剩余问题：
+  - 仍没有 3 轮真实 smoke accepted。
+  - vision 仍会要求 `Task Loss` 语义可见；当前做法是删除无锚点 generic `Task Loss` text annotation，下一步更合理的是把这类语义转成靠近 `edge_student_output` 的 connector label 或独立 loss box，而不是恢复顶部浮动 annotation。
+  - `post_quality_gate_smoke_20260621_104500` 暴露 input/student box 的 internal whitespace 仍偏大，下一步应让已有 short-content compaction 覆盖更高更窄的 input/main boxes，或在 reasoner plan 中避免竖向巨框。
+
+## 2026-06-21 tall short boxes and task-loss label preservation
+
+- 本轮目标：
+  - 继续实现上一轮计划，针对 `post_quality_gate_smoke_20260621_104500/final` 中仍然可见的高瘦短文本框和 `Task Loss` 语义缺失做局部修复。
+  - 继续保持“上一轮暴露一个具体坏模式，就加一个最小回归测试和局部 polish”的策略，避免重排整图或硬套模板。
+- 根因 1：短文本框压缩规则漏掉高瘦 input/output/main box。
+  - 证据：final DrawPlan 中 `comp_input` 为 `[0.0233, 0.44, 0.1433, 0.9767]`、文本 `Input x`；`comp_student` 为 `[0.278, 0.6113, 0.472, 0.972]`、文本 `Student`；`comp_task_output` 为 `[0.815, 0.6067, 0.935, 0.9767]`、文本 `ŷ`。
+  - 旧 `compact_oversized_short_content_boxes` 直接跳过 input box，并且只用大面积或宽大框判定 oversized；高瘦短框面积不一定超过旧阈值，因此保留了大量内部空白。
+  - 修复：`src/tools/draw_plan.rs` 允许短 input box 参与 content compaction，并新增 `tall_short_box` 判定，覆盖高度大、宽度窄、短文本的 input/main/output/module box；压缩后继续 realign connector endpoints。
+  - 回归测试：`model_draw_plan_polish_compacts_tall_short_input_main_and_output_boxes_from_smoke`，确认 `Input x`、`Student`、`ŷ` 不再留在高空白框中，且 `edge_student_output` 重新贴到压缩后的框边界。
+- 根因 2：generic `Task Loss` annotation 被删除后没有转成可见语义。
+  - 证据：旧修复为了避免顶部悬浮 `anno_task_loss`，只删除 generic `Task Loss` text annotation；vision review 仍会认为任务损失语义缺失。
+  - 修复：`src/tools/draw_plan.rs` 在 FigurePlan annotation 回填阶段先识别 generic `Task Loss`/`loss` annotation；如果 target 是 connector 或 FigurePlan edge，且当前没有独立 Task Loss box，则把它折叠成目标 connector 的 `DrawLabel`，不再创建悬浮 Text object。
+  - 保守条件：已有独立 Task Loss box 时不额外加 label，避免重复表达；无法解析到 connector target 时保持旧的 annotation 处理路径。
+  - 回归测试：扩展 `model_draw_plan_polish_removes_redundant_phase_loss_and_inference_notes_from_smoke`，确认 `anno_task_loss` text 不存在，但 `edge_student_to_output` 上存在可编辑 `Task Loss` label，且 label 不压在线段上。
+- 测试副作用与处理：
+  - 全量 DrawPlan 测试首次失败在 `model_draw_plan_polish_routes_right_side_residual_feedback_to_student_edge`。
+  - 原因：student 短文本框现在会被压缩，residual feedback 边终点随当前 student 上边缘移动；旧测试硬编码了压缩前的 `y=0.62`。
+  - 处理：测试改为断言终点连接到当前 `comp_student` 的右侧/上边界，保留原有语义约束，不再依赖旧框高。
+- 已完成验证：
+  - `cargo test --test draw_plan_tests model_draw_plan_polish_compacts_tall_short_input_main_and_output_boxes_from_smoke -- --nocapture` 通过。
+  - `cargo test --test draw_plan_tests model_draw_plan_polish_removes_redundant_phase_loss_and_inference_notes_from_smoke -- --nocapture` 通过。
+  - `cargo test --test draw_plan_tests -- --nocapture` 通过，87 个 DrawPlan 测试全绿。
+  - `cargo fmt --check` 通过。
+  - `cargo test` 全量通过；过程中 LibreOffice 仍偶发打印外部 `DeploymentException`，但测试 exit 0。
+  - `cd renderer && npm run build` 通过。
+  - `git diff --check` 通过。
+- 待完成验证：
+  - 再跑 3 轮真实 `.env` smoke，确认 aux inference connector 删除、短框压缩和 Task Loss label 保留在真实模型路径下共同生效，并检查每轮是否有实质提升。
+- 第一次真实 `.env` smoke：
+  - 命令：`SESSION_ID=post_tall_short_taskloss_smoke_20260621_113000 REFERENCE_PREVIEWS=required MAX_ITERATIONS=3 MAX_MINUTES=45 bash scripts/run_real_env.sh examples/teacher_student.md`
+  - run dir：`runs/teacher-student-distillation-with-latent-residuals/post_tall_short_taskloss_smoke_20260621_113000`
+  - 结果：`accepted=false`、3 轮、`reason="cap reached before acceptance"`；全部轮次都是 `source="model_generated_code"`、`used_fallback=false`；final PPTX `unzip -t` 通过。
+  - 本地 quality：`round_000 score=94/issues=1` -> `round_001 score=100/issues=0` -> `round_002/final score=100/issues=0`，说明短框压缩和本地几何 gate 已生效。
+  - 视觉 review：仍未通过。主要残留问题集中在 `comp_inference` 作为左上角 standalone inference note、`anno_residual_label` 作为浮动 residual signal 注释、`edge_residual_to_student` 保留 4 点 detour，以及 `edge_residual_to_student` 的泛化 `supervise` label 漂移到页面顶部。
+  - 结论：本地 quality gate 已经不再暴露这些问题，但视觉模型能稳定指出。下一步应把这类“FigurePlan 保护但视觉上 detached 的 note/annotation/label”转成确定性 polish 规则。
+- 第二组局部修复：
+  - `src/tools/draw_plan.rs` 新增后期 `fold_detached_protected_inference_notes_into_student_annotations`：只在 protected inference note 位于 student 上方且偏左/外侧时触发，把 standalone box 折叠成靠近 student 的 editable text annotation；靠近 student 的 badge 或 FigurePlan 明确放在 student 下方的 note 仍保留为 box。
+  - `remove_redundant_phase_loss_and_inference_notes` 现在会删除 `residual signal` 这类 annotation，只在已有 semantic box 文本包含 residual 时触发，避免误删唯一语义。
+  - 新增 `simplify_residual_objective_to_main_edges`，将 residual objective 到 main/student 的 4 点 detour 简化为不超过 3 点的正交路线。
+  - 新增 `remove_redundant_residual_supervision_labels`，只删除 `supervise`、`supervision`、`residual signal`、`latent signal` 这类泛化 label；保留 `residual supervision`、`h_t - h_s` 等更具体的标签。
+  - 回归测试：`model_draw_plan_polish_folds_detached_protected_inference_and_residual_notes_from_smoke`。
+- 第二组本地验证：
+  - 新增目标测试通过。
+  - 由于规则初版过宽，曾导致 `model_draw_plan_polish_adds_missing_figure_plan_note_components`、`model_draw_plan_polish_moves_inference_note_out_of_residual_student_gap`、`model_draw_plan_polish_resnaps_elbow_connector_label_to_final_segment` 失败；已通过收窄 protected-note 判定和 generic-label 判定修复。
+  - `cargo test --test draw_plan_tests -- --nocapture` 通过，88 个 DrawPlan 测试全绿。
+  - `cargo test` 全量通过。
+  - `cd renderer && npm run build` 通过。
+  - `cargo fmt --check` 通过。
+  - `git diff --check` 通过。
+- 下一步：
+  - 再跑 3 轮真实 `.env` smoke，确认上述视觉 review 残留是否减少，尤其检查 `comp_inference`、`anno_residual_label`、`edge_residual_to_student.label` 和 `edge_residual_to_student.points`。
+- 第二次真实 `.env` smoke：
+  - 命令：`SESSION_ID=post_protected_note_residual_smoke_20260621_121500 REFERENCE_PREVIEWS=required MAX_ITERATIONS=3 MAX_MINUTES=45 bash scripts/run_real_env.sh examples/teacher_student.md`
+  - run dir：`runs/teacher-student-distillation-with-latent-residuals/post_protected_note_residual_smoke_20260621_121500`
+  - 结果：`accepted=false`、3 轮、`reason="cap reached before acceptance"`；全部轮次都是 `source="model_generated_code"`、`used_fallback=false`；final PPTX `unzip -t` 通过。
+  - 本地 quality：`round_000 score=82/issues=3` -> `round_001/final score=94/issues=1`；`round_002 score=82/issues=3` 被 best-so-far 判为回退，没有成为 final。
+  - 视觉 review：`round_002` 的视觉分数比 final 更好，但本地 quality 回退导致未选中。final 的主要本地问题是 `e_student_output` 因 `task_loss` 挡在 student-output 水平通道中而走四点 detour；vision 还指出多个 connector label 贴线、teacher/student size asymmetry 不明显、inference note padding 偏大。
+  - 结论：每轮都有实质改动和部分提升，但 `task_loss` 占据主输出通道是下一类最确定、可本地修复的根因。
+- 第三组局部修复：
+  - `src/tools/draw_plan.rs` 新增 `move_task_loss_boxes_out_of_main_output_horizontal_corridors`。
+  - 该规则检测同一 main/source 同时连到 output 和 task-loss 的情况；若 task-loss box 与 main→output 水平 lane 相交，则优先把 task-loss 移到该 lane 上方或下方的空位，再 realign connector endpoints。
+  - 后续已有 `improve_connector_routes_against_boxes` 会在障碍移走后把 main→output connector 简化回直接水平线。
+  - 回归测试：`model_draw_plan_polish_moves_task_loss_out_of_student_output_lane_from_smoke`，复现 `post_protected_note_residual_smoke_20260621_121500/final` 的 `student_block/task_loss/output/e_student_output` 几何。
+- 第三组本地验证：
+  - 新增目标测试通过。
+  - `cargo test --test draw_plan_tests -- --nocapture` 通过，89 个 DrawPlan 测试全绿。
+  - `cargo test` 全量通过；LibreOffice 仍偶发打印外部 `DeploymentException`，但测试 exit 0。
+  - `cd renderer && npm run build` 通过。
+  - `cargo fmt --check` 通过。
+  - `git diff --check` 通过。
+- 下一步：
+  - 再跑 3 轮真实 `.env` smoke，重点检查 `e_student_output` 是否不再产生 route_detour，以及是否暴露下一类视觉模型指出但本地 gate 漏掉的问题。
+- 第三次真实 `.env` smoke：
+  - 命令：`SESSION_ID=post_student_output_lane_smoke_20260621_130000 REFERENCE_PREVIEWS=required MAX_ITERATIONS=3 MAX_MINUTES=45 bash scripts/run_real_env.sh examples/teacher_student.md`
+  - run dir：`runs/teacher-student-distillation-with-latent-residuals/post_student_output_lane_smoke_20260621_130000`
+  - 结果：`accepted=false`、3 轮、`reason="cap reached before acceptance"`；全部轮次都是 `source="model_generated_code"`、`used_fallback=false`；final PPTX `unzip -t` 通过。
+  - 本地 quality：`round_000 score=100/issues=0`、`round_001 score=94/issues=1`、`round_002/final score=100/issues=0`。`e_student_output` route_detour 已消失，说明第三组修复生效。
+  - 视觉 review：仍未通过，主要问题变成 `c_inference_note` standalone box、residual dashed paths 过近、`h_t/h_s` label 贴线、部分框仍偏大。人工查看 final PNG 确认 inference note 仍是大独立框，student-output 主线已不再绕 task-loss。
+- 第四组局部修复：
+  - 放宽 `detached_protected_inference_note_should_fold`：只要 protected inference note 完全位于 student 上方，就折叠成 editable text annotation；不再要求它必须偏左。
+  - 更新 `model_draw_plan_polish_folds_detached_protected_inference_and_residual_notes_from_smoke`，用第三次 smoke 中 `c_inference_note` 类似位置覆盖“上方但不偏左”的情况。
+  - 更新 `model_draw_plan_polish_moves_inference_note_out_of_residual_student_gap`：允许合格结果为保留 note box 且避开 residual，或折叠为 editable inference text；不再强制 standalone box 必须存在。
+- 第四组本地验证：
+  - `cargo test --test draw_plan_tests -- --nocapture` 通过，89 个 DrawPlan 测试全绿。
+  - `cargo test` 全量通过。
+  - `cd renderer && npm run build` 通过。
+  - `cargo fmt --check` 通过。
+  - `git diff --check` 通过。
+- 第四次真实 `.env` smoke：
+  - 命令：`SESSION_ID=post_inference_fold_smoke_20260621_134500 REFERENCE_PREVIEWS=required MAX_ITERATIONS=3 MAX_MINUTES=45 bash scripts/run_real_env.sh examples/teacher_student.md`
+  - run dir：`runs/teacher-student-distillation-with-latent-residuals/post_inference_fold_smoke_20260621_134500`
+  - 结果：`accepted=false`、3 轮、`reason="cap reached before acceptance"`；全部轮次都是 `source="model_generated_code"`、`used_fallback=false`；final PPTX `unzip -t` 通过。
+  - 本地 quality：`round_000 score=76/issues=4` -> `round_001/final score=100/issues=0`；`round_002 score=94/issues=1` 被判为回退。说明每轮仍有实质修复，但 final 仍按本地 best-so-far 选择 `round_001`。
+  - 验证结果：`round_000` 的 inference note 已折叠成 `ann_inference` editable text；但后续 model 又生成了新的 `comp_inference_note` standalone box，位置变成 task-loss 附近/底部 corridor，视觉 review 继续把它列为 blocker。
+  - 当前剩余根因：
+    - inference note 可以换位置复发；本地规则目前只处理上方 detached note，未覆盖“与 loss/task/output 区域拥挤的 standalone inference box”。
+    - 本地 `quality_report` 对 connector label 贴线的 recall 仍不足，vision 反复指出 `h_t/h_s/ŷ` label 离真实 connector path 太远或贴线。
+    - 本地 quality 与 vision review 的选择目标仍冲突：`round_002` 有时 vision 更好但本地 quality 回退，final 选择本地更干净的 round。
+  - 下一步建议：
+    - 把 standalone inference note 的处理从位置特例升级为语义规则：如果 note 无连接且 role/style 是 muted/context，并且不在明确允许的 student-adjacent badge 区域，则折叠成 text annotation。
+    - 给 `label_far_from_edge`/`label_overlaps_edge` 加基于实际 polyline 最近距离的检查，覆盖当前 `h_t/h_s/ŷ` 的视觉问题。
+    - 调整 best-round selection，让 vision review 明显改善但 local quality 轻微回退的 round 不一定被丢弃，或把 vision blockers 转成下一轮更硬的 local gates。
+
+## 2026-06-21 protected inference recurrence and label-distance gate
+
+- 本轮目标：
+  - 继续执行上一节规划，不重排模板，只把 `post_inference_fold_smoke_20260621_134500/final` 暴露的两个残留坏模式转成确定性规则和回归测试。
+  - 坏模式 1：模型下一轮又生成新的 `comp_inference_note`，这次不在 student 上方，而是在 `Task Loss` 附近/底部 corridor，视觉模型仍判定为 standalone note blocker。
+  - 坏模式 2：`edge_head_loss_label` 的 `ŷ` 和 `edge_tenc_resid_label` 的 `h_t` 视觉上远离所属 connector，但本地 `label_far_from_edge` 阈值过松导致漏报。
+- 已完成实现：
+  - `tests/draw_plan_tests.rs` 新增 `model_draw_plan_polish_folds_protected_inference_note_crowding_task_loss_from_smoke`，复现底部 `comp_inference_note` 与 `comp_task_loss` 同层拥挤的 latest-smoke 几何。
+  - `src/tools/draw_plan.rs`
+    - `fold_detached_protected_inference_notes_into_student_annotations` 现在只折叠 protected、无连接、`context/muted` 的 inference note，避免误伤 data-flow component。
+    - 新增 loss/objective 同层拥挤判定：当 protected inference note 与 loss/objective 在同一水平带且横向距离不超过 `0.20` 时，折叠成 `ann_inference` editable text。
+    - 新增 student-adjacent badge 豁免：与 student 垂直重叠且横向距离很近的 inference badge 保持为 box，避免旧用例 `model_draw_plan_polish_repairs_stacked_teacher_residual_smoke_layout` 被错误折叠。
+  - `tests/review_tests.rs` 新增 `quality_report_flags_smoke_labels_detached_from_actual_polyline`，复现 `edge_head_loss_label` 与 `edge_tenc_resid_label` 远离真实 polyline 的情况。
+  - `src/tools/review.rs` 将 `label_far_from_edge` 改成按 label 文本长度分层：`ŷ`、`h_t` 这类短符号用 `0.08` normalized 的近线阈值，较长短语保留 `0.16` 阈值。这样能抓住 latest-smoke 的短标签漂移，同时不把 mock pipeline 里被模块行挤开的长短语 caption 判成 blocker。
+- 已完成局部验证：
+  - 新增 DrawPlan 回归测试先失败，修复后通过。
+  - 新增 Review 回归测试先失败，修复后通过。
+  - `cargo test --test review_tests -- --nocapture` 通过，28 个 review 测试全绿。
+  - `cargo test --test draw_plan_tests -- --nocapture` 通过，90 个 DrawPlan 测试全绿。
+- 验证中发现的副作用与处理：
+  - 初版 label 阈值统一收紧到 `0.08` 后，`mock_pipeline_accepts_zero_max_iterations_as_until_passed` 会长循环；临时 mock run `tmp/debug_quality_gate_mock` 显示阻塞项是 `teacher_to_student_label`/`student_to_output_label` 这类长短语 caption 离模块中心线较远。
+  - 处理方式不是回滚短标签 gate，而是按 label 文本长度分层；短公式/变量继续严格，长短语 caption 允许更大偏移。
+- 已完成全量验证：
+  - `cargo test` 通过；过程中 LibreOffice 仍偶发打印 `DeploymentException`，但测试 exit 0。
+  - `cargo fmt --check` 通过。
+  - `cd renderer && npm run build` 通过。
+  - `git diff --check` 通过。
+- 待完成验证：
+  - 再跑真实 `.env` smoke，重点检查新一轮是否会把 `comp_inference_note` 折叠，并将 `h_t/ŷ` label 漂移转成机器可读反馈。
+- 第五次真实 `.env` smoke：
+  - 命令：`SESSION_ID=post_inference_crowding_label_gate_smoke_20260621_151500 REFERENCE_PREVIEWS=required MAX_ITERATIONS=3 MAX_MINUTES=45 bash scripts/run_real_env.sh examples/teacher_student.md`
+  - run dir：`runs/teacher-student-distillation-with-latent-residuals/post_inference_crowding_label_gate_smoke_20260621_151500`
+  - 结果：`accepted=false`、3 轮、`reason="cap reached before acceptance"`；全部轮次都是 `source="model_generated_code"`、`used_fallback=false`；final PPTX `unzip -t` 通过。
+  - 本地 quality：`round_000/final score=76/issues=3`；`round_001` 和 `round_002` 都回退到 `score=58` 且带 blocking overlap/crossing，因此 best-so-far 正确保留 `round_000`。
+  - 验证结果：此前反复出现的 `comp_inference_note` standalone box 已被折叠，final layout 中没有独立 inference box；但折叠出的 `ann_inference` 位于 `[0.2558, 0.435, 0.5358, 0.495]`，仍在主流 corridor 附近，被 vision 判为 blocker。
+  - 新暴露根因：
+    - `inference_annotation_bbox_near_student` 旧策略优先把折叠后的 annotation 放在 student 上方。对于 student branch 位于中下部的 method figure，这个位置会落入 input/student/output 的主流上沿，视觉上仍像浮动说明。
+    - 这个问题不是 FigurePlan 保护问题，而是 fold 后 placement 策略的问题。
+- 第六组局部修复：
+  - `tests/draw_plan_tests.rs` 扩展 `model_draw_plan_polish_folds_protected_inference_note_crowding_task_loss_from_smoke`：除确认 `comp_inference_note` 被移除、`ann_inference` 保持 editable text 外，还断言 annotation 应落到 student 下方空白，而不是主流上方 corridor。
+  - `src/tools/draw_plan.rs` 修改 `inference_annotation_bbox_near_student`：只要 student 下方有空间，就优先把 inference annotation 放在 student 下方；下方空间不足时才回退到 student 上方。
+  - 该修复保留了“不把 inference 语义塞进 student module label”的既有设计约束，避免破坏 `model_draw_plan_polish_preserves_inference_text_annotation_outside_student_label`。
+- 第六组本地验证：
+  - 扩展后的目标测试在旧逻辑下失败，修复后通过。
+  - `model_draw_plan_polish_folds_standalone_inference_note_into_annotation` 通过。
+  - `model_draw_plan_polish_preserves_inference_text_annotation_outside_student_label` 通过。
+  - `cargo test --test draw_plan_tests -- --nocapture` 通过，90 个 DrawPlan 测试全绿。
+- 待完成验证：
+  - 重新跑 `cargo test`、`cargo fmt --check`、`cd renderer && npm run build`、`git diff --check`。
+  - 再跑真实 `.env` smoke，检查 `ann_inference` 是否离开主流 corridor，以及是否开始暴露下一类主要问题：latent residual/output crowding、student-output route detour、edge crossing。
+- 第六组全量验证：
+  - `cargo test` 通过。
+  - `cargo fmt --check` 通过。
+  - `cd renderer && npm run build` 通过。
+  - `git diff --check` 通过。
+- 第六次真实 `.env` smoke：
+  - 命令：`SESSION_ID=post_inference_annotation_below_smoke_20260621_154500 REFERENCE_PREVIEWS=required MAX_ITERATIONS=3 MAX_MINUTES=45 bash scripts/run_real_env.sh examples/teacher_student.md`
+  - run dir：`runs/teacher-student-distillation-with-latent-residuals/post_inference_annotation_below_smoke_20260621_154500`
+  - 结果：`accepted=false`、3 轮、`reason="cap reached before acceptance"`；全部轮次都是 `source="model_generated_code"`、`used_fallback=false`；final PPTX `unzip -t` 通过。
+  - 本地 quality：三轮和 final 均为 `score=94/issues=1`，唯一 local issue 是 `comp_input` 与 `comp_residual` 竖向距离过近。
+  - 视觉 review：`ann_inference` 相比上一轮已离开 student 上方主流位置，但仍在 student branch 右侧空间中，被 vision 认为还在 vertical flow space；更主要的 blocker 变成 `comp_residual` 作为 standalone residual box，且 dashed `edge_residual_supervision` 绕着它形成 4 点 staircase。
+  - 人工查看 final PNG：图的主要坏点是中心 `Latent Residual` 盒子打断 dashed residual edge；这应当是 edge label，而不是一个独立 loss box。
+- 第七组局部修复：
+  - `tests/draw_plan_tests.rs` 新增 `model_draw_plan_polish_folds_unconnected_residual_box_into_supervision_label_from_smoke`，复现 `post_inference_annotation_below_smoke_20260621_154500/final` 中无连接 `comp_residual` 与已有 `edge_residual_supervision` dashed edge 的组合。
+  - `src/tools/draw_plan.rs` 新增 `fold_unconnected_residual_boxes_into_supervision_labels`：
+    - 只处理没有任何 connector endpoint 引用的 residual box。
+    - 只有找到可承载 label 的 residual/supervision/dashed connector 时才折叠；否则保留 residual box，避免误删合法 objective/module。
+    - 折叠时把 residual box 文本写成 edge label，并删除该 residual box。
+    - 同时把 residual supervision edge 从 4 点 staircase 简化为不超过 3 点的正交 route。
+  - 初版规则过宽，曾删除无 connector 场景里的合法 residual box，导致 3 个 DrawPlan 旧用例失败；已通过“必须成功绑定到 dashed/supervision connector 才删除 box”修复。
+- 第七组本地验证：
+  - 新增目标测试先失败，修复后通过。
+  - 回归用例 `model_draw_plan_polish_compacts_oversized_short_main_boxes_from_smoke`、`model_draw_plan_polish_moves_inference_note_away_from_loss_crowding`、`model_draw_plan_polish_moves_near_overlapping_inference_component_off_semantic_boxes` 通过。
+  - `cargo test --test draw_plan_tests -- --nocapture` 通过，91 个 DrawPlan 测试全绿。
+- 待完成验证：
+  - 重新跑全量验证。
+  - 再跑真实 `.env` smoke，检查 `comp_residual` 是否消失、residual label 是否落在 dashed edge 上，以及是否减少 input/residual crowding 和 residual route detour。
+- 第七组全量验证：
+  - `cargo test` 通过。
+  - `cd renderer && npm run build` 通过。
+  - 初次 `cargo fmt --check` 发现 `src/tools/draw_plan.rs` 一处格式差异；已运行 `cargo fmt` 修复。
+  - `cargo fmt --check` 通过。
+  - `git diff --check` 通过。
+- 待完成验证：
+  - 再跑真实 `.env` smoke，检查 `comp_residual` 是否消失、residual label 是否落在 dashed edge 上，以及是否减少 input/residual crowding 和 residual route detour。
+- 第七次真实 `.env` smoke：
+  - 命令：`SESSION_ID=post_residual_edge_label_smoke_20260621_161500 REFERENCE_PREVIEWS=required MAX_ITERATIONS=3 MAX_MINUTES=45 bash scripts/run_real_env.sh examples/teacher_student.md`
+  - run dir：`runs/teacher-student-distillation-with-latent-residuals/post_residual_edge_label_smoke_20260621_161500`
+  - 结果：`accepted=false`、3 轮、`reason="cap reached before acceptance"`；`round_000` 使用 `deterministic_fallback`，`round_001/round_002/final` 均为 `model_generated_code`、`used_fallback=false`；final PPTX `unzip -t` 通过。
+  - 本地 quality：final `score=76/issues=4`，主要是 `student_model/teacher_model` crowding、`task_output/latent_residual_supervision` crowding、`e_teacher_residual_label` 远离竖向 dashed edge、`e_input_teacher` route detour。
+  - 验证结果：
+    - 本轮 final 不再出现上一轮那种“无连接 `comp_residual` standalone box”；模型生成的是连接中的 `latent_residual_supervision` component，按第七组规则不应删除。
+    - 当前 residual blocker 转移为 connected objective/component 与 output 过近，而不是无连接 residual box。
+    - 视觉 review 新指出 `student_model` 文本包含重复 parenthetical：`Student\n(frozen at inference)\n(inference-only)`，说明 reasoner/coder 会把 inference 语义塞回主 box，但目前没有去重规则。
+    - `e_input_teacher` 仍可能保留 4 点 detour；`e_teacher_residual_label` 对竖向 dashed connector 的 label placement 仍不够近。
+- 当前剩余根因：
+  - 对“连接中的 residual supervision/objective component”还需要单独的 gutter/placement 规则，不能复用无连接 residual box 删除规则。
+  - 需要清理重复 phase parenthetical，尤其是 `frozen at inference` 与 `(inference-only)` 同时出现在 student label 时。
+  - 需要增强 vertical edge label snapping，使短 label 靠近竖向 connector 的实际 path。
+  - 需要针对 shared input → teacher/student 的 4 点 detour 做更强简化，避免每轮靠 coder 自己修。
+
+## 2026-06-21 duplicate phase text and short vertical label polish
+
+- 本轮目标：
+  - 继续执行上一节规划，优先把最新真实 smoke 暴露且能确定本地化的两个坏模式转成 regression tests 和 deterministic polish。
+  - 坏模式 1：`student_model` label 出现 `Student\n(frozen at inference)\n(inference-only)`，同一 inference 语义重复占用主模块内部空间。
+  - 坏模式 2：`e_teacher_residual_label` 的 `latent z` 虽然 bbox 左边贴近竖向 dashed edge，但 bbox 宽度仍是 `0.16`，导致文本中心离真实 connector path 过远，视觉上像浮动标签。
+- 已完成实现：
+  - `tests/draw_plan_tests.rs` 新增 `model_draw_plan_polish_removes_redundant_inference_parenthetical_from_main_label`，复现重复 inference parenthetical；旧逻辑下失败，修复后通过。
+  - `tests/draw_plan_tests.rs` 新增 `model_draw_plan_polish_tightens_short_vertical_edge_label_near_route_from_smoke`，复现 `post_residual_edge_label_smoke_20260621_161500/final` 中 `latent z` label 过宽漂移；旧逻辑下失败，修复后通过。
+  - `src/tools/draw_plan.rs` 新增 `remove_redundant_inference_only_parentheticals_from_main_boxes`：仅当主模块文本中已有更具体 inference 语义（如 `frozen at inference`、`student-only inference`）时，删除额外 standalone `(inference-only)`/`inference-only`，避免删掉唯一 inference cue。
+  - `src/tools/draw_plan.rs` 新增 `tighten_short_connector_labels_near_routes`：在 final route snapping 后，对 `visible_text_len <= 8` 的 connector label 按字符数收窄 bbox，并贴回最近的水平/竖向 route segment；这解决短公式/变量 label 因默认 `0.16` 宽度导致中心远离边的问题。
+- 已完成局部验证：
+  - `cargo test --test draw_plan_tests model_draw_plan_polish_removes_redundant_inference_parenthetical_from_main_label -- --nocapture` 通过。
+  - `cargo test --test draw_plan_tests model_draw_plan_polish_tightens_short_vertical_edge_label_near_route_from_smoke -- --nocapture` 通过。
+- 已完成全量验证：
+  - `cargo test --test draw_plan_tests -- --nocapture` 通过，93 个 DrawPlan 测试全绿。
+  - `cargo test` 通过。
+  - `cd renderer && npm run build` 通过。
+  - 初次 `cargo fmt --check` 只发现新增 helper 的格式差异；已运行 `cargo fmt` 修复。
+  - `cargo fmt --check` 通过。
+  - `git diff --check` 通过。
+- 待完成验证：
+  - 再跑真实 `.env` smoke，检查重复 inference 文本和短 label 漂移是否消失，并观察剩余 blocker 是否转移到 connected residual objective gutter 或 shared input route detour。
+- 第八次真实 `.env` smoke：
+  - 命令：`SESSION_ID=post_dup_phase_short_label_smoke_20260621_080949 REFERENCE_PREVIEWS=required MAX_ITERATIONS=3 MAX_MINUTES=45 bash scripts/run_real_env.sh examples/teacher_student.md`
+  - run dir：`runs/teacher-student-distillation-with-latent-residuals/post_dup_phase_short_label_smoke_20260621_080949`
+  - 结果：`accepted=false`、3 轮、`reason="cap reached before acceptance"`；三轮和 final 均为 `source="model_generated_code"`、`used_fallback=false`；final PPTX `unzip -t` 通过。
+  - 本地 quality：`round_000 score=40/issues=7` -> `round_001/final score=88/issues=2`，`round_002 score=76/issues=3` 回退。说明 loop 仍有实质提升，但 final 未通过。
+  - 验证结果：
+    - final 中不再出现 `Student\n(frozen at inference)\n(inference-only)` 这类重复 inference parenthetical；student label 为 `Student\nEncoder`。
+    - final 中也没有上一轮 `latent z` 竖向短 label 漂移；本轮模型没有生成该 label，短 label blocker 未复发。
+    - 新主要 blocker 变成 connected objective/loss 与主 branch 的上下 gutter：`teacher_encoder` 与 `latent_residual` 只有 0.8mm、`student_encoder` 与 `task_loss` 只有 1.5mm。
+    - 人工查看 final PNG：`Latent Residual Supervision` 夹在 Teacher/Student 中间并贴着 Student 上边，`Task Loss` 贴着 Student 下边，整体像三层堆叠挤压；`ann_inference` 仍靠近 output corridor。
+- 第九组局部修复：
+  - `tests/draw_plan_tests.rs` 新增 `model_draw_plan_polish_moves_connected_residual_hub_out_of_tight_branch_gutter_from_smoke`，复现 connected `latent_residual` 位于 teacher/student branch 中间但贴边的情况；旧逻辑下失败，修复后通过。
+  - `tests/draw_plan_tests.rs` 新增 `model_draw_plan_polish_adds_gutter_between_student_and_connected_task_loss_from_smoke`，复现 `task_loss` 直接压在 `student_encoder` 下方的情况；旧逻辑下失败，修复后通过。
+  - `src/tools/draw_plan.rs` 放宽 `move_objective_hubs_out_of_branch_gap_crowding` 触发条件：当 residual/supervision hub 位于上下 branch rows 之间且至少贴近一个 branch 时，也使用已有 side/below/above clearance candidates，而不是要求同时被两个 branch 以旧 gate 判定 crowded。
+  - `src/tools/draw_plan.rs` 新增 `separate_task_loss_boxes_from_main_modules`：对 main -> task loss connector，如果 task loss 与 main 纵向/横向间距不足，优先沿原上下方向增加到 `0.055` normalized gutter；不行再尝试左右侧候选，并 realign connector endpoints。
+- 已完成局部验证：
+  - `cargo test --test draw_plan_tests model_draw_plan_polish_moves_connected_residual_hub_out_of_tight_branch_gutter_from_smoke -- --nocapture` 通过。
+  - `cargo test --test draw_plan_tests model_draw_plan_polish_adds_gutter_between_student_and_connected_task_loss_from_smoke -- --nocapture` 通过。
+- 验证中发现的副作用与处理：
+  - 初版 `separate_task_loss_boxes_from_main_modules` 会再次移动已有合格的 `Student Output Head -> Task Loss` 短竖线布局，导致 `model_draw_plan_polish_moves_touching_task_loss_to_short_vertical_route` 的 connector 从 2 点变成 5 点绕线。
+  - 处理方式：收窄新规则，只处理真正 main/student module；当 source 文本/id/role/style 显示为 output/head-like 时跳过，让已有 `align_touching_task_loss_boxes_with_sources` 负责该局部结构。
+  - 回归测试 `model_draw_plan_polish_moves_touching_task_loss_to_short_vertical_route` 已恢复通过。
+- 已完成 DrawPlan 验证：
+  - `cargo test --test draw_plan_tests -- --nocapture` 通过，95 个 DrawPlan 测试全绿。
+- 已完成全量验证：
+  - `cargo test` 通过；过程中 LibreOffice 仍偶发打印外部 `DeploymentException`/`Unspecified Application Error`，但测试 exit 0。
+  - `cd renderer && npm run build` 通过。
+  - 初次 `cargo fmt --check` 发现新增函数和测试的格式差异；已运行 `cargo fmt` 修复。
+  - `cargo fmt --check` 通过。
+  - `git diff --check` 通过。
+- 待完成验证：
+  - 再跑真实 `.env` smoke，检查 connected residual/task-loss gutter 是否消除，并观察下一类 blocker，尤其是 `ann_inference` 是否仍占 output corridor、`e_input_teacher` 是否仍有 detour。
+- 第九次真实 `.env` smoke：
+  - 命令：`SESSION_ID=post_connected_gutter_smoke_20260621_082404 REFERENCE_PREVIEWS=required MAX_ITERATIONS=3 MAX_MINUTES=45 bash scripts/run_real_env.sh examples/teacher_student.md`
+  - run dir：`runs/teacher-student-distillation-with-latent-residuals/post_connected_gutter_smoke_20260621_082404`
+  - 结果：`accepted=false`、3 轮、`reason="cap reached before acceptance"`；三轮和 final 均为 `source="model_generated_code"`、`used_fallback=false`；final PPTX `unzip -t` 通过。
+  - 本地 quality：`round_000 score=64/issues=4` -> `round_001 score=82/issues=2` -> `round_002/final score=100/issues=0`。新增 connected gutter 规则没有引入本地几何问题。
+  - 验证结果：
+    - 之前的 residual/task-loss 与主模块贴边问题在 final 本地 gate 中消失。
+    - vision 没有列 blocking issues，但整体评分仍低：`story_clarity=5`、`layout_cleanliness=3`、`arrow_routing=3`、`aesthetic_quality=4`，因此未 accepted。
+    - 人工查看 final PNG：主要坏点转为本地 quality 漏检的整体构图问题：`anno_inference` 插在 Teacher/Student 水平主通道中，`edge_input_to_student` 从底部横穿后上折成长 L，多个 connector label 占据主通道。
+    - 结论：下一步不能只看 component overlap/crowding，需要把 vision-only 的 corridor clutter 转成本地 quality issue，至少让下一轮得到具体 target，而不是只有低总分。
+- 第十组局部修复：
+  - `tests/review_tests.rs` 新增 `quality_report_flags_inference_annotation_in_teacher_student_corridor_from_smoke`，复现第九次 smoke final 中 `anno_inference` 位于 `comp_teacher` 和 `comp_student` 之间水平 corridor 的情况；旧 quality gate 下失败，修复后通过。
+  - `src/tools/review.rs` 新增 `annotation_in_main_corridor` quality issue：仅针对 `kind="annotation"` 且文本/ID 包含 inference/student-only 的 annotation；当它位于 teacher 与 student 两个 component 之间且贴近两者水平行时，生成 major issue，target ids 包含 annotation、teacher、student。
+  - 这个修复不强行改布局；它把 vision-only blocker 转为机器可读反馈，避免下一轮只收到泛泛低分。
+- 已完成局部验证：
+  - `cargo test --test review_tests quality_report_flags_inference_annotation_in_teacher_student_corridor_from_smoke -- --nocapture` 通过。
+- 已完成全量验证：
+  - `cargo test --test review_tests -- --nocapture` 通过，29 个 review 测试全绿。
+  - `cargo test --test draw_plan_tests -- --nocapture` 通过，96 个 DrawPlan 测试全绿。
+  - `cargo test` 通过。
+  - `cd renderer && npm run build` 通过。
+  - 初次 `cargo fmt --check` 发现新增 review helper 和测试的格式差异；已运行 `cargo fmt` 修复。
+  - `cargo fmt --check` 通过。
+  - `git diff --check` 通过。
+- 待完成验证：
+  - 再跑真实 `.env` smoke，检查 `anno_inference` corridor 是否被下一轮明确修复，或至少是否在 quality report 中稳定出现并绑定 target。
+- 第十次真实 `.env` smoke：
+  - 命令：`SESSION_ID=post_annotation_corridor_gate_smoke_20260621_083800 REFERENCE_PREVIEWS=required MAX_ITERATIONS=3 MAX_MINUTES=45 bash scripts/run_real_env.sh examples/teacher_student.md`
+  - run dir：`runs/teacher-student-distillation-with-latent-residuals/post_annotation_corridor_gate_smoke_20260621_083800`
+  - 结果：`accepted=false`、3 轮、`reason="cap reached before acceptance"`；三轮和 final 均为 `source="model_generated_code"`、`used_fallback=false`；final PPTX `unzip -t` 通过。
+  - 本地 quality：`round_000/final score=82/issues=3`，`round_001 score=64/issues=4`，`round_002 score=64/issues=4`。best-so-far 正确保留 `round_000`。
+  - 验证结果：
+    - 本次模型没有复现 `anno_inference` 位于 teacher/student 水平 corridor 的具体模式，因此新 `annotation_in_main_corridor` gate 未触发是合理的。
+    - quality report 已经稳定给出具体 target：`student_model` text wrap risk，`teacher_model/teacher_latent` 水平 crowding，`student_model/student_output` 水平 crowding。vision 还指出 `e_residual_to_student` 大 elbow 和 `ann_inference` 浮在主图下方缺少 anchor。
+    - 人工查看 final PNG：当前坏点是左右相邻模块几乎贴边、Student/Prediction 框过大且贴近、`Inference: student only` 在底部漂浮、residual-to-student dashed route 绕出大折线。相比早期重叠/独立 residual box/重复 inference 文本，问题已转移到更具体的布局细化层。
+- 当前剩余根因：
+  - 需要处理水平相邻模块的最小 gutter，尤其是 `teacher_model -> teacher_latent`、`student_model -> student_output` 这种 source-output 或 source-latent 相邻结构。
+  - 需要给 `Student` 这类短主模块 label 提供最小宽度，避免刚好触发 `text_wrap_risk`。
+  - 需要把底部 `ann_inference` floating note 也转成 quality gate 或 deterministic re-anchor：它不在 teacher/student corridor，但仍缺少视觉 anchor。
+  - 需要简化 `e_residual_to_student` 这种 residual objective 到 student 的大 elbow route。
+
+## 2026-06-21 horizontal connected gutter and short main width
+
+- 本轮目标：
+  - 继续处理 `post_annotation_corridor_gate_smoke_20260621_083800/final` 暴露的下一组高确定性问题。
+  - 坏模式 1：`teacher_model -> teacher_latent` 和 `student_model -> student_output` 是有连接的同一行组件，但水平间距分别只有约 0.1mm 和 2.0mm，导致本地 `component_crowding` 与视觉上的“贴边块”。
+  - 坏模式 2：`student_model` 只有 `Student` 一个短词，但 bbox 宽度仅约 `0.1127`，在 paper width 下刚好触发 `text_wrap_risk`。
+- 已完成实现：
+  - `tests/draw_plan_tests.rs` 新增 `model_draw_plan_polish_separates_horizontally_crowded_connected_modules_from_smoke`，复现 latest smoke 中 teacher/latent 与 student/output 水平贴边；旧逻辑下失败，修复后通过。
+  - `tests/draw_plan_tests.rs` 新增 `model_draw_plan_polish_widens_short_main_module_label_from_smoke`，复现 `student_model` 短主模块过窄；旧逻辑下失败，修复后通过。
+  - `src/tools/draw_plan.rs` 新增 `widen_short_main_boxes_for_readability`：对 main/student 这类主模块按最长行字符数补到最小可读宽度，避免短词在目标论文宽度下处在 wrap 风险边缘。
+  - `src/tools/draw_plan.rs` 新增 `separate_horizontally_crowded_connected_boxes`：只处理有 connector 连接、同一行、非 input/loss/objective 的水平相邻模块；目标 gutter 为 `0.035` normalized。优先移动右侧 target，若会挤到其它框则尝试移动左侧 source，并要求候选不会造成新的 overlap/crowding。
+- 已完成局部验证：
+  - `cargo test --test draw_plan_tests model_draw_plan_polish_separates_horizontally_crowded_connected_modules_from_smoke -- --nocapture` 通过。
+  - `cargo test --test draw_plan_tests model_draw_plan_polish_widens_short_main_module_label_from_smoke -- --nocapture` 通过。
+- 验证中发现的副作用与处理：
+  - 初版 horizontal gutter 把 `role=context` 的 `teacher_model` 错误当作 note-like 端点跳过，导致目标回归没有触发；已收窄 note-like 判定，不再把普通 `context` 模块排除。
+  - 另一个旧用例 `model_draw_plan_polish_converts_note_text_components_to_connectable_boxes` 暴露 note-like component 会与 source module 贴边；已新增 `separate_note_like_connected_boxes_from_sources`，只对 note/inference/student-only 这类 connected note 端点补最小 gutter，旧用例恢复通过。
+- 已完成 DrawPlan 验证：
+  - `cargo test --test draw_plan_tests -- --nocapture` 通过，98 个 DrawPlan 测试全绿。
+- 已完成全量验证：
+  - `cargo test` 通过。
+  - `cd renderer && npm run build` 通过。
+  - 初次 `cargo fmt --check` 发现新增 helper 的格式差异；已运行 `cargo fmt` 修复。
+  - `cargo fmt --check` 通过。
+  - `git diff --check` 通过。
+- 待完成验证：
+  - 再跑真实 `.env` smoke，检查 `teacher_model/teacher_latent`、`student_model/student_output` 水平 crowding 和 `student_model` text wrap 是否消失。
+
+## 2026-06-21 thin visible overlap gate after horizontal gutter smoke
+
+- 真实 `.env` smoke：
+  - 命令：`SESSION_ID=post_horizontal_gutter_smoke_20260621_085754 REFERENCE_PREVIEWS=required MAX_ITERATIONS=3 MAX_MINUTES=45 bash scripts/run_real_env.sh examples/teacher_student.md`
+  - run dir：`runs/teacher-student-distillation-with-latent-residuals/post_horizontal_gutter_smoke_20260621_085754`
+  - 结果：`accepted=false`、3 轮、`reason="cap reached before acceptance"`；final 为 `source="model_generated_code"`、`used_fallback=false`；final PPTX `unzip -t` 通过。
+- 验证结果：
+  - 前一组水平 connected gutter 和短主模块宽度修复有效：final 没有复现 `teacher_model/teacher_latent`、`student_model/student_output` 的水平贴边，也没有 `Student` 短框 wrap blocker。
+  - final `quality_report.json` 只剩 `annotation_in_main_corridor`，但人工查看 PNG 发现右侧 `teacher_residual_out` 与 `task_loss_box` 有明显薄相交，`Latent residual r` 文本被 `Task loss` 区域视觉压住。
+  - 根因不是 renderer metadata 分类错误：二者在 `layout_map.json` 中均为 `kind="component"`。漏检来自 `component_overlap` 的阈值：旧规则要求纵向重叠至少约 1mm，当前 smoke 的纵向重叠约 0.7mm，但横向重叠很长且 overlap ratio 已超过 0.15，纸面上仍是可见碰撞。
+- 已完成实现：
+  - `tests/review_tests.rs` 新增 `quality_report_flags_thin_smoke_component_collision`，使用 `post_horizontal_gutter_smoke_20260621_085754/final` 中 `teacher_residual_out` 与 `task_loss_box` 的真实 bbox；旧逻辑下失败，修复后通过。
+  - `src/tools/review.rs` 抽出 `component_visible_collision`，保留原有面积碰撞和 `>=1mm x >=1mm` 可见碰撞，同时新增 thin-but-visible 分支：横向重叠足够长、纵向压入约 0.55mm 以上、normalized 高度和 overlap ratio 达标时，也输出 blocking `component_overlap`。
+  - `src/tools/draw_plan.rs` 同步收紧 `component_overlap_gate_fails`，并让 overlap repair 的评分按该 gate 给重罚，避免 structured/fallback path 把薄相交视为“移动成本高于保留重叠”。
+  - `tests/draw_plan_tests.rs` 新增 `model_draw_plan_polish_separates_thin_visible_loss_residual_overlap_from_smoke`，覆盖 DrawPlan polish 不应保留同源薄相交。
+  - 另新增 `model_draw_plan_polish_deduplicates_inference_annotations_from_smoke`，确认当前已有 polish 会把 `ann_inference` / `anno_inference` 这类重复 inference annotation 合并；该测试当前代码已通过，说明当前必须补的是 overlap quality gate 漏检。
+- 已完成验证：
+  - `cargo test --test review_tests -- --nocapture` 通过，30 个 review 测试全绿。
+  - `cargo test --test draw_plan_tests -- --nocapture` 通过，100 个 DrawPlan 测试全绿。
+  - `cargo test` 全量通过。
+  - `cd renderer && npm run build` 通过。
+  - 初次 `cargo fmt --check` 只发现新增测试 bbox 格式差异；已运行 `cargo fmt` 修复。
+  - `cargo fmt --check` 通过。
+  - `git diff --check` 通过。
+- 待完成验证：
+  - 再跑真实 `.env` smoke，检查薄相交是否被本地 `component_overlap` 稳定捕获或被 DrawPlan polish 直接消除，并观察剩余 blocker 是否转移到 annotation corridor / residual route detour。
+- 第十一次真实 `.env` smoke：
+  - 命令：`SESSION_ID=post_thin_overlap_gate_smoke_20260621_091230 REFERENCE_PREVIEWS=required MAX_ITERATIONS=3 MAX_MINUTES=45 bash scripts/run_real_env.sh examples/teacher_student.md`
+  - run dir：`runs/teacher-student-distillation-with-latent-residuals/post_thin_overlap_gate_smoke_20260621_091230`
+  - 结果：`accepted=false`、3 轮、`reason="cap reached before acceptance"`；三轮和 final 均为 `source="model_generated_code"`、`used_fallback=false`；final PPTX `unzip -t` 通过。
+  - 本地 quality：`round_000 score=34/issues=10` -> `round_001 score=64/issues=6` -> `round_002/final score=76/issues=4`。第 0 轮新增 gate 把 `student_head/task_loss` 的可见 overlap 抓成 blocking `component_overlap`，后续轮次已消除该 blocker，证明 thin visible overlap gate 生效。
+  - 当前 final 剩余 issues：`teacher_latent/student_head` horizontal crowding、`teacher_latent/latent_residual` vertical crowding、`ann_inference` `label_outside_main_area`、`e_input_student` `route_detour`。
+  - 人工查看 final PNG：右侧 `Task Loss` 与 residual 不再重叠；主要坏点转为顶部 `Inference: student only` 贴近画布顶边、input→student connector 绕到顶部形成大 detour、teacher latent/residual 仍挤。
+- 第十一组 prompt/contract 修复：
+  - 发现 DrawPlan polish 对 top-edge `ann_inference` 的同类复现会删除该浮动 phase label，但真实 `model_generated_code` path 仍能保留它；因此不能只在 DrawPlan fallback path 加局部规则，必须把 `label_outside_main_area` 作为明确的 model repair contract。
+  - `tests/draw_plan_tests.rs` 新增 `model_draw_plan_polish_removes_top_edge_inference_annotation_from_smoke`，记录 DrawPlan path 对顶边 inference label 的预期删除行为。
+  - `src/prompts.rs` 的 DrawPlan optimizer contract 增加 `label_outside_main_area`：删除通用 floating phase/capacity text，或把有意义 label 重锚到主图内目标附近。
+  - `src/agent.rs` 的 DrawPlan revision prompt 与 RoundImprovementPlan prompt 同步增加 `label_outside_main_area` 的硬规则，要求具体说明 remove/reanchor，不能继续把 named label 留在 top/bottom margin。
+  - `tests/prompt_tests.rs` 增加断言，确保 revision/improvement prompt 继续包含 `label_outside_main_area` 和 remove/reanchor 语义。
+- 已完成局部验证：
+  - `cargo test --test draw_plan_tests model_draw_plan_polish_removes_top_edge_inference_annotation_from_smoke -- --nocapture` 通过。
+  - `cargo test --test prompt_tests -- --nocapture` 通过。
+- 待完成验证：
+  - 跑全量本地验证；如时间允许，再跑一轮短真实 smoke 检查 `ann_inference` 顶边 label 是否被下一轮模型删除或重锚。
+- 已完成全量验证：
+  - `cargo test` 全量通过；LibreOffice 在 workspace 测试中仍打印一次历史外部 `DeploymentException`/`Unspecified Application Error` 文本，但测试 exit 0。
+  - `cd renderer && npm run build` 通过。
+  - `cargo fmt --check` 通过。
+  - `git diff --check` 通过。
+- 第十二次短真实 `.env` smoke：
+  - 命令：`SESSION_ID=post_label_outside_contract_smoke_20260621_092803 REFERENCE_PREVIEWS=required MAX_ITERATIONS=2 MAX_MINUTES=35 bash scripts/run_real_env.sh examples/teacher_student.md`
+  - run dir：`runs/teacher-student-distillation-with-latent-residuals/post_label_outside_contract_smoke_20260621_092803`
+  - 结果：`accepted=false`、2 轮、`reason="cap reached before acceptance"`；final PPTX `unzip -t` 通过。
+  - `round_000` 为 `deterministic_fallback`、`used_fallback=true`，`quality score=34`，含 `component_overlap` 等 blocker。
+  - `round_001` 为 `model_generated_code`、`used_fallback=false`，`quality score=52`；它没有 `label_outside_main_area`，说明新增 prompt contract 对顶边浮动 label 有效果，但模型改成了左侧 `Inference Only` 模块，并引入两个 blocking `edge_crossing`。
+  - final 选择回退到 `round_000`，因为 best-so-far 当前优先减少 blocking issue 数：`round_000` 1 个 blocker，`round_001` 2 个 blockers。该回退合理，但也说明下一步应约束“修 label_outside 时不能新增 edge_crossing/annotation corridor”，或者在 regression budget 中更明确禁止用新增 inference lane/重复 input 来修浮动标签。
+- 当前剩余风险：
+  - prompt contract 已让模型处理 `label_outside_main_area`，但模型可能用过度结构重排换来新 crossing；后续需要把 `edge_crossing`/`annotation_in_main_corridor` 的 anti-regression 作为更强的 next-round 禁止项。
+  - final 仍未 accepted；这次任务完成的是把 thin overlap 漏检补进本地 gate、证明真实 loop 能修掉该 blocker，并强化 `label_outside_main_area` 的修复合同。
+
+## 2026-06-21 anti-regression contract for inference-lane repair
+
+- 本轮目标：
+  - 继续处理第十二次 smoke 暴露的新根因：模型按 prompt 修掉 `label_outside_main_area` 后，用新增左侧 `Inference Only` 模块、重复 `Task Input` 分支和新的 `edge_crossing` 换掉旧问题，导致 best-so-far 只能回退。
+  - 目标不是阻止 best-so-far 回退，而是让下一轮明确知道这种策略是负例，不能把“修一个 label”变成“新增 inference lane/edge crossing”。
+- 已完成实现：
+  - `src/prompts.rs` 的 DrawPlan optimizer contract 增加 `edge_crossing` 与 `annotation_in_main_corridor` 明确修复语义，并要求修 `label_outside_main_area` 时不得创建新 inference lane、重复 input 或新 edge crossing。
+  - `src/agent.rs` 的 DrawPlan revision prompt 与 RoundImprovementPlan prompt 同步强化 anti-regression：新 `edge_crossing`、`annotation_in_main_corridor`、duplicate input lanes、standalone inference lanes 都是硬回归，即使另一个 issue 被改善也不能接受。
+  - `src/pipeline.rs` 的 `RegressionContext` 机器指令加入同样禁区，让回滚到 best-so-far 时最新失败尝试作为负例进入 workspace。
+  - `tests/prompt_tests.rs` 增加断言，锁定 `edge_crossing`、`annotation_in_main_corridor`、duplicate input lane、standalone inference lane 这些关键约束。
+  - `tests/review_tests.rs` 新增 `quality_report_flags_standalone_inference_lane_component_from_smoke`，使用第十二次 smoke round_001 的真实 `comp_inference_note` bbox/text，要求无连接 `Inference Only` component 输出 major `standalone_inference_lane`。
+  - `src/tools/review.rs` 新增 `standalone_inference_lane` quality issue：仅当 inference/student-only 语义的 component 没有任何 edge endpoint 引用时触发，避免误伤真实连接的 inference 子图。
+- 已完成局部验证：
+  - `cargo test --test prompt_tests -- --nocapture` 通过。
+  - `cargo test --test review_tests quality_report_flags_standalone_inference_lane_component_from_smoke -- --nocapture` 通过。
+  - `cargo test --test review_tests -- --nocapture` 通过，31 个 review 测试全绿。
+- 待完成验证：
+  - 跑全量本地验证。
+  - 再跑真实 `.env` smoke，检查模型是否仍用 standalone inference lane 修浮动 label；若复发，`quality_report` 应明确输出 `standalone_inference_lane` 并绑定 `comp_inference_note`。
+- 已完成全量验证：
+  - `cargo test` 全量通过。
+  - `cd renderer && npm run build` 通过。
+  - `cargo fmt --check` 通过。
+  - `git diff --check` 通过。
+
+## 2026-06-21 task-loss connector label cleanup after inference-lane gate
+
+- 第十三次真实 `.env` smoke：
+  - 命令：`SESSION_ID=post_inference_lane_gate_smoke_20260621_094015 REFERENCE_PREVIEWS=required MAX_ITERATIONS=3 MAX_MINUTES=45 bash scripts/run_real_env.sh examples/teacher_student.md`
+  - run dir：`runs/teacher-student-distillation-with-latent-residuals/post_inference_lane_gate_smoke_20260621_094015`
+  - 结果：`accepted=false`、3 轮、`reason="cap reached before acceptance"`；三轮和 final 均为 `source="model_generated_code"`、`used_fallback=false`；final PPTX `unzip -t` 通过。
+  - 本地 quality：`round_000 score=4/issues=13` -> `round_001 score=4/issues=13` -> `round_002/final score=34/issues=9`。新增 anti-regression 约束后没有复发上一轮的 standalone inference lane，但模型仍没有收敛到可接受质量。
+  - final 剩余 issues：`teacher_enc/teacher_proj`、`student_enc/student_head`、`student_proj/output_pred` 的 `component_crowding`；三个 connector label 的 `label_far_from_edge`；`e_task_loss_label` 同时触发 blocking `label_overlaps_component` 和 `label_overlaps_edge`；`e_input_student` 仍有 `route_detour`。
+  - 人工查看 final PNG：主要新坏点是 task-loss connector 的 `ŷ, y` 小标签压在 `Task Head` 底部并覆盖自己的连线，而 `task_ce` 框内已经写有 `Task Loss\nCE(y, ŷ)`。这类 label 在拥挤底部区域继续移动不稳定，删除冗余 connector label 更符合图面信息密度。
+- 已完成实现：
+  - `tests/draw_plan_tests.rs` 新增/更新 `model_draw_plan_polish_moves_task_loss_label_off_head_and_edge_from_smoke`，使用第十三次 smoke final 的真实几何复现 `e_task_loss_label` 压框压线问题。
+  - `src/tools/draw_plan.rs` 新增 `remove_redundant_task_loss_connector_labels`，在 task-loss endpoint 框已经包含 `CE(y, ŷ)`、`loss` 或等价监督目标时，删除 connector 上重复的 `ŷ, y`/loss label。
+  - 该清理放在 residual supervision label 清理之后、inference note 折叠之前执行，避免后续 label snapping 又把冗余 label 放回拥挤区域。
+- 已完成局部验证：
+  - `cargo test --test draw_plan_tests model_draw_plan_polish_moves_task_loss_label_off_head_and_edge_from_smoke -- --nocapture` 通过。
+- 已完成本地验证：
+  - `cargo test --test draw_plan_tests -- --nocapture` 通过，102 个 DrawPlan 测试全绿。
+  - `cargo test` 全量通过；LibreOffice 仍在部分 pipeline/workspace 测试中打印外部 `DeploymentException` 文本，但测试 exit 0。
+  - `cd renderer && npm run build` 通过。
+  - `cargo fmt --check` 通过。
+  - `git diff --check` 通过。
+- 第十四次真实 `.env` smoke：
+  - 命令：`SESSION_ID=post_task_loss_label_cleanup_smoke_20260621_101200 REFERENCE_PREVIEWS=required MAX_ITERATIONS=3 MAX_MINUTES=45 bash scripts/run_real_env.sh examples/teacher_student.md`
+  - run dir：`runs/teacher-student-distillation-with-latent-residuals/post_task_loss_label_cleanup_smoke_20260621_101200`
+  - 结果：`accepted=false`、3 轮、`reason="cap reached before acceptance"`；final 为 `source="model_generated_code"`、`used_fallback=false`；final PPTX `unzip -t` 通过。
+  - 本地 quality：`round_000 score=76/issues=3` -> `round_001 score=94/issues=1` -> `round_002 score=88/issues=2`，final 选择 `round_001`，说明 best-so-far 在同一 run 目录内工作正常。
+  - 之前的 blocking `e_task_loss_label` 压框/压线问题没有复发；这验证了 task-loss connector label cleanup 的真实路径有效。
+  - final 唯一剩余 issue 是 `standalone_inference_lane`：`comp_inference` 为无连接 `Inference: student only` 大号 context component。人工查看 final PNG，顶部大框占据主画布上方，虽不重叠但缺少 anchor，视觉上像一条孤立 inference lane。
+- 第十四次 smoke 后追加修复：
+  - `tests/draw_plan_tests.rs` 新增 `model_draw_plan_polish_folds_standalone_inference_component_from_smoke`，使用第十四次 final 的 `comp_inference` 几何和 FigurePlan 语义复现问题。
+  - 初版“所有 protected inference note 都折叠”的规则过宽，误删了小型 `inference_badge`、`role=output` 的真实 inference 节点和移除辅助连接后仍应保留的 context note；完整 DrawPlan suite 暴露 4 个旧用例失败。
+  - 最终修复改为窄规则：`role=output` 不折叠；id 含 `note`/`badge` 的小 context note 继续按旧逻辑保留或移动；只有 `comp_inference` 这类无连接、非 note/badge、context/muted 的 lane-like protected inference component 会折叠成 `ann_inference` 文本。
+  - 相关验证：新增回归通过；`model_draw_plan_polish_moves_inference_note_out_of_input_student_corridor`、`model_draw_plan_polish_moves_near_overlapping_inference_component_off_semantic_boxes`、`model_draw_plan_polish_removes_auxiliary_inference_note_connectors_from_smoke`、`model_draw_plan_polish_repairs_stacked_teacher_residual_smoke_layout` 均通过；`cargo test --test draw_plan_tests -- --nocapture` 通过，103 个 DrawPlan 测试全绿。
+- 待完成验证：
+  - 重新跑全量 `cargo test`、renderer build、format 和 diff whitespace 检查。
+  - 如时间允许，再跑一轮真实 `.env` smoke，检查唯一剩余 `standalone_inference_lane` 是否被消掉，以及是否达到 acceptance 或暴露下一组更细 issues。
+
+## 2026-06-21 standalone inference fold smoke and latent residual width fix
+
+- 第十五次真实 `.env` smoke：
+  - 命令：`SESSION_ID=post_standalone_inference_fold_smoke_20260621_102350 REFERENCE_PREVIEWS=required MAX_ITERATIONS=3 MAX_MINUTES=45 bash scripts/run_real_env.sh examples/teacher_student.md`
+  - run dir：`runs/teacher-student-distillation-with-latent-residuals/post_standalone_inference_fold_smoke_20260621_102350`
+  - 结果：`accepted=false`、3 轮、`reason="cap reached before acceptance"`；final 为 `source="model_generated_code"`、`used_fallback=false`；final PPTX `unzip -t` 通过。
+  - 本地 quality：`round_000 score=94/issues=1` -> `round_001 score=82/issues=2` -> `round_002 score=88/issues=2`，final 选择 `round_000`。
+  - 第十四次唯一剩余的 `standalone_inference_lane` 已消失：`comp_inference` 不再作为 component 存在，语义被保留为 `anno_inference` 文本 `Student only at inference`。
+  - 当前 final 唯一剩余 issue 是 `latent_residual` 的 `text_wrap_risk`：`Latent Residual` 框宽度只有 `0.10`，在 85mm paper-width 和 13.1pt 字号下，最长 token `Residual` 需要约 9.6mm，可用宽度约 8.0mm。
+  - 人工查看 final PNG：整体结构明显简化，之前的大号 standalone inference box、task-loss label blocker、visible overlap/crossing 已消失；新坏点集中在 `Latent Residual` 框偏窄和整体 composition 仍偏空。
+- 第十五次 smoke 后追加修复：
+  - `tests/draw_plan_tests.rs` 新增 `model_draw_plan_polish_widens_narrow_latent_residual_loss_from_smoke`，使用第十五次 final 的 `latent_residual`/`task_loss` 几何复现 text-wrap 风险。
+  - `src/tools/draw_plan.rs` 新增 `widen_loss_or_objective_boxes_for_readability`：在 loss/objective compact 之后，根据最长 token 计算最小可读宽度；候选包含居中扩宽、向左扩、向右扩，并根据 overlap penalty 选择不会制造可见碰撞的方案。
+  - 该修复暴露旧测试 `model_draw_plan_polish_reroutes_residual_feedback_off_reverse_shared_segment` 过度依赖旧 bbox 坐标；已把断言改为检查 connector 起点锚在当前 residual box 左下角，而不是固定旧坐标 `[0.58,0.36]`。
+- 已完成局部验证：
+  - `cargo test --test draw_plan_tests model_draw_plan_polish_widens_narrow_latent_residual_loss_from_smoke -- --nocapture` 通过。
+  - `cargo test --test draw_plan_tests -- --nocapture` 通过，104 个 DrawPlan 测试全绿。
+- 待完成验证：
+  - 重新跑全量 `cargo test`、renderer build、format 和 diff whitespace 检查。
+  - 尚未在 text-wrap 修复后再次跑真实 `.env` smoke；下一轮应检查 local quality 是否可以达到 100，以及 vision review 是否仍因 composition/aesthetic 未通过。
+- 已完成最终本地验证：
+  - `cargo fmt` 已运行。
+  - `cargo test` 全量通过，包含 104 个 DrawPlan 测试、31 个 review 测试以及 pipeline/workspace 测试。
+  - `cd renderer && npm run build` 通过。
+  - `cargo fmt --check` 通过。
+  - `git diff --check` 通过。
+- 中断的真实 smoke：
+  - 尝试运行：`SESSION_ID=post_loss_width_smoke_20260621_103300 REFERENCE_PREVIEWS=required MAX_ITERATIONS=2 MAX_MINUTES=35 bash scripts/run_real_env.sh examples/teacher_student.md`
+  - 用户中断后检查进程，未发现残留 `methodfig run`、`run_real_env`、`soffice` 或 `pdftoppm`。
+  - 该 run 目录只生成到 `round_000` 的 `figure.pptx`、`figure.png`、`layout_map.json`、`renderer_payload.json`、`draw_plan.json` 等渲染产物，没有 `final/status.json`，也没有完整 review/quality/final 选择流程。
+  - 因此它不能作为 text-wrap 修复后的真实验收证据；当前 text-wrap 修复的可靠证据是目标回归和全量本地测试。
+
+## 2026-06-21 compact inference badge gate and post-width smoke
+
+- 补跑真实 `.env` smoke：
+  - 命令：`SESSION_ID=post_loss_width_smoke_20260621_110500 REFERENCE_PREVIEWS=required MAX_ITERATIONS=3 MAX_MINUTES=45 bash scripts/run_real_env.sh examples/teacher_student.md`
+  - run dir：`runs/teacher-student-distillation-with-latent-residuals/post_loss_width_smoke_20260621_110500`
+  - 结果：`accepted=false`、3 轮、`reason="cap reached before acceptance"`；三轮和 final 均为 `source="model_generated_code"`、`used_fallback=false`；final PPTX `unzip -t` 通过。
+  - 本地 quality：`round_000 score=88/issues=2`、`round_001 score=88/issues=2`、`round_002/final score=88/issues=2`。
+  - 验证结果：上一轮 `latent_residual` 的 `text_wrap_risk` 已消失，说明 loss/objective width 修复有效；剩余为 `comp_student` 的 `excessive_internal_whitespace` 和 `inference_note` 的 `standalone_inference_lane`。
+- 根因分析：
+  - `inference_note` 是小型 note/badge，文本明确为 `Inference: student only`；它不是上一轮那种大号无锚 inference lane。
+  - 当前 `standalone_inference_lane` quality gate 对 compact note/badge 过宽，会把合理保留的 student-only cue 当成结构性 lane blocker，导致本地 loop 在错误目标上反复修。
+  - 对同一几何运行 DrawPlan polish 回归显示 `comp_student` 大空白可以被当前 `compact_oversized_short_content_boxes` 等规则压缩，说明需要保留该回归，但本轮更高优先级是修正 inference gate 的假阳性。
+- 已完成实现：
+  - `tests/review_tests.rs` 新增 `quality_report_allows_compact_student_only_inference_note_badge`，用 `post_loss_width_smoke_20260621_110500/final` 的真实 note/badge 几何复现假阳性。
+  - `src/tools/review.rs` 增加 `compact_student_only_inference_badge` 例外：只有 id/text 含 note 或 badge 且明确含 `student only`/`student-only` 的 compact inference component 才不触发 `standalone_inference_lane`。
+  - `tests/draw_plan_tests.rs` 新增 `model_draw_plan_polish_compacts_oversized_student_box_from_loss_width_smoke` 和 `model_draw_plan_polish_compacts_full_loss_width_smoke_student_box`，锁定 student 大空白可以被 DrawPlan polish 压缩的行为。
+- 已完成验证：
+  - `cargo test --test review_tests quality_report_allows_compact_student_only_inference_note_badge -- --nocapture` 通过。
+  - `cargo test --test review_tests quality_report_flags_standalone_inference_lane_component_from_smoke -- --nocapture` 通过，确认旧的大号 `Inference Only` lane 仍会被抓住。
+  - `cargo test --test draw_plan_tests model_draw_plan_polish_compacts_full_loss_width_smoke_student_box -- --nocapture` 通过。
+  - `cargo test --test review_tests -- --nocapture` 通过，32 个 review 测试全绿。
+  - `cargo test --test draw_plan_tests -- --nocapture` 通过，106 个 DrawPlan 测试全绿。
+  - `cargo fmt`、`cargo test`、`cd renderer && npm run build`、`cargo fmt --check`、`git diff --check` 均通过。
+- 修复后真实 `.env` smoke：
+  - 命令：`SESSION_ID=post_badge_gate_compact_smoke_20260621_112200 REFERENCE_PREVIEWS=required MAX_ITERATIONS=3 MAX_MINUTES=45 bash scripts/run_real_env.sh examples/teacher_student.md`
+  - run dir：`runs/teacher-student-distillation-with-latent-residuals/post_badge_gate_compact_smoke_20260621_112200`
+  - 结果：`accepted=false`、3 轮、`reason="cap reached before acceptance"`；三轮和 final 均为 `source="model_generated_code"`、`used_fallback=false`；final PPTX `unzip -t` 通过。
+  - 本地 quality：`round_000 score=100/issues=0`、`round_001 score=70/issues=3`、`round_002 score=100/issues=0`、`final score=100/issues=0`。
+  - vision review 仍未通过：`story_clarity=5`、`visual_hierarchy=5`、`paper_readability=5`、`layout_cleanliness=4`、`arrow_routing=4`、`aesthetic_quality=5`。
+  - vision localized issues：`edge_input_to_teacher` 路径大折线；`comp_task_loss` 占 teacher/student branch 的阅读 corridor；`edge_student_to_task_loss` 向上短边破坏分支关系；`comp_inference_note` 虽然不应被当成 standalone lane，但位置仍缺少视觉锚点并靠近主通道；`comp_latent_residual` 文本略紧。
+- 当前结论：
+  - 本地 gate 已经能抓低层可编辑几何问题，但不能代表“画得好”。当前差距来自高层 composition：哪些对象应该在主 flow/corridor 外、哪些 note 可以保留但必须锚在 student/output 附近、哪些 route 算视觉绕路。
+  - 下一步应把 vision-only 的高层问题转成结构化 quality issue 或 deterministic DrawPlan polish，而不是继续只调 overlap/crowding。
+
+## 2026-06-21 branch corridor, shared input, and residual signal gates
+
+- 本轮目标：
+  - 继续把 vision review 里能稳定定位的高层坏模式转成本地 `QualityReport` issue 和 DrawPlan polish，而不是让模型每轮重构。
+  - 重点处理：共享 input 贴到 student 行导致 teacher 输入线大绕路；task loss 占 teacher/student 分支 corridor；compact inference note 无锚点或太大；annotation 太贴近 flow edge；上下 teacher/student 分支之间的 inference annotation；简单 residual signal 盒占据主分支间隙。
+- 已完成实现：
+  - `src/tools/review.rs` 增加/收紧：
+    - `task_loss_in_branch_corridor`：task loss 不应占 teacher/student branch gap。
+    - `route_detour` 的 input->student / input->teacher 分支识别，避免长三点输入线被漏掉，同时不过度惩罚被拉回分支中线后的正常 teacher branch。
+    - `annotation_too_close_to_edge`：annotation 不能贴在 flow/supervision stroke 上。
+    - `inference_note_unanchored` 与 `inference_note_excessive_whitespace`：小型 student-only note 可以保留，但必须锚到 student/output 附近且不能大框空白。
+    - `annotation_in_main_corridor` 支持上下 teacher/student 分支间隙，不再只识别左右并排 teacher/student。
+    - `residual_signal_in_branch_corridor`：简单 `Teacher`/`Student` 分支之间的短 residual signal 盒会被报为 major；规则刻意排除 Encoder/Projection/Head/Compact 等内部结构，避免误伤真正的 residual 模块。
+  - `src/tools/draw_plan.rs` 增加/调整：
+    - `align_shared_input_boxes_with_branch_targets` 从“落在任意 branch row 范围内即可”改为拉到 teacher/student 中线，解决共享 input 被吸到 student 行的问题。
+    - `align_single_input_boxes_with_main_targets`，处理单 input -> main 的偏行长绕路。
+    - `move_task_loss_boxes_out_of_teacher_student_branch_corridors`，把 task loss 移出 branch gap。
+    - `move_annotations_off_edges` 和 `place_label_outside_edge` 的 annotation 避让更严格；同时把短 connector label 间距单独收回到 `0.024`，避免把 connector 自带短标签推得太远。
+    - `fold_detached_protected_inference_notes_into_student_annotations`、`compact_inference_note_is_anchored_to_student_or_output`，让 protected inference note 离主通道并保留语义。
+    - `fold_connected_residual_signal_boxes_between_branch_rows`，只折叠简单 `Teacher`/`Student` 分支之间的短 `Latent Residual` signal 盒为 dashed supervision connector label；复杂 encoder/projection/head 场景继续保留 residual 盒并由已有规则移动。
+  - 新增/扩展回归：
+    - review tests 从 32 增至 40；DrawPlan tests 从 106 增至 111。
+    - 覆盖 latest smoke 的 task loss corridor、long input detour、annotation too close、oversized/unanchored inference note、vertical branch annotation corridor、connected residual signal box fold 等失败模式。
+- 第一轮真实 `.env` smoke：
+  - 命令：`SESSION_ID=post_shared_input_balance_smoke_20260621_124900 REFERENCE_PREVIEWS=required MAX_ITERATIONS=3 MAX_MINUTES=45 bash scripts/run_real_env.sh examples/teacher_student.md`
+  - run dir：`runs/teacher-student-distillation-with-latent-residuals/post_shared_input_balance_smoke_20260621_124900`
+  - 结果：`accepted=false`、3 轮、`reason="cap reached before acceptance"`；final 为 `source="model_generated_code"`、`used_fallback=false`；final PPTX `unzip -t` 通过。
+  - 本地 quality：`round_000 score=100/issues=0`、`round_001 score=88/issues=2`、`round_002 score=76/issues=3`、`final score=100/issues=0`。
+  - vision final 分数：semantic 5、story 4、hierarchy 5、readability 4、layout 3、arrow 3、color 6、aesthetic 4、editability 8。
+  - 人工/vision 结论：共享 input 大绕路明显缓解，但本地 quality 仍漏掉两个高层 blocker：`Latent Residual` 简单 signal 盒占 teacher/student branch gap，`Inference: student only` annotation 落在上下分支中间。
+- 第一轮 smoke 后追加修复：
+  - 新增红测 `quality_report_flags_inference_annotation_between_vertical_teacher_student_branches`、`quality_report_flags_connected_residual_signal_box_between_vertical_teacher_student_branches` 和 `model_draw_plan_polish_folds_connected_residual_signal_box_between_vertical_branches_from_smoke`。
+  - 初版 residual 折叠过宽，误伤 `model_draw_plan_polish_moves_residual_hub_out_of_branch_gap_crowding` 与 `model_draw_plan_polish_repairs_stacked_teacher_residual_smoke_layout`。已通过 simple branch label 约束收窄：只有简单 Teacher/Student 分支标签之间的短 residual signal 盒才折叠；Encoder/Projection/Head 等场景保留 residual 盒。
+- 已完成本地验证：
+  - `cargo test --test review_tests -- --nocapture` 通过，40 个 review 测试全绿。
+  - `cargo test --test draw_plan_tests -- --nocapture` 通过，111 个 DrawPlan 测试全绿。
+  - `cargo test` 全量通过。
+  - `cd renderer && npm run build` 通过。
+  - `cargo fmt --check` 通过。
+  - `git diff --check` 通过。
+- 第二轮真实 `.env` smoke：
+  - 命令：`SESSION_ID=post_vertical_corridor_residual_gate_smoke_20260621_132000 REFERENCE_PREVIEWS=required MAX_ITERATIONS=3 MAX_MINUTES=45 bash scripts/run_real_env.sh examples/teacher_student.md`
+  - run dir：`runs/teacher-student-distillation-with-latent-residuals/post_vertical_corridor_residual_gate_smoke_20260621_132000`
+  - 结果：`accepted=false`、3 轮、`reason="cap reached before acceptance"`；final 为 `source="model_generated_code"`、`used_fallback=false`；final PPTX `unzip -t` 通过。
+  - 本地 quality：`round_000 score=82/issues=3` -> `round_001 score=100/issues=0` -> `round_002 score=100/issues=0`；final `score=100/issues=0`。
+  - vision 分数明显提升：round_000 为 story 4 / hierarchy 2 / readability 3 / layout 2 / arrow 3 / aesthetic 3；final 提升到 semantic 7、story 7、hierarchy 6、readability 6、layout 5、arrow 5、color 7、aesthetic 6、editability 9。
+  - 人工查看 final PNG：结构已经从上一轮的中间 residual signal 盒与 corridor note，推进到更可读的 Y-branch 布局；仍未 accepted 的主要原因转为路线质量：`e_input_to_student` 沿底部绕大 L、`e_student_to_output` 右侧大 U、`e_residual_to_student` 贴 student 边，以及 teacher/student 宽度不平衡。
+- 当前剩余任务：
+  - 下一轮应把 route quality 继续本地化：识别靠画布外圈的长 L/U 形 route、edge endpoint tangent/贴边、output 与 source 垂直错位过大但水平相邻的情况。
+  - 具体修复方向：扩展 `route_detour` 不只看 route/direct ratio，还应考虑 path 接近 canvas margin 的长段；DrawPlan polish 中让 output 盒优先与 source 同行，input 盒避免被放到远离 teacher/student 中线的画布底部；residual-to-student supervision edge 应避开 student box 边界切线。
+
+## 2026-06-21 outer route and reverse teacher/student layout fixes
+
+- 本轮目标：
+  - 继续执行上一节剩余任务：把靠画布外圈的大 L/U 形路线、student-only inference 斜穿主图、teacher/residual/objective 小间距等真实 smoke 失败模式转成本地可重复修复。
+- 第三轮真实 `.env` smoke：
+  - 命令：`SESSION_ID=post_outer_route_gate_smoke_20260621_123838 REFERENCE_PREVIEWS=required MAX_ITERATIONS=3 MAX_MINUTES=45 bash scripts/run_real_env.sh examples/teacher_student.md`
+  - run dir：`runs/teacher-student-distillation-with-latent-residuals/post_outer_route_gate_smoke_20260621_123838`
+  - 结果：`accepted=false`、3 轮、`reason="cap reached before acceptance"`；final PPTX `unzip -t` 通过。
+  - 本地 quality：`round_000 score=16/issues=9` -> `round_001 score=52/issues=5` -> `round_002/final score=64/issues=5`，说明 gate 有推进，但仍未收敛。
+  - vision 分数：round_000/001 低位徘徊，round_002 小幅提升到 semantic 5、story 4、hierarchy 4、readability 4、layout 3、arrow 3、color 6、aesthetic 4、editability 8。
+  - 人工查看 final PNG：模型把 student 放到左下、teacher 放到右侧，导致 `e_input_teacher` 沿左边和底边绕大圈，`e_student_inference` 从 student 斜穿到顶部 inference，`e_joint_student` 与它相交；同时 teacher/residual、teacher/joint_loss 间距过小，`latent` label 远离真实 connector。
+- 已完成实现：
+  - `tests/review_tests.rs` 新增 latest smoke 的 outer-margin route 红测，覆盖 input->student 和 student->output 的大 L/U 路线；`src/tools/review.rs` 增加 `has_main_output_outer_margin_detour`，让右侧相邻 output 的大 U route 被稳定报为 `route_detour`。
+  - `tests/draw_plan_tests.rs` 新增 `model_draw_plan_polish_repairs_outer_margin_input_and_output_routes_from_latest_smoke`，锁定共享 input 不应留在底部、output 应与 source 同行。
+  - `src/tools/draw_plan.rs` 增加 `move_shared_inputs_off_outer_margins`、`align_outer_margin_outputs_with_sources` 和 `straighten_adjacent_main_output_connectors`，在不重写模板的前提下做局部 bbox/connector 修正。
+  - 追加 `model_draw_plan_polish_repairs_teacher_student_reverse_layout_from_latest_smoke`，直接使用第三轮 smoke final 的 `input/student/teacher/task_loss/residual/joint_loss/inference` 真实 geometry 复现失败图。
+  - 针对该失败图新增局部 polish：
+    - `move_student_only_inference_outputs_next_to_sources`：只移动非 note/muted 的 student-only inference output，把它放到 student 旁边，避免顶部单独 lane。
+    - `separate_teacher_context_objective_gutters`：给 teacher/context 与 residual/objective 留出 0.065 normalized gutter，避免刚好卡在 quality 阈值边界。
+    - `repair_outer_input_context_detours`：晚期强制把 input->teacher/context 的外圈大绕线收缩成不穿组件的短折线；优先不碰其它线，必要时退回到不穿组件的最短候选。
+    - `orthogonalize_student_only_inference_connectors`：把 student->inference 的长斜线改成可读的正交 connector。
+  - 初版 inference 旁置规则误处理了 `inference_note`，导致两个旧用例不再把长 note 折叠为 annotation；已通过 `note`/`muted`/`annotation` 排除条件收窄，旧折叠路径恢复。
+- 已完成本地验证：
+  - `cargo test --test draw_plan_tests model_draw_plan_polish_repairs_teacher_student_reverse_layout_from_latest_smoke -- --nocapture` 通过。
+  - `cargo test --test draw_plan_tests -- --nocapture` 通过，113 个 DrawPlan 测试全绿。
+  - `cargo test --test review_tests -- --nocapture` 通过，42 个 review 测试全绿。
+  - `cargo test` 全量通过；LibreOffice 仍打印历史外部 `DeploymentException` warning，但所有相关测试 exit 0。
+  - `cd renderer && npm run build` 通过。
+  - `cargo fmt --check` 通过。
+  - `git diff --check` 通过。
+- 待完成验证：
+  - 需要在这些 route/layout 修复后再跑一轮真实 `.env` smoke，检查外圈绕线、student-only inference 斜线、teacher/residual/joint 小间距是否在真实路径中消失，以及是否暴露下一组更高层 composition/aesthetic 问题。
+
+## 2026-06-21 annotation, residual, and vertical-stack polish
+
+- 第四轮真实 `.env` smoke：
+  - 命令：`SESSION_ID=post_reverse_layout_polish_smoke_20260621_130321 REFERENCE_PREVIEWS=required MAX_ITERATIONS=3 MAX_MINUTES=45 bash scripts/run_real_env.sh examples/teacher_student.md`
+  - run dir：`runs/teacher-student-distillation-with-latent-residuals/post_reverse_layout_polish_smoke_20260621_130321`
+  - 结果：`accepted=false`、3 轮、`reason="cap reached before acceptance"`；final PPTX `unzip -t` 通过。
+  - 本地 quality：`round_000 score=0/issues=16` -> `round_001 score=4/issues=12` -> `round_002/final score=28/issues=8`。上一轮的外圈 input->teacher 大绕线已明显改善，但新输出暴露出 annotation 和 residual/layout 问题。
+  - vision final 分数：semantic 7、story 5、hierarchy 5、readability 4、layout 3、arrow 3、color 6、aesthetic 4、editability 9。
+  - 人工查看 final PNG：`ann_inference` 与 `anno_teacher_frozen` 重叠并压在 `Task head` 上；`residual_supervision` 变成底部大宽条；`e_residual_student` 为 5 点绕线；`e_task_loss` 为 4 点 hook；单行 `task_input`、`student_encoder`、`teacher_encoder` 盒太高，导致上下模块间距被 quality gate 报为 crowding。
+- 第四轮 smoke 后追加修复：
+  - 新增 `model_draw_plan_polish_repairs_annotation_and_residual_stack_from_latest_smoke`，用第四轮 final 的真实 geometry 锁定：
+    - 重叠 inference annotation 应删除或折叠；
+    - teacher/frozen annotation 不应压 `task_head`；
+    - 同列单行 flow box 应压缩高度以腾出垂直 gutter；
+    - `residual_supervision` 不应保持超宽底座；
+    - `e_residual_student` 和 `e_task_loss` 应简化为短正交路线。
+  - `src/tools/draw_plan.rs` 新增：
+    - `compact_single_line_flow_boxes_in_vertical_stacks`：对同列 vertical stack 中的单行 flow box 压缩下边界，解决“盒内空隙大但盒间距小”的根因；补了 pair-based fallback，避免只依赖 connector 方向。
+    - `compact_wide_residual_supervision_boxes`：把超宽 residual supervision 盒收窄到可读范围，避免底部大 slab。
+    - `simplify_main_to_residual_supervision_edges`：把 main/student -> residual supervision 的 5 点绕线收成紧凑 elbow。
+    - `simplify_adjacent_output_loss_connectors`：把 output -> task loss 的近邻 hook 收成直连或短 elbow。
+- 已完成本地验证：
+  - `cargo test --test draw_plan_tests model_draw_plan_polish_repairs_annotation_and_residual_stack_from_latest_smoke -- --nocapture` 通过。
+  - `cargo test --test draw_plan_tests -- --nocapture` 通过，114 个 DrawPlan 测试全绿。
+  - `cargo test --test review_tests -- --nocapture` 通过，42 个 review 测试全绿。
+  - `cargo test` 全量通过。
+  - `cd renderer && npm run build` 通过。
+  - `cargo fmt --check` 通过。
+  - `git diff --check` 通过。
+- 第五轮真实 `.env` smoke：
+  - 命令：`SESSION_ID=post_annotation_residual_stack_smoke_20260621_131833 REFERENCE_PREVIEWS=required MAX_ITERATIONS=3 MAX_MINUTES=45 bash scripts/run_real_env.sh examples/teacher_student.md`
+  - run dir：`runs/teacher-student-distillation-with-latent-residuals/post_annotation_residual_stack_smoke_20260621_131833`
+  - 结果：`accepted=false`、3 轮、`reason="cap reached before acceptance"`；final PPTX `unzip -t` 通过。
+  - 本地 quality：`round_000 score=70/issues=4` -> `round_001 score=76/issues=3` -> `round_002/final score=94/issues=1`。第四轮的 annotation overlap、residual bottom slab、5 点 residual route 等问题未在 final 复发。
+  - vision final 分数：semantic 6、story 5、hierarchy 5、readability 5、layout 4、arrow 4、color 7、aesthetic 5、editability 9。
+  - final 唯一本地 issue：`task_loss` 与 `output_answer` 垂直间距过小。
+  - 人工查看 final PNG：图已从大量重叠/绕线降到一个较干净的左右 teacher/student 结构，但仍有明显质量问题：student box 内带 `(inference only)` 造成三行拥挤，`Answer` 与 `Task Loss` 上下贴得太近，`ann_supervision` 浮在右侧，整体 composition 仍不够论文级。
+- 当前剩余任务：
+  - 把 `task_loss`/`output_answer` 近距离 crowding 转成 DrawPlan polish，优先把 `task_loss` 移到 answer 侧边或加大垂直 gap。
+  - 清理 main student box 内的孤立 `(inference only)` 行，改为外部 compact note 或删除冗余 cue。
+  - 处理 `ann_supervision` 这种浮动说明文字：若 dashed edge 已表达 supervision，应删除或吸附到 connector label。
+  - 继续真实 smoke，目标是 local quality 100 且 vision layout/arrow/aesthetic 不再卡在 4-5。
+
+## 2026-06-21 inference-only语义保留修复
+
+- 本轮目标：
+  - 修复 `remove_redundant_inference_only_parenthetical_from_text` 的过度清理，避免把主语义行从 `Student (compact, inference-only)` 这种主框注释里误删，导致唯一的推理语义丢失。
+- 已完成实现：
+  - `src/tools/draw_plan.rs`：
+    - 调整 `remove_redundant_inference_only_parenthetical_from_text`：不再对主框文本进行泛化字符串替换，保留非独立行内的 `inference-only` 短语，只移除纯独立的 `(inference-only)` / `(inference only)` 行。
+- 验证：
+  - `cargo test --test draw_plan_tests -- --nocapture` 通过（117/117）。
+  - `cargo test --test draw_plan_tests model_draw_plan_polish_removes_redundant_phase_loss_and_inference_notes_from_smoke -- --nocapture` 通过。
+- 真实 `.env` smoke 验证：
+  - 命令：`SESSION_ID=post_inference_semantics_fix_smoke_20260621_135000 REFERENCE_PREVIEWS=required MAX_ITERATIONS=3 MAX_MINUTES=45 bash scripts/run_real_env.sh examples/teacher_student.md`
+  - run dir：`runs/teacher-student-distillation-with-latent-residuals/post_inference_semantics_fix_smoke_20260621_135000`
+  - 结果：`accepted=false`、3 轮、`reason="cap reached before acceptance"`；`final score=52`；本地问题集中在 `student_head` 空白/挤压和 `ann_inference` 漂浮/标签远离边的问题。
+  - 与上一轮相比，本次 smoke 主要验证目标回归修复有效；未引入新的语义缺失；但 composition/aesthetic 仍未收敛到 acceptance。
+- 剩余任务：
+  - 将 `draw_plan` 继续收敛到避免 `student_head` 空白和上下拥挤，优先复用既有 `compact_single_line_flow_boxes_in_vertical_stacks` 与 `separate_task_loss_boxes_from_main_modules` 逻辑，减少无效回路。
+
+## 2026-06-21 inference语义相关 debug 清理与本地回归
+
+- 本轮目标：
+  - 清理前序版本为定位问题而加的 `AUTOFIG_DEBUG_INFERENCE` 调试输出，确保正式路径不再引入测试/日志噪音，同时保留 `comp_inference -> ann_inference` 的语义修复结果。
+- 已完成：
+  - `src/tools/draw_plan.rs`：
+    - 移除 `debug_inference_stage_snapshot` 与所有 `AUTOFIG_DEBUG_INFERENCE` 条件分支及 `eprintln!` 调用。
+    - 保持 `is_marginal_annotation` 对 `ann_inference` 的语义保护逻辑不变（仅跳过语义型 inference 注释），避免误删。
+  - `tests/draw_plan_tests.rs`：
+    - 移除 `model_draw_plan_polish_folds_standalone_inference_component_from_smoke` 中临时 `eprintln!`，避免测试噪音。
+- 验证：
+  - `cargo fmt`
+  - `cargo test --test draw_plan_tests -- --nocapture`（118/118）
+- 当前状态：
+  - 本地 `draw_plan_tests` 全绿，`AUTOFIG_DEBUG_INFERENCE` 已从当前路径移除；`draw_plan` 的 inference 折叠与语义保护行为仍保持。
+  - 真实 `.env` smoke 仍未在本轮重新执行（仍建议下轮继续沿既定 smoke session 做可视化回归）。
+
+## 2026-06-21 current smoke output/note/loss-route root cause fix
+
+- 本轮真实 `.env` smoke：
+  - 命令：`SESSION_ID=post_output_note_gate_smoke_20260621_190000 REFERENCE_PREVIEWS=required MAX_ITERATIONS=3 MAX_MINUTES=45 bash scripts/run_real_env.sh examples/teacher_student.md`
+  - run dir：`runs/teacher-student-distillation-with-latent-residuals/post_output_note_gate_smoke_20260621_190000`
+  - 结果：`accepted=false`、3 轮、`reason="cap reached before acceptance"`；每轮 `renderer_status.source="model_generated_code"`、`used_fallback=false`；final PPTX `unzip -t` 通过。
+  - 本地 quality：`round_000 score=46/issues=8`，`round_001 score=64/issues=4`，`round_002 score=58/issues=5`，final 被 best-so-far 逻辑复制回 `round_000`，因此 final 仍有巨大 `output_pred`、拥挤 `inference_note` 和 loss/branch corridor 问题。
+  - 人工查看 PNG：`round_001` 修小了 `ŷ` 框但引入 `ann_inference` 压 teacher 和右侧大回路线；`round_002` 缩短了部分路线但仍保留 teacher 上的 inference annotation 和弯折 student-loss edge。这说明模型每轮确实在改，但局部修复会引入 hard regression。
+- 根因：
+  - `compact_tall_output_boxes_for_short_labels` 只压缩高度，不压缩 `ŷ` 这类单字符输出的宽度，导致单字输出仍是大空框。
+  - student-only inference note 的处理边界不清：真正的 note/badge/context 组件、lane-like inference component、漂浮 text annotation 被同一批折叠/移动逻辑处理，容易要么丢语义，要么保留成拥挤小面板。
+  - student -> task loss 的模型输出可绕到画布右边界；旧局部修复只看组件避让，没有检查新的短路由是否会与其它 connector 冲突。
+- 已完成实现：
+  - `tests/draw_plan_tests.rs` 新增两条 current-smoke 回归：
+    - `model_draw_plan_polish_compacts_current_smoke_prediction_and_student_inference_note`
+    - `model_draw_plan_polish_moves_student_inference_annotation_and_shortens_loss_route_from_current_smoke`
+  - `src/tools/draw_plan.rs`：
+    - 将短输出框压缩从“只压高”改为“按可见字符数同时压宽高”，并用 incoming connector terminal 对齐单字输出。
+    - 新增 `move_student_inference_notes_near_student`，只处理 note/muted/context/annotation，不碰真正的 inference branch/output；candidate 优先右侧，右侧被占才放到下方。
+    - 收窄 protected inference note 折叠：`badge` 和裸 `inference_note` 保留为 editable box；lane-like `comp_inference` 可折叠；压到 loss/objective 的 `comp_inference_note` 仍折叠成 text annotation。
+    - 新增 `simplify_student_to_task_loss_connectors`，只对跑出局部 bbox 的 student->task_loss 大绕线生成短 elbow；候选必须同时通过 component 避让和 connector conflict 检查，避免覆盖已有避障路线。
+    - 对非常泛的 `ŷ,y` loss connector label，仅在成功短路由后删除，避免误删垂直 connector 的有效标签。
+- 当前验证：
+  - `cargo test --test draw_plan_tests -- --nocapture` 通过（122/122）。
+- 待完成：
+  - 继续跑 `review_tests`、`pipeline_tests`、全量 `cargo test`、renderer build、fmt/diff check。
+  - 再跑一轮真实 `.env` smoke，确认 round_000 的巨大 output、student-only inference note 拥挤和 student->loss 右边界大绕线不再复发，并观察下一组 vision/local blocker。
+- 后续验证与新增 gate：
+  - 本地验证完成：`cargo test --test draw_plan_tests -- --nocapture` 通过（122/122）；`cargo test --test review_tests -- --nocapture` 通过（45/45）；`cargo test` 全量通过；`cd renderer && npm run build` 通过；`cargo fmt --check` 通过；`git diff --check` 通过。
+  - 真实 `.env` smoke：
+    - 命令：`SESSION_ID=post_output_note_loss_route_fix_smoke_20260621_193000 REFERENCE_PREVIEWS=required MAX_ITERATIONS=3 MAX_MINUTES=45 bash scripts/run_real_env.sh examples/teacher_student.md`
+    - run dir：`runs/teacher-student-distillation-with-latent-residuals/post_output_note_loss_route_fix_smoke_20260621_193000`
+    - 结果：`accepted=false`、3 轮、`reason="cap reached before acceptance"`；每轮 `renderer_status.source="model_generated_code"`、`used_fallback=false`；final PPTX `unzip -t` 通过。
+    - 本地 quality：`round_000 score=76/issues=4` -> `round_001 score=100/issues=0` -> `round_002 score=70/issues=5`；final 选择 `round_001`，`score=100/issues=0`。这说明本轮修复已避免 final 退回巨大 `ŷ` 空框和右边界大绕线版本。
+    - 人工查看 final PNG：巨大单字输出和 inference note 挤压已明显改善，但仍有未本地化的高层问题：`Student Encoder` 框过高、`Task Loss` 被放到最右上角，`e_student_task` 是穿过主图的长水平 loss line；vision 因 student/task_loss 水平拥挤和 teacher/student 权重不平衡拒绝。
+  - smoke 后新增 review gate：
+    - `tests/review_tests.rs` 新增 `quality_report_flags_far_student_task_loss_route_from_latest_smoke`。
+    - `src/tools/review.rs` 新增 `task_loss_far_from_student_source` issue：当 `student/main -> task_loss` 的 connector 有长水平段且 task loss 被送到远右侧时，本地 quality 不再给 100 分。
+    - 新增 gate 后再次验证：`cargo test --test review_tests -- --nocapture` 通过（45/45）；`cargo test` 全量通过；`cd renderer && npm run build`、`cargo fmt --check`、`git diff --check` 均通过。
+  - 当前剩余问题：
+    - 下一轮应让 DrawPlan polish 或 model prompt 针对 `task_loss_far_from_student_source` 做具体几何修复：把 `Task Loss` 拉回 student/output path 附近，或改成 output->loss 的短局部 objective cue。
+    - 还需要把 `Student Encoder` 过高/teacher-student 权重不平衡转成本地 gate 或 polish；当前 vision 能看出来，但 local gate 仍主要靠新增 far-loss issue 间接阻止 acceptance。
+
+## 2026-06-21 far task-loss route follow-up
+
+- 本轮目标：
+  - 按上一轮真实 smoke 的具体视觉失败继续闭环：`Task Loss` 被放到画布最右上角，`student_enc -> task_loss` 形成跨过主图的长水平线；这类问题不能只靠 reasoning/vision 提示，必须让 coding 模型读取上一轮几何并改当前代码。
+- 根因：
+  - 前序 `simplify_student_to_task_loss_connectors` 只会在目标 box 已经合适时重画线；如果模型把 `Task Loss` 本身放到远右侧，它不会主动移动 loss box，因此长水平线仍然合法地保留下来。
+  - review gate 已能报 `task_loss_far_from_student_source`，但 DrawPlan polish 尚无对应修复动作，导致本地 quality 可以识别问题却不能自动收敛。
+- 已完成实现：
+  - `tests/draw_plan_tests.rs` 新增 `model_draw_plan_polish_pulls_far_student_task_loss_near_output_path_from_latest_smoke`，使用上一轮 final PNG 对应的真实 bbox/points：
+    - `student_enc` 在中部偏左；
+    - `task_loss` 在最右上；
+    - `e_student_task` 包含长水平段；
+    - 同时包含 `latent_residual` 和 `output_pred`，防止修复方式只是把 loss 压到其它框上。
+  - `src/tools/draw_plan.rs` 新增 `pull_far_student_task_loss_boxes_near_output_path`：
+    - 只处理 student/main -> task loss 且 route 明显过宽/有长水平段的情况；
+    - 优先参考同一 student 的 output，在 output 上方/下方/左侧或 student 右侧生成候选；
+    - 候选必须通过 box overlap 检查、中间穿框检查、connector conflict 检查，并且必须比当前 route 明显更短；
+    - 移动 `Task Loss` 后立即把对应 student->loss connector 重画成本地短 elbow，避免旧远端折线遗留；
+    - 对 `ŷ,y` 这类泛化 loss label，在短路由成功时同步删除，保留有信息量的 label。
+- 当前验证：
+  - `cargo test --test draw_plan_tests model_draw_plan_polish_pulls_far_student_task_loss_near_output_path_from_latest_smoke -- --nocapture` 通过。
+  - 首次完整 DrawPlan 回归发现 `model_draw_plan_polish_moves_student_inference_annotation_and_shortens_loss_route_from_current_smoke` 失败：新 pass 先重画了短路线，导致旧 `simplify_student_to_task_loss_connectors` 不再触发泛化 label 删除。
+  - 已修复该回归：在新 pass 成功重画短路线时同步移除泛化 `ŷ,y` label。
+  - 全量 `cargo test` 首次暴露另一个非确定性问题：`move_student_inference_notes_near_student` 从 `HashMap` 中用宽松的 `is_main_route_box` 找 student anchor，而 `comp_inference_note` 文本含 `student`，有时会被误选为 student 本体，导致 note 自己被跳过、保持过大 box。
+  - 已修复该非确定性：新增 `student_anchor_for_inference_notes`，按 `plan.objects` 顺序选择真正的 student 模块，并排除 `inference`/`note`/`context`/`muted` 等 note-like box；`model_draw_plan_polish_repairs_latest_branch_corridor_smoke_layout` 单测恢复通过。
+  - `cargo test --test draw_plan_tests -- --nocapture` 通过（123/123）。
+  - `cargo test --test review_tests -- --nocapture` 通过（45/45）。
+  - `cargo test` 全量通过。
+  - `cd renderer && npm run build` 通过。
+  - `cargo fmt && cargo fmt --check && git diff --check` 通过。
+- 待完成：
+  - 跑真实 `.env` smoke，确认 `task_loss_far_from_student_source` 不再复发，同时观察 `Student Encoder` 过高/teacher-student 权重不平衡是否仍是主要 blocker。
+
+## 2026-06-21 oversized inference annotation follow-up
+
+- 真实 `.env` smoke：
+  - 命令：`SESSION_ID=post_far_task_loss_pull_smoke_20260621_203000 REFERENCE_PREVIEWS=required MAX_ITERATIONS=3 MAX_MINUTES=45 bash scripts/run_real_env.sh examples/teacher_student.md`
+  - run dir：`runs/teacher-student-distillation-with-latent-residuals/post_far_task_loss_pull_smoke_20260621_203000`
+  - 结果：`accepted=false`、3 轮、`reason="cap reached before acceptance"`；`renderer_status.source="model_generated_code"`、`used_fallback=false`；final PPTX `unzip -t` 通过。
+  - 本地 quality：三轮均 `score=94/issues=1`；唯一 issue 为 `annotation_excessive_whitespace`，target `anno_inference`。
+  - 人工查看 final PNG：上一轮的 far task-loss 已解决，`Task Loss` 在 student 左侧，`e_student_taskloss` 是短横线；新的主要问题是右下角 `Inference: student only` 被保留为大文本框 `[0.7083, 0.75, 1.0, 1.0]`。
+- 根因：
+  - inner polish 会移动/压缩 inference note，但 `polish_model_draw_plan_geometry_with_figure_plan` 之后调用 `upsert_meaningful_annotations_from_figure_plan`，当 FigurePlan annotation 没有 `target_id` 时，会用原始大 bbox 直接覆盖现有 `anno_inference`。
+  - 有 `target_id` 的 inference annotation 已由 `anchored_figure_plan_annotation_bbox` 正确锚定；不能对它们再做 student-note 二次移动。
+- 已完成实现：
+  - `src/tools/draw_plan.rs`：
+    - 在 figure-plan annotation upsert 后再次调用 inference-note 压缩/锚定逻辑，处理无 target 的大 `anno_inference`。
+    - 新增 `target_bound_inference_annotation_ids` 和 `move_student_inference_notes_near_student_except`，跳过带 `target_id` 的 inference annotation，避免破坏已有 target anchoring。
+  - `tests/draw_plan_tests.rs`：
+    - 新增 `model_draw_plan_polish_recompacts_upserted_inference_annotation_from_latest_smoke`，复现本轮 final 的大 `anno_inference` bbox，要求 polish 后面积小于 `0.025` 且仍锚定在 student/output 附近。
+    - 回归覆盖 `model_draw_plan_polish_anchors_inference_annotation_to_figure_plan_target`，确保有 target 的 annotation 不被二次移动。
+- 当前验证：
+  - `cargo test --test draw_plan_tests model_draw_plan_polish_recompacts_upserted_inference_annotation_from_latest_smoke -- --nocapture` 通过。
+  - `cargo test --test draw_plan_tests model_draw_plan_polish_anchors_inference_annotation_to_figure_plan_target -- --nocapture` 通过。
+  - `cargo test --test draw_plan_tests -- --nocapture` 通过（124/124）。
+  - `cargo test --test review_tests -- --nocapture` 通过（45/45）。
+  - `cargo test` 全量通过。
+  - `cd renderer && npm run build` 通过。
+  - `cargo fmt && cargo fmt --check && git diff --check` 通过。
+- 待完成：
+  - 再跑真实 `.env` smoke，确认 `annotation_excessive_whitespace` 不再成为唯一 blocker，并观察 vision acceptance 仍缺什么。
+
+## 2026-06-21 targeted inference annotation corridor follow-up
+
+- 真实 `.env` smoke：
+  - 命令：`SESSION_ID=post_inference_annotation_recompact_smoke_20260621_210000 REFERENCE_PREVIEWS=required MAX_ITERATIONS=3 MAX_MINUTES=45 bash scripts/run_real_env.sh examples/teacher_student.md`
+  - run dir：`runs/teacher-student-distillation-with-latent-residuals/post_inference_annotation_recompact_smoke_20260621_210000`
+  - 结果：`accepted=false`、3 轮、`reason="cap reached before acceptance"`；renderer 仍为 model generated code。
+  - 本地 quality：三轮均 `score=46/issues=6`。上一轮右下角巨大 inference note 已消失，但新 final 中 `anno_inference` 被压到 residual/teacher-to-residual 边上，触发：
+    - `annotation_in_main_corridor`
+    - `label_overlaps_component` (`anno_inference` vs `latent_residual`)
+    - `label_overlaps_edge` (`anno_inference` vs `e_teacher_to_residual`)
+    - 另有 `anno_teacher_role` 顶部大注释和 `residual` connector label 覆盖边。
+- 根因：
+  - `anno_inference` 这次带 `target_id="student_predictor"`。上一轮为了保护有 target 的 annotation，upsert 后的 corridor repair 也跳过了它。
+  - 正确边界应是：有 target 的 annotation 不走泛化 student-note 重定位；但如果 target-adjacent 位置实际覆盖组件或边，仍应允许 corridor/overlap repair 移开。
+- 已完成实现：
+  - `src/tools/draw_plan.rs`：
+    - 保持 `move_student_inference_notes_near_student_except` 跳过 target-bound inference annotation，避免破坏清晰的 target anchoring。
+    - upsert 后改为继续运行 `move_inference_note_boxes_out_of_flow_corridors`，让 target-bound annotation 在实际覆盖 residual/edge/corridor 时仍可移动。
+  - `tests/draw_plan_tests.rs`：
+    - 新增 `model_draw_plan_polish_moves_targeted_inference_annotation_out_of_residual_corridor_from_latest_smoke`，复现当前 final：`anno_inference` 有 target，但覆盖 `latent_residual` 和 `e_teacher_to_residual`；要求 polish 后不再覆盖组件/边且仍靠近 student。
+    - 保留并验证 `model_draw_plan_polish_anchors_inference_annotation_to_figure_plan_target`，确认清晰 target annotation 不会被普通重定位破坏。
+- 当前验证：
+  - `cargo test --test draw_plan_tests model_draw_plan_polish_moves_targeted_inference_annotation_out_of_residual_corridor_from_latest_smoke -- --nocapture` 通过。
+  - `cargo test --test draw_plan_tests model_draw_plan_polish_anchors_inference_annotation_to_figure_plan_target -- --nocapture` 通过。
+  - `cargo test --test draw_plan_tests -- --nocapture` 通过（125/125）。
+  - `cargo test --test review_tests -- --nocapture` 通过（45/45）。
+  - `cargo test` 全量通过。
+  - `cd renderer && npm run build` 通过。
+  - `cargo fmt && cargo fmt --check && git diff --check` 通过。
+- 待完成：
+  - 再跑真实 `.env` smoke，确认 inference annotation corridor blocker 是否清除；若仍失败，下一优先级是 `anno_teacher_role` 顶部大注释和 residual edge label 覆盖。
+
+## 2026-06-21 post-targeted-corridor smoke result
+
+- 真实 `.env` smoke：
+  - 命令：`SESSION_ID=post_targeted_inference_corridor_smoke_20260621_213000 REFERENCE_PREVIEWS=required MAX_ITERATIONS=3 MAX_MINUTES=45 bash scripts/run_real_env.sh examples/teacher_student.md`
+  - run dir：`runs/teacher-student-distillation-with-latent-residuals/post_targeted_inference_corridor_smoke_20260621_213000`
+  - 结果：`accepted=false`、3 轮、`reason="cap reached before acceptance"`。
+  - 本地 quality：`round_000 score=0/issues=11`，`round_001 score=58/issues=4`，`round_002/final score=40/issues=6`。
+  - 本轮验证结论：上一轮的 `anno_inference` 覆盖 residual/edge blocker 未在 final 复发；但模型换成了更差的整体布局。
+- 当前 final 主要问题：
+  - `input_text` 被放到左下角，`e_input_teacher` 和 `e_input_student` 形成大 U 型绕线；本地报 `route_detour`。
+  - `task_loss` 和 `residual_loss` 被挤到顶部，`e_task_supervision`、`e_residual_supervision` 与主路径和 teacher/student 区域交叉；本地报 `edge_crosses_component`、`edge_crossing`。
+  - `inference_note` 作为 box 保留，但 bbox 被压得偏小；本地报 `component_collapsed`。
+  - 这说明当前 loop 的主要缺口已经从单个 annotation 转向“teacher/student 模板拓扑约束不稳定”：模型仍会把 input/loss/residual 放到不符合参考模板的区域，后处理只能局部救火。
+- 下一步建议：
+  - 不再继续只修单个 label；应把 `teacher_student` 模板的几何拓扑收紧为局部可变但结构稳定的约束：
+    - input 必须在 teacher/student 左侧或两者中间左侧，禁止落到底部外圈；
+    - teacher/student 两分支应共享输入左侧入口，避免 input->branch 的外圈 U 型绕线；
+    - task loss/residual loss 不能同时占据顶部横向 corridor，loss/objective 应靠近对应 output/student 边；
+    - inference note 最小可读尺寸与 student/output 附近 anchor 应同时满足。
+  - 对应需要新增本地 fixture：复现本轮 final 的 bottom input / top losses / crossing supervision 组合，再实现 template-aware placement polish 或更强的 FigurePlan canonicalization。
+
+## 2026-06-22 teacher/student topology repair implementation
+
+- 已完成实现：
+  - `src/tools/draw_plan.rs`：
+    - 新增 `stabilize_teacher_student_shared_inputs`，把同时连接 teacher/context 与 student/main 的 shared input 从底部外圈拉回到分支左侧，并复用 `compact_input_context_route` 重算短局部绕线，避免 input->student 穿过 teacher 或回到底部。
+    - 新增 `pull_top_edge_task_losses_near_outputs`，当 task loss 被放在顶部且 output->loss 路径形成长竖线时，将 task loss 拉回 output/student 附近，并重算相邻 objective connector。
+    - 新增 `pull_top_residual_losses_near_sources`，当 residual/supervision objective 被放到顶边且远离来源时，将其拉回来源附近，避免顶部横向 corridor 与 task supervision 交叉。
+    - 新增 `ensure_inference_note_boxes_readable`，对仍保留为 `inference_note` box 的 student inference cue 做最小高度保护，避免塌缩；直接 polish 路径可能会把孤立 note 折成 editable text，真实 FigurePlan pipeline 还需要 smoke 验证。
+  - `tests/draw_plan_tests.rs`：
+    - 新增 `model_draw_plan_polish_repairs_bottom_input_and_top_losses_from_latest_smoke`，复现 `post_targeted_inference_corridor_smoke_20260621_213000` final 的 bottom input / top task loss / top residual loss / crossing supervision 组合。
+- 当前验证：
+  - `cargo test --test draw_plan_tests model_draw_plan_polish_repairs_bottom_input_and_top_losses_from_latest_smoke -- --nocapture` 通过。
+  - 初次 `cargo test --test draw_plan_tests -- --nocapture` 发现 3 个回归：同列 top task loss 被错误移动、同列 residual supervision 被错误移动、stacked teacher/residual fixture 的 loss stack 被破坏。
+  - 根因：新增 top-edge repair 只判断“位于顶边且离来源远”，没有区分“source 与 objective 同列，应只绕线/调 label”与“source 与 objective 横向错位，应移动 objective”。
+  - 修复：`top_edge_task_loss_needs_pull` 和 `top_residual_objective_needs_pull` 增加 `horizontal_separation > 0.04` 触发门槛，只处理横向错位明显的顶边 objective。
+  - 复跑失败单测与新增单测均通过。
+  - `cargo fmt && cargo test --test draw_plan_tests -- --nocapture` 通过（126/126）。
+  - `cargo test --test review_tests -- --nocapture` 通过（45/45）。
+  - `cargo test` 全量通过。
+  - `cd renderer && npm run build` 通过。
+  - `cargo fmt --check && git diff --check` 通过。
+- 待完成：
+  - 跑真实 `.env` smoke，确认视觉输出是否从“底部 U 型路线 + 顶部 objective 交叉”改善到稳定 teacher/student 拓扑。
+
+## 2026-06-22 post-topology-repair smoke result and follow-up
+
+- 真实 `.env` smoke：
+  - 命令：`SESSION_ID=post_teacher_student_topology_repair_smoke_20260622_001736 REFERENCE_PREVIEWS=required MAX_ITERATIONS=3 MAX_MINUTES=45 bash scripts/run_real_env.sh examples/teacher_student.md`
+  - run dir：`runs/teacher-student-distillation-with-latent-residuals/post_teacher_student_topology_repair_smoke_20260622_001736`
+  - 结果：`accepted=false`、3 轮、`reason="cap reached before acceptance"`；final PPTX `unzip -t` 通过；renderer 为 `model_generated_code`，未 fallback。
+  - 本地 quality：`round_000 score=0/issues=15`，`round_001/final score=52/issues=7`，`round_002 score=58/issues=5`。
+- 观察结论：
+  - 上一轮 final 的 `task_loss`/`residual_loss` 顶边横向 corridor 问题已消失；objective 进入主图区域。
+  - 新的主要 blocker 是后期 crossing reroute 把 `edge_input_to_student` 推到外圈（round_002 走到 `y=0.03` 顶边；final 走到底部大 U），以及模型会把 `Student Head` 放在 `Student Encoder` 上方，导致 task-loss/source 关系判断错。
+  - `comp_inference_note` 在 final 中高度只有约 `0.052`，触发 `component_collapsed`；此前 readability guard 跳过了 `comp_` 前缀 note。
+- 已完成 follow-up 实现：
+  - `src/tools/draw_plan.rs`：
+    - 将 `repair_outer_input_context_detours` 泛化到 `input -> student/main`，并在第二次 `reroute_connectors_around_crossing_edges` 后再执行一次，避免后期重路由重新把 shared input connector 推到外圈。
+    - 新增 `stack_student_encoder_head_pairs_top_down`，当 `Student Encoder -> Student Head` 被模型反向堆叠时，按 encoder 在上、head 在下的拓扑重新排布，并重算 connector。
+    - 放宽 `ensure_inference_note_boxes_readable` 到 `comp_inference_note`，同时把 note 最大宽度限制在 `0.16`，让高度可读但面积不膨胀。
+  - `tests/draw_plan_tests.rs`：
+    - 新增 `model_draw_plan_polish_repairs_outer_shared_input_to_student_after_crossing_reroute_from_smoke`，复现 round_002 的顶边外圈 input->student route。
+    - 新增 `model_draw_plan_polish_stacks_student_encoder_above_head_from_smoke`，复现 final 中 Student Head/Encoder 颠倒的问题。
+- 当前验证：
+  - 两个新增局部单测均通过。
+  - `cargo fmt && cargo test --test draw_plan_tests -- --nocapture` 通过（128/128）。
+  - `cargo test` 全量通过。
+  - `cd renderer && npm run build` 通过。
+  - `cargo fmt --check && git diff --check` 通过。
+- 待完成：
+  - 再跑真实 `.env` smoke，确认 input 外圈路线、student 顺序、inference note collapse 是否消失。
+
+## 2026-06-22 post-shared-input/student-order smoke result and final corridor fixes
+
+- 真实 `.env` smoke：
+  - 命令：`SESSION_ID=post_shared_input_student_order_smoke_20260622_003108 REFERENCE_PREVIEWS=required MAX_ITERATIONS=3 MAX_MINUTES=45 bash scripts/run_real_env.sh examples/teacher_student.md`
+  - run dir：`runs/teacher-student-distillation-with-latent-residuals/post_shared_input_student_order_smoke_20260622_003108`
+  - 结果：`accepted=false`、3 轮、`reason="cap reached before acceptance"`；final PPTX `unzip -t` 通过。
+  - 本地 quality：`round_000 score=82/issues=2`，`round_001/final score=88/issues=2`，`round_002 score=70/issues=4`。
+  - 视觉评分：semantic 8、story 7、hierarchy 7、readability 6、layout 6、arrow 8、color 7、aesthetic 7、editability 9。
+- 观察结论：
+  - input 外圈路线、student encoder/head 顺序、`comp_inference_note` collapse 均已消失，整体从上一轮 final score 52 提升到 88，且无 blocking quality issue。
+  - 剩余两个 major：
+    - `task_loss_in_branch_corridor`：output->task_loss 的 loss 位于 output 上方的 teacher/student 中间带。
+    - `annotation_in_main_corridor`：`anno_inference` 作为 Text 保留在 teacher/student 中间。
+- 已完成 final corridor fixes：
+  - `src/tools/draw_plan.rs`：
+    - 新增 `move_output_task_losses_out_of_branch_corridors`，只在 `output -> task_loss` 且 loss 位于 output 上方中间带时，把 task loss 拉到 output periphery。
+    - 调整 `student_inference_note_candidate`：Box note 靠近 loss/objective 时仍走折叠保护；Text annotation 允许移动出 teacher/student corridor。
+  - `tests/draw_plan_tests.rs`：
+    - 新增 `model_draw_plan_polish_moves_output_task_loss_below_output_from_corridor_smoke`。
+    - 新增 `model_draw_plan_polish_moves_inference_text_out_of_teacher_student_corridor_from_smoke`。
+- 当前验证：
+  - 两个新增测试通过。
+  - `cargo fmt && cargo test --test draw_plan_tests -- --nocapture` 通过（130/130）。
+  - `cargo test` 全量通过。
+  - `cd renderer && npm run build` 通过。
+  - `cargo fmt --check && git diff --check` 通过。
+- 待完成：
+  - 再跑真实 `.env` smoke，确认 final 是否达到 quality pass 或至少没有 `task_loss_in_branch_corridor` / `annotation_in_main_corridor`。
+
+## 2026-06-22 post-final-corridor-fixes smoke result
+
+- 真实 `.env` smoke：
+  - 命令：`SESSION_ID=post_final_corridor_fixes_smoke_20260622_004202 REFERENCE_PREVIEWS=required MAX_ITERATIONS=3 MAX_MINUTES=45 bash scripts/run_real_env.sh examples/teacher_student.md`
+  - run dir：`runs/teacher-student-distillation-with-latent-residuals/post_final_corridor_fixes_smoke_20260622_004202`
+  - 结果：`accepted=false`、3 轮、`reason="cap reached before acceptance"`。
+  - 本地 quality：`round_000 score=22/issues=8`，`round_001 score=46/issues=7`，`round_002/final score=64/issues=5`。
+- 对比结论：
+  - 本轮模型生成了与上一轮不同的更复杂 layout，因此没有复现 `task_loss_in_branch_corridor` / `annotation_in_main_corridor`；这两个 issue 在本轮 final 中消失。
+  - 但新 layout 引入了新的 blocker：student vertical chain 的 box 间距过小、`student_head -> student_output` connector 太短、`anno_frozen` 靠近 `e_ground_truth_to_task_loss`。
+  - 这说明后处理已经能修掉上一轮明确的 corridor 问题，但真实 loop 仍会在不同结构之间跳动；下一步不应继续只补单个 smoke，而应收紧 student vertical chain 的最小 gutter、output 右侧间距、以及 generic frozen annotation 的去重/移位。
+- 当前最佳真实 smoke：
+  - `post_shared_input_student_order_smoke_20260622_003108` final：`score=88/issues=2`，无 blocking quality issue；视觉上 input 路线、student 顺序、inference note collapse 已解决。
+  - `post_final_corridor_fixes_smoke_20260622_004202` final：`score=64/issues=5`，说明后续模型换布局会回落。
+
+## 2026-06-22 student-chain gutter and frozen annotation repair
+
+- 根因定位：
+  - `post_final_corridor_fixes_smoke_20260622_004202` final 的 student vertical chain 间隔为约 `0.045`，已有 `stack_crowded_student_branch_chains` 只有小于 `0.035` 才触发，因此视觉上仍然拥挤但 polish 不介入。
+  - `student_head -> student_output` 的短边不是单点问题：chain stack 会尝试拉远 output，但后续 `widen_output_boxes_for_long_tokens` 将单字符 `ŷ` 重新放宽到 `0.10`，再由 `separate_horizontally_crowded_connected_boxes` 以旧的 `0.035` target gap 定格，最终仍然出现过短 connector。
+  - `anno_frozen` 与 `Teacher (frozen)` 语义重复，且仅在真正压上线时才移动；真实评审会把“贴近长连线”也判为问题，所以这类冗余 annotation 更适合删除。
+- 已完成实现：
+  - `src/tools/draw_plan.rs`：
+    - 将 student chain 纵向修复触发门槛从 `0.035` 提到 `0.055`，目标 gutter 从 `0.045` 提到 `0.060`。
+    - 为 `head -> output` 相连盒子使用 `0.045` 的水平 target gap，普通相连盒子仍保持 `0.035`，避免全局放大间距。
+    - 新增冗余 `frozen` annotation 去重：只有当 annotation-like 文本本身就是 `frozen` 且 semantic boxes 已包含 `frozen` 时删除，FigurePlan 明确保护的有意义 frozen 标注仍会保留。
+  - `tests/draw_plan_tests.rs`：
+    - 新增 `model_draw_plan_polish_increases_student_chain_gutters_and_output_gap_from_smoke`，复现 student chain 过密和 head-output 短边。
+    - 新增 `model_draw_plan_polish_removes_redundant_frozen_annotation_near_task_edge_from_smoke`，复现冗余 `anno_frozen` 靠近 task loss 连线。
+- 当前验证：
+  - 初次尝试 `cargo test --test draw_plan_tests test_a test_b -- --nocapture` 失败，原因是 `cargo test` 只接受一个 test name 过滤参数。
+  - 新增的两个局部测试分别通过。
+  - `cargo fmt && cargo test --test draw_plan_tests -- --nocapture` 通过（132/132）。
+  - `cargo test` 全量通过。
+  - `cd renderer && npm run build` 通过。
+  - `cargo fmt --check` 通过。
+  - `git diff --check` 通过。
+- 待完成：
+  - 再跑真实 `.env` smoke，确认这次 final 的 `component_crowding`、`degenerate_edge`、`annotation_too_close_to_edge` 是否消失，观察是否有新的模型布局跳动。
+
+## 2026-06-22 post-student-gutter/frozen smoke and inference-note follow-up
+
+- 真实 `.env` smoke：
+  - 命令：`SESSION_ID=post_student_gutter_frozen_smoke_20260622_012000 REFERENCE_PREVIEWS=required MAX_ITERATIONS=3 MAX_MINUTES=45 bash scripts/run_real_env.sh examples/teacher_student.md`
+  - run dir：`runs/teacher-student-distillation-with-latent-residuals/post_student_gutter_frozen_smoke_20260622_012000`
+  - 结果：`accepted=false`、3 轮、`reason="cap reached before acceptance"`；final PPTX `unzip -t` 通过。
+  - 本地 quality：`round_000 score=4/issues=12`，`round_001 score=58/issues=4`，`round_002/final score=94/issues=1`。
+- 观察结论：
+  - 本轮 loop 没有重开式退化：`regression_report` 显示 round_001 相对 round_000 `score_delta=54`，blocking/major/issue 数均下降。
+  - 此前目标问题未复发：没有 `component_crowding`、`student_head -> student_output` degenerate、`anno_frozen` close-to-edge。
+  - final 图显著改善，但仍未被 vision 接受；本地唯一 quality issue 是 `standalone_inference_lane`，即 `comp_inference_note` 作为无连接 box 留在图中。
+  - 根因：`comp_inference_note` 因 id 含 `note` 被视为 protected FigurePlan component；旧逻辑只有它挤到 loss/objective 或是 lane-like id 时才折叠，因此这个“无连接、非 badge、但不挤 loss”的 note 漏掉了。
+- 已完成 follow-up 实现：
+  - `src/tools/draw_plan.rs`：
+    - 放宽 `detached_protected_inference_note_should_fold`：无连接、非 badge、非显式 `inference_note` 的 protected inference note，如果不是紧贴 student 的小 badge，就折叠为 annotation。
+    - 将 `Inference only` / `inference-only` 归一成 `Inference: student only`，避免折叠后语义变弱。
+  - `tests/draw_plan_tests.rs`：
+    - 新增 `model_draw_plan_polish_folds_unconnected_protected_inference_note_from_final_smoke`，复现 final 中 `comp_inference_note` 无连接但未折叠的问题，并要求折叠后的 annotation 不覆盖 student/input box。
+- 当前验证：
+  - 新增局部测试通过。
+  - `cargo fmt && cargo test --test draw_plan_tests -- --nocapture` 通过（133/133）。
+  - `cargo test` 全量通过。
+  - `cd renderer && npm run build` 通过。
+  - `cargo fmt --check` 通过。
+  - `git diff --check` 通过。
+- 待完成：
+  - 下一次真实 smoke 应确认 final 的 `standalone_inference_lane` 是否消失；如果消失但 vision 仍拒绝，下一优先级是 teacher/student Y-branch 平衡和 residual connector 的主观美学问题。
+
+## 2026-06-22 post-inference-note-fold smoke result
+
+- 真实 `.env` smoke：
+  - 命令：`SESSION_ID=post_inference_note_fold_smoke_20260622_013000 REFERENCE_PREVIEWS=required MAX_ITERATIONS=3 MAX_MINUTES=45 bash scripts/run_real_env.sh examples/teacher_student.md`
+  - run dir：`runs/teacher-student-distillation-with-latent-residuals/post_inference_note_fold_smoke_20260622_013000`
+  - 结果：`accepted=false`、3 轮、`reason="cap reached before acceptance"`；final PPTX `unzip -t` 通过。
+  - 本地 quality：`round_000 score=52/issues=5`，`round_001 score=70/issues=4`，`round_002/final score=76/issues=3`。
+- 验证结论：
+  - 上一轮 final 的 `standalone_inference_lane` 已消失，说明 protected inference note 折叠修复有效。
+  - `regression_report` 显示 round_002 相对 round_001 仍为 improved，`score_delta=6`，没有新增 regressed issue type。
+  - 新 final 的 3 个本地问题来自同一拓扑：teacher、latent residual、student 被压在同一水平线，导致 `teacher_encoder -> latent_residual_obj` 太短、teacher 与 residual 太近、`task_input -> student_encoder` 必须绕 teacher 走底部长 U。
+  - 视觉观察：图已清爽很多，但结构像单行 pipeline，不像 teacher/student Y-branch；`ann_inference` 已从 box 折成 text，但仍位于 student 下方主流区，vision 认为它应该更靠外。
+- 下一步：
+  - 不再补单个 connector；应新增一个 focused topology repair：当 shared input 同时连 teacher 和 student，且 teacher/student/residual 被压成同一横排时，把 teacher/student 分成上下分支或至少拉开 residual/teacher 并避免 input->student 四点 U 型 dogleg。
+  - 对应新增 final-smoke fixture，覆盖 `component_crowding`、`route_detour`、`degenerate_edge` 三个问题。
+
+## 2026-06-22 same-row teacher/student collapse repair
+
+- 已完成实现：
+  - `src/tools/draw_plan.rs`：
+    - 新增 `repair_same_row_teacher_student_shared_input_collapse`，只在 shared input 同时连接 teacher 与 student、teacher/student 几乎同一行、teacher 位于 input 与 student 之间、且 input->student 已出现四点 U 型路线时触发。
+    - 修复策略是局部移动 teacher 到 student 上方、把 residual/objective 放到 teacher 与 student 之间但保持可见 gutter，并用 `orthogonal_connector_points_between_boxes` 重算 input->teacher、input->student、teacher/student->residual 边。
+    - 不移动正常的 vertical teacher/student 分支，不处理没有 shared input 的普通 pipeline，降低误伤已有布局的风险。
+  - `tests/draw_plan_tests.rs`：
+    - 新增 `model_draw_plan_polish_repairs_same_row_teacher_student_shared_input_collapse_from_smoke`，复现 `post_inference_note_fold_smoke_20260622_013000` final 中的 `component_crowding`、`route_detour`、`degenerate_edge` 组合。
+- 当前验证：
+  - 新增局部测试通过。
+  - `cargo fmt && cargo test --test draw_plan_tests -- --nocapture` 通过（134/134）。
+  - `cargo test` 全量通过。
+  - `cd renderer && npm run build` 通过。
+  - `cargo fmt --check` 通过。
+  - `git diff --check` 通过。
+- 待完成：
+  - 如继续跑真实 smoke，应确认 `post_inference_note_fold_smoke_20260622_013000` final 的同排 collapse 三问题是否消失；仍需关注 vision 对 teacher/student Y-branch 平衡的主观评分。
+
+## 2026-06-22 post-same-row smoke panic and fix
+
+- 真实 `.env` smoke 尝试：
+  - 命令：`SESSION_ID=post_same_row_collapse_smoke_20260622_014500 REFERENCE_PREVIEWS=required MAX_ITERATIONS=3 MAX_MINUTES=45 bash scripts/run_real_env.sh examples/teacher_student.md`
+  - run dir：`runs/teacher-student-distillation-with-latent-residuals/post_same_row_collapse_smoke_20260622_014500`
+  - 结果：round_000 只写出 `figure_plan.json`，随后 panic：`f64::clamp min > max`，`min = 0.9881666666666667, max = 0.94`。
+- 根因定位：
+  - panic 来自 `residual_signal_bridge_route` 的右侧 rail 计算：当 teacher/student branch 已经靠近右边界时，`right_x + 0.035 > 0.94`，但代码仍调用 `.clamp(right_x + 0.035, 0.94)`，导致 min/max 反序。
+  - 这不是 LLM/API 问题，是本地几何保护缺口；真实 smoke 比单测覆盖到了更极端的右边界 residual bridge。
+- 已完成修复：
+  - `src/tools/draw_plan.rs`：
+    - `residual_signal_bridge_route` 增加右边界 fallback：右侧 rail 空间不足时，改用左侧 rail；若左侧也极窄，则使用不反序的安全边界，避免 panic。
+  - `tests/draw_plan_tests.rs`：
+    - 新增 `model_draw_plan_polish_folds_right_edge_residual_bridge_without_clamp_panic`，覆盖靠右 teacher/student residual bridge 的折叠路径。
+- 当前验证：
+  - 新增 panic 回归通过。
+  - `cargo fmt && cargo test --test draw_plan_tests -- --nocapture` 通过（135/135）。
+  - `cargo test` 全量通过。
+  - `cd renderer && npm run build` 通过。
+  - `cargo fmt --check` 通过。
+  - `git diff --check` 通过。
+- 待完成：
+  - 重新跑真实 `.env` smoke，确认 panic 已消失，并观察 same-row collapse repair 的端到端效果。
+
+## 2026-06-22 post-panic-fix smoke result
+
+- 真实 `.env` smoke：
+  - 命令：`SESSION_ID=post_same_row_collapse_smoke_20260622_020000 REFERENCE_PREVIEWS=required MAX_ITERATIONS=3 MAX_MINUTES=45 bash scripts/run_real_env.sh examples/teacher_student.md`
+  - run dir：`runs/teacher-student-distillation-with-latent-residuals/post_same_row_collapse_smoke_20260622_020000`
+  - 结果：`accepted=false`、3 轮、`reason="cap reached before acceptance"`；final PPTX `unzip -t` 通过。
+  - 本地 quality：`round_000 score=0/issues=18`，`round_001 score=34/issues=9`，`round_002/final score=46/issues=7`。
+- 验证结论：
+  - `residual_signal_bridge_route` 的 clamp panic 已消失；round_000 成功渲染、导出、review。
+  - `standalone_inference_lane` 未复发；final 中 inference cue 是 compact text。
+  - 这次 LLM 生成了更复杂的 encoder/projection/output 双分支，而不是上一轮的同排 simple chain；final 主要问题变成 teacher/student projection 比例严重不对称、latent residual 放在 teacher flow 上方、task loss 贴 student output、分支间距仍不足。
+  - 这类问题已经超出单条 edge / 单个 annotation 修复，下一轮应考虑更强的 teacher_student template canonicalizer，或者在 reasoner/coder prompt 中强制选择并保持一个参考模板的 branch grammar，而不是继续按真实 smoke 一个个补局部 polish。
+- 当前状态：
+  - 已修复并验证的具体问题：student chain gutter、head-output short edge、redundant frozen annotation、protected inference note standalone box、same-row shared-input collapse、right-edge residual bridge panic。
+  - 未解决的系统性问题：LLM 仍会在每次 smoke 生成不同拓扑；现有 local polish 能显著提升某些布局，但对复杂 projection/out 多节点 teacher_student 图还缺少模板级结构约束。
+
+## 2026-06-22 multistage teacher/student branch balancing repair
+
+- 根因复查：
+  - 读取 `post_same_row_collapse_smoke_20260622_020000/final/draw_plan.json`、`quality_report.json`、`review.json` 后确认，失败不是单条线问题，而是复杂 encoder/projection/output teacher-student 分支的结构失衡：
+    - `teacher_proj` 高度 `0.319`，明显大于 `student_proj` 的 `0.180`，导致 paired stage 视觉权重失衡。
+    - `latent_residual` 被放在 teacher flow 上方，而不是 teacher/student branch endpoints 之间，随后 dashed route 穿过 teacher projection flow。
+    - `student_out` 与 `task_loss` 几乎贴边，产生 degenerate edge。
+  - `templates/method_overview/method_templates.json` 只有 `simclr_contrastive_y_branch` 抽象参考；其规则是 shared source、两条分支、agreement/loss 位于分支端点上方或之间。因此本轮没有写死某张论文图坐标，而是把它落成 branch grammar repair。
+- 已完成实现：
+  - `src/tools/draw_plan.rs`：
+    - 新增 `balance_multistage_teacher_student_branches`，插在同排 collapse repair 之后、task loss corridor repair 之前。
+    - 触发条件收窄为同时存在 teacher/student 至少两个 paired stage，且必须有成对 projection/head stage；避免误伤只有 encoder/output 或普通 student vertical chain 的布局。
+    - 对明显高度失衡的 paired encoder/projection stage 做局部压缩，不因同高同排而强行上下移动。
+    - 将 residual/supervision hub 拉回 connected teacher/student branch rows 之间，并为 moved objective connectors 重算 orthogonal route。
+    - 将贴住 student output 的 task loss 推到 output 下方或侧边，保证短边不再 degenerate。
+    - `move_objective_hubs_out_of_branch_gap_crowding` 增加保护：如果 residual 已处于 multi-stage teacher/student 的合法 branch slot，不再把它搬到 branch union 上方，避免二次破坏。
+  - `tests/draw_plan_tests.rs`：
+    - 新增 `model_draw_plan_polish_balances_multistage_teacher_student_branches_from_latest_smoke`，直接复现 latest final 的 teacher/student projection 失衡、residual 顶部漂浮、task loss 贴边和 crossing 问题。
+- 调试中遇到的坑：
+  - 初版 repair 只跑新增测试可通过，但全量 `draw_plan_tests` 暴露两个回归：没有 projection pair 的 student vertical chain 被误判为 multi-stage branch。
+  - 解决方式是把触发条件收窄到必须有成对 projection/head stage，并只处理明显高度失衡，不再用普通 vertical gap 作为移动理由。
+- 当前验证：
+  - 新增测试先红后绿。
+  - `cargo test --test draw_plan_tests -- --nocapture` 通过（136/136）。
+  - `cargo fmt` 已执行。
+  - `cargo test` 全量通过。
+  - `cd renderer && npm run build` 通过。
+  - `cargo fmt --check` 通过。
+  - `git diff --check` 通过。
+- 待完成：
+  - 跑真实 `.env` smoke，确认复杂 projection/out 分支是否端到端改善；重点观察 `component_crowding`、`degenerate_edge`、`edge_crossing` 和 vision 对 residual/loss placement 的评价。
+
+## 2026-06-22 post-multistage-balance smoke and embedded-inference follow-up
+
+- 真实 `.env` smoke：
+  - 命令：`SESSION_ID=post_multistage_branch_balance_smoke_20260622_030000 REFERENCE_PREVIEWS=required MAX_ITERATIONS=3 MAX_MINUTES=45 bash scripts/run_real_env.sh examples/teacher_student.md`
+  - run dir：`runs/teacher-student-distillation-with-latent-residuals/post_multistage_branch_balance_smoke_20260622_030000`
+  - 结果：`accepted=false`、3 轮、`reason="cap reached before acceptance"`；final PPTX `unzip -t` 通过。
+  - 本地 quality：`round_000 score=76/issues=3`，`round_001 score=88/issues=1`，`round_002/final score=100/issues=0`。
+- 验证结论：
+  - 本轮几何目标达成：final 本地 quality 已无 `component_crowding`、`degenerate_edge`、`edge_crossing`。
+  - PNG 视觉上不再有上一轮那种 teacher/student projection 失衡和 residual 穿线问题。
+  - vision 仍拒绝，但拒绝点已经切换为新问题：`final_output` 文本合并了 `(inference: student only)`，导致 output 框承担了辅助注记语义，视觉上像一个挤压的多行小框。
+- 已完成 follow-up 实现：
+  - `src/tools/draw_plan.rs`：
+    - 新增 `split_embedded_inference_notes_from_output_boxes`，在 polish 末尾拆分 output box 中独立的 `inference: student only` parenthetical。
+    - output box 保留 `Final/Prediction` 等预测语义；`Inference: student only` 通过现有 `ensure_inference_annotation` 生成独立 editable text annotation。
+    - 旧的 `remove_redundant_inference_only_parentheticals_from_main_boxes` 现在跳过 output box，避免提前删掉 inference 语义却不生成 annotation。
+  - `tests/draw_plan_tests.rs`：
+    - 新增 `model_draw_plan_polish_splits_embedded_inference_note_from_output_box_from_smoke`，复现 final `final_output` 合并 inference note 的问题。
+- 调试中遇到的坑：
+  - 初版在 polish 早期拆分 annotation，但后续 inference-note 清理链会删掉新生成的 annotation。
+  - 最终改为在 polish 末尾拆分，并让旧 main-box parenthetical 清理跳过 output，避免“先删文本、后无从恢复语义”。
+- 当前验证：
+  - 新增测试先红后绿。
+  - `cargo test --test draw_plan_tests -- --nocapture` 通过（137/137）。
+  - `cargo fmt && cargo test` 全量通过。
+  - `cd renderer && npm run build` 通过。
+  - `cargo fmt --check` 通过。
+  - `git diff --check` 通过。
+- 待完成：
+  - 再跑一次真实 `.env` smoke，确认 vision 是否仍拒绝；如果仍拒绝，应优先检查是否出现新的语义层问题，而不是回到几何微调。
+
+## 2026-06-22 post-embedded-inference-split smoke result
+
+- 真实 `.env` smoke：
+  - 命令：`SESSION_ID=post_embedded_inference_split_smoke_20260622_033000 REFERENCE_PREVIEWS=required MAX_ITERATIONS=3 MAX_MINUTES=45 bash scripts/run_real_env.sh examples/teacher_student.md`
+  - run dir：`runs/teacher-student-distillation-with-latent-residuals/post_embedded_inference_split_smoke_20260622_033000`
+  - 结果：`accepted=false`、3 轮、`reason="cap reached before acceptance"`；final PPTX 写出成功。
+  - 本地 quality：`round_000 score=40/issues=9`，`round_001 score=88/issues=2`，`round_002 score=76/issues=3`，`final score=88/issues=2`。
+- 验证结论：
+  - 上一轮的 `final_output` 合并 `(inference: student only)` 问题没有复发；说明 output embedded inference split 修复有效。
+  - 本轮 final 的拒绝点变成 exact `inference_note` box 自身：`inference_note_excessive_whitespace` 和 `student_enc`/`inference_note` vertical crowding。
+  - PNG 观察：主 teacher/student 双分支、latent residual、task loss 都比早期 smoke 稳定；当前瓶颈是 inference note 被模型画成一个较大的 muted box，位置夹在 teacher/student branch 之间，距离 student encoder 太近。
+- 尝试与撤回：
+  - 曾尝试把 protected exact `inference_note` 直接折叠成 annotation，但最小 FigurePlan fixture 会先把它重定位成 student-adjacent badge，不能可靠复现 smoke 的最终路径。
+  - 该未验证实现已撤回，没有留下未通过测试或未验证逻辑。
+- 当前验证：
+  - `cargo fmt && cargo test --test draw_plan_tests -- --nocapture` 通过（137/137）。
+  - `cargo test` 全量通过。
+  - `cd renderer && npm run build` 通过。
+  - `cargo fmt --check` 通过。
+  - `git diff --check` 通过。
+- 下一轮明确目标：
+  - 针对 exact `inference_note` box 增加一个能复现真实 smoke final 的回归入口。更合理的修复方向不是继续改 branch 几何，而是让 compact inference note 在最终 polish 阶段满足：面积小于 quality 阈值、与 student encoder 有足够 gutter、或在非 badge 情况下折叠为 `ann_inference` text。
+
+## 2026-06-22 exact inference note compact repair
+
+- 根因定位：
+  - 读取 `post_embedded_inference_split_smoke_20260622_033000/final/draw_plan.json` 后确认，final 的 exact `inference_note` bbox 为 `[0.3058, 0.5617, 0.4858, 0.6617]`，面积约 `0.018`、高度 `0.10`。
+  - `src/tools/review.rs` 的质量门禁会把 compact student-only inference note 中 `area > 0.016` 或 `height > 0.095` 判为 `inference_note_excessive_whitespace`，所以本地 gate 已经能看出问题。
+  - 真正漏修在 `src/tools/draw_plan.rs::ensure_inference_note_boxes_readable`：旧的 early continue 条件使用“当前尺寸大于等于目标尺寸”就跳过，刚好跳过了需要缩小的 exact `inference_note`。此外，直接折叠 exact `inference_note` 风险较大，因为 FigurePlan 明确声明了该 component；更稳妥的是压缩未连接 note 的尺寸并保持可编辑 box。
+  - `move_student_inference_notes_near_student` 没移动该 note 是合理保护：它检测到 note 如果贴近 student 会挤到 `latent_residual` 区域，所以不应强行搬动。
+- 已完成实现：
+  - `src/tools/draw_plan.rs`：
+    - `ensure_inference_note_boxes_readable` 现在跳过有 connector 端点的 note，避免误伤真正 connectable 的 inference component。
+    - 对 exact `inference_note` 使用更紧的目标尺寸：宽度最大 `0.16`，高度压到 `0.060..0.070`，保证低于质量门禁阈值。
+    - early continue 改为比较当前尺寸与目标尺寸是否近似相等，避免“需要缩小却跳过”的反向判断。
+  - `tests/draw_plan_tests.rs`：
+    - 新增 `model_draw_plan_polish_compacts_protected_inference_note_between_branches_from_smoke`，直接复现上一次 final 的 exact `inference_note` 过大且贴近 `student_enc` 的路径，并断言 note 面积、高度和 student gutter 都满足质量门禁。
+- 调试中遇到的坑：
+  - 新增测试绿后，全量 `draw_plan_tests` 暴露 `model_draw_plan_polish_converts_note_text_components_to_connectable_boxes` 回归：连接中的 `comp_inference_note` 被压缩导致 connector endpoint 变化。
+  - 修复方式是只压缩未连接 note id；有 connector 的 inference component 继续保持原有几何，避免破坏连线语义。
+- 当前验证：
+  - `cargo test --test draw_plan_tests model_draw_plan_polish_compacts_protected_inference_note_between_branches_from_smoke -- --nocapture` 通过。
+  - `cargo test` 全量通过。
+  - `cd renderer && npm run build` 通过。
+  - `cargo fmt --check` 通过。
+  - `git diff --check` 通过。
+- 待完成：
+  - 跑真实 `.env` smoke，确认 `inference_note_excessive_whitespace` 和 `student_enc`/`inference_note` crowding 是否消失；如果 vision 仍拒绝，再按新的 final issue 继续定位。
+
+## 2026-06-22 post-compact smoke and inference annotation corridor repair
+
+- 真实 `.env` smoke：
+  - 命令：`SESSION_ID=post_inference_note_compact_smoke_20260622_040000 REFERENCE_PREVIEWS=required MAX_ITERATIONS=3 MAX_MINUTES=45 bash scripts/run_real_env.sh examples/teacher_student.md`
+  - run dir：`runs/teacher-student-distillation-with-latent-residuals/post_inference_note_compact_smoke_20260622_040000`
+  - 结果：`accepted=false`、3 轮、`reason="cap reached before acceptance"`；final PPTX `unzip -t` 通过。
+  - 本地 quality：`round_000 score=70/issues=5`，`round_001 score=88/issues=1`，`round_002/final score=88/issues=2`。
+- 验证结论：
+  - 上一轮 exact `inference_note` 大框问题已经消失，final 不再报告 `inference_note_excessive_whitespace` 或 `student_enc`/`inference_note` crowding。
+  - 新 final 的两个本地 issue 都绑定到 `ann_inference`：`annotation_in_main_corridor` 和 `annotation_too_close_to_edge`。PNG 观察确认 `Inference: student only` 文本横在 teacher/student 之间，并贴近 `edge_latent_student` 虚线。
+  - 根因不是 vision 看不出来，而是本地 polish 只处理 annotation 与组件/线段的重叠，没有处理“未重叠但位于 teacher-student 主走廊”的语义避让。`student_inference_note_candidate` 又认为该 annotation 与 student 距离不够远，所以不会触发移动。
+- 已完成 follow-up 实现：
+  - `src/tools/draw_plan.rs`：
+    - 新增 `move_inference_annotations_out_of_teacher_student_corridors`，复用已有 `teacher_student_branch_pairs` 和 `inference_note_is_in_teacher_student_corridor` 判断，使质量门禁和修复条件一致。
+    - 对 inference/student annotation 落入 teacher-student corridor 或贴近 connector 的情况，尝试放到 student 右侧、下方、下方偏左等候选位置，并用已有 `connector_label_candidate_clear` 同时检查组件、connector 段、其它文本和 safe area。
+    - 在普通 polish 和 `polish_model_draw_plan_geometry_with_figure_plan` 的 final annotation upsert 之后调用，覆盖 `ann_inference` 被重新生成后的路径。
+  - `tests/draw_plan_tests.rs`：
+    - 新增 `model_draw_plan_polish_moves_upserted_inference_annotation_below_student_corridor_from_smoke`，直接复现本次 final 的 `ann_inference` bbox 和 `edge_latent_student` 路线，要求 annotation 离开 corridor 并避开 residual-to-student connector。
+- 当前验证：
+  - 新增测试先红后绿。
+  - `cargo test --test draw_plan_tests -- --nocapture` 通过（139/139）。
+  - `cargo test` 全量通过。
+  - `cd renderer && npm run build` 通过。
+  - `cargo fmt --check` 通过。
+  - `git diff --check` 通过。
+- 待完成：
+  - 再跑真实 `.env` smoke，确认 `annotation_in_main_corridor` 与 `annotation_too_close_to_edge` 是否消失；若仍拒绝，重点查看 task-loss feedback connector 的弯折/回流问题。
+
+## 2026-06-22 post-annotation-escape smoke and unanchored note repair
+
+- 真实 `.env` smoke：
+  - 命令：`SESSION_ID=post_inference_annotation_escape_smoke_20260622_043000 REFERENCE_PREVIEWS=required MAX_ITERATIONS=3 MAX_MINUTES=45 bash scripts/run_real_env.sh examples/teacher_student.md`
+  - run dir：`runs/teacher-student-distillation-with-latent-residuals/post_inference_annotation_escape_smoke_20260622_043000`
+  - 结果：`accepted=false`、3 轮、`reason="cap reached before acceptance"`；final PPTX `unzip -t` 通过。
+  - 本地 quality：`round_000 score=58/issues=6`，`round_001 score=82/issues=2`，`round_002/final score=76/issues=4`。这次 final 相对 round_001 回落，说明模型第三轮换了一个新拓扑，仍需要本地 polish 兜底。
+- 验证结论：
+  - `ann_inference` corridor 问题没有以同一形式复发；但模型把 inference cue 重新生成为 `inference_note` component，放在 teacher 上方，导致 `inference_note_unanchored` 与 teacher 侧 crowding。
+  - `e_task_loss_label` 的 `ŷ` label 留在 student head 下方，离短的 `student_head -> task_loss` 边太远。根因是短数学符号 label 的默认 bbox 宽度过大，放不进两个相邻模块之间的窄 connector gap，后续 component-avoidance 会把它推到远处。
+- 已完成 follow-up 实现：
+  - `src/tools/draw_plan.rs`：
+    - 新增 `move_unanchored_inference_note_boxes_to_student_periphery`，只移动未锚定或压线的 standalone inference note box；已锚定 student 的 note 继续交给 `ensure_inference_note_boxes_readable` 原地压缩，避免破坏上一轮 exact note 修复。
+    - 新 mover 遍历所有 student/output 锚点，而不是只依赖 primary/main student。这样当模型把 student boxes 都标成普通 module 时，仍能把 `inference_note` 放回 `student_enc`/`student_head` 附近。
+    - 将 1-2 字符 connector label 的目标宽度从通用下限收紧到 `0.036`，使 `ŷ`、`z_T`、`z_S` 这类短数学标签能贴近短边而不被组件避让逻辑推远。
+  - `tests/draw_plan_tests.rs`：
+    - 新增并扩展 `model_draw_plan_polish_moves_unanchored_inference_note_component_to_student_periphery_from_smoke`，复现本次 final 的 `inference_note` 顶部漂浮和 `e_task_loss` label 脱线问题。
+- 调试中遇到的坑：
+  - 初版 unanchored mover 把上一轮“可原地压缩”的 exact `inference_note` 也搬到 student 下方，导致 student gutter 变小。修复方式是区分 anchored 与 unanchored：已锚定的 note 不因单纯处于 branch gap 就移动，只有未锚定或确实压线时才移动。
+- 当前验证：
+  - 新增测试先红后绿。
+  - `cargo test --test draw_plan_tests -- --nocapture` 通过（140/140）。
+  - `cargo test` 全量通过。
+  - `cd renderer && npm run build` 通过。
+  - `cargo fmt --check` 通过。
+  - `git diff --check` 通过。
+- 待完成：
+  - 再跑真实 `.env` smoke，确认 `inference_note_unanchored` 和 `e_task_loss_label` 是否消失；若仍拒绝，下一优先级是 residual annotation 与 teacher/student branch vertical gutter。
+
+## 2026-06-22 post-unanchored-note smoke and collapsed context note repair
+
+- 真实 `.env` smoke：
+  - 命令：`SESSION_ID=post_unanchored_inference_note_smoke_20260622_050000 REFERENCE_PREVIEWS=required MAX_ITERATIONS=3 MAX_MINUTES=45 bash scripts/run_real_env.sh examples/teacher_student.md`
+  - run dir：`runs/teacher-student-distillation-with-latent-residuals/post_unanchored_inference_note_smoke_20260622_050000`
+  - 结果：`accepted=false`、3 轮、`reason="cap reached before acceptance"`；final PPTX `unzip -t` 通过。
+  - 本地 quality：`round_000 score=64/issues=5`，`round_001 score=82/issues=2`，`round_002/final score=88/issues=1`。这是本轮最稳定的一次：每轮本地质量都有实质提升，final 只剩一个本地 issue。
+- 验证结论：
+  - `inference_note_unanchored` 和 `e_task_loss_label` 不再是 final 本地 issue，说明上一轮 unanchored note mover 与短 label 宽度修复有效。
+  - final 唯一 issue 是 `component_collapsed` on `inference_note`。PNG 显示 note 已在 student 下方、位置合理；失败原因是它仍作为 component box 渲染，继承主模块字号 `13.1pt`，而不是作为上下文注记使用较小 annotation 字号。
+- 已完成 follow-up 实现：
+  - `src/tools/draw_plan.rs`：
+    - 新增 `convert_peripheral_inference_note_boxes_to_annotations`：只把无连接、compact、已离开 teacher/student corridor、已锚定 student/output、且位于底部外围的 exact `inference_note` box 转成 editable text annotation。
+    - 转换条件刻意收窄到 `id == "inference_note"` 且 `bbox[1] >= 0.80`，避免误伤已有测试中仍应保持 box 的 `comp_inference_note`、`inference_badge` 和非底部 exact note。
+  - `tests/draw_plan_tests.rs`：
+    - 扩展 `model_draw_plan_polish_moves_unanchored_inference_note_component_to_student_periphery_from_smoke`，要求底部外围 compact `inference_note` 最终以 editable text annotation 形式保留，而不是 collapsed component。
+- 调试中遇到的坑：
+  - 初版转换条件过宽，导致多个既有路径把 note/badge 从 box 误转成 text。全量 `draw_plan_tests` 暴露 7 个回归后，将转换条件收窄到当前真实 smoke 的底部外围 exact note 场景。
+- 当前验证：
+  - 新增/扩展测试先红后绿。
+  - `cargo test --test draw_plan_tests -- --nocapture` 通过（140/140）。
+  - `cargo test` 全量通过。
+  - `cd renderer && npm run build` 通过。
+  - `cargo fmt --check` 通过。
+  - `git diff --check` 通过。
+- 待完成：
+  - 如继续跑真实 `.env` smoke，重点确认 final 是否越过本地 quality gate；如果仍被 vision 拒绝，下一步应关注 residual placement 与 teacher/student branch symmetry，而不是继续围绕 inference note 微调。
+
+## 2026-06-22 post-collapsed-context-note smoke result
+
+- 真实 `.env` smoke：
+  - 命令：`SESSION_ID=post_collapsed_context_note_smoke_20260622_053000 REFERENCE_PREVIEWS=required MAX_ITERATIONS=3 MAX_MINUTES=45 bash scripts/run_real_env.sh examples/teacher_student.md`
+  - run dir：`runs/teacher-student-distillation-with-latent-residuals/post_collapsed_context_note_smoke_20260622_053000`
+  - 结果：`accepted=false`、3 轮、`reason="cap reached before acceptance"`；final PPTX `unzip -t` 通过。
+  - 本地 quality：`round_000 score=70/issues=4`，`round_001 score=40/issues=8`，`round_002 score=52/issues=7`，`final score=70/issues=4`。final 选择了 best round，而不是最后一轮，说明 best-round 回退逻辑有效。
+- 验证结论：
+  - 上一轮唯一 blocker `component_collapsed` on `inference_note` 没有复发，说明底部外围 inference note 转 annotation 的修复生效。
+  - 本轮失败切换到新的复杂 multi-stage topology：`teacher_encoder`/`teacher_latent` 和 `student_encoder`/`student_head` stage gutter 太小，`teacher_latent` 与 `residual_node` 横向太近，`e_student_residual` 穿过非端点组件 `teacher_latent`。
+  - PNG 观察：模型把 task loss 放到左下并用反向箭头连回 task head，student branch 被压成两行并和 teacher latent/residual 连接纠缠。这已经不是 inference note 问题，而是 branch grammar / stage stack 的系统性约束缺口。
+- 当前状态：
+  - 已连续修复并验证：exact inference note compact、ann_inference corridor escape、unanchored inference note periphery move、short math connector label width、bottom peripheral inference note annotation conversion。
+  - 最新未解决问题：multi-stage teacher/student 分支在模型换拓扑时仍会出现 stage gutter 不足、residual connector 穿线、task loss 反向放置。下一轮应围绕 “stage stack + residual slot + task loss side” 写一个更强的 branch grammar repair，而不是继续补 inference note。
+
+## 2026-06-22 projectionless multi-stage branch repair
+
+- 根因定位：
+  - 复查 `post_collapsed_context_note_smoke_20260622_053000/final/quality_report.json`，本地 gate 的 4 个 final issue 分别是 teacher stage vertical crowding、teacher latent/residual horizontal crowding、student encoder/head vertical crowding、`e_student_residual` 穿过 `teacher_latent`。
+  - 读取 `src/tools/draw_plan.rs::balance_multistage_teacher_student_branches` 后确认，旧逻辑要求同时识别到 `Projection` stage 才会继续。最新真实输出是 `teacher_encoder -> teacher_latent` 与 `student_encoder -> student_latent -> student_head -> output_pred`，没有 teacher projection pair，所以已有 multi-stage repair 直接 return。
+  - `stack_crowded_student_branch_chains` 也不能单独解决：它尝试把 student encoder/latent/head 纵向重排，但候选会撞到未压缩的 `teacher_latent`，因此被 clear check 拒绝。
+- 已完成实现：
+  - `tests/draw_plan_tests.rs`：
+    - 新增 `model_draw_plan_polish_repairs_projectionless_multistage_stack_from_smoke`，直接复现 latest smoke final 的 bbox 和连接关系。
+    - 测试先红后绿；红灯首先暴露 teacher stage gutter 仍停在旧 bbox。
+  - `src/tools/draw_plan.rs`：
+    - `balance_multistage_teacher_student_branches` 现在在缺少 projection pair 但已有 encoder/output pair 时进入 `repair_projectionless_multistage_teacher_student_layout`，而不是直接退出。
+    - 新 repair 只针对模型已经生成的 teacher/student encoder-latent-head 语义链：压缩 teacher encoder/latent 的宽高并保留 `0.060` vertical gutter；压缩 student encoder/latent/head 并保留 student encoder/head gutter。
+    - residual hub 被放到 teacher/student latent 右侧的独立槽位，并重新正交路由 latent-residual connectors，避免 student residual edge 再穿过 teacher latent。
+    - task loss 从左侧反向位置移动到 student 分支最右边界之外；当 output node 夹在 head 和 task loss 之间时，task-loss route 使用 output 上方 rail 绕行，避免横穿 prediction node。
+- 调试中遇到的坑：
+  - 初版 teacher gutter 设为 `0.055`，单测显示实际浮点结果卡在阈值边界；已提高到 `0.060`，避免真实毫米换算时再被判为 crowding。
+  - 初版 task loss 右侧候选仍与 `student_latent` 在 x 方向轻微重叠，且 vertical gap 贴近阈值，被 `objective_hub_candidate_is_clear` 拒绝。最终改为优先使用 student 分支最右边界之外的槽位，而不是只贴着 output 右侧。
+- 当前验证：
+  - `cargo test --test draw_plan_tests model_draw_plan_polish_repairs_projectionless_multistage_stack_from_smoke -- --nocapture`：通过。
+  - `cargo test --test draw_plan_tests -- --nocapture`：通过（141/141）。
+  - `cargo fmt`：已执行。
+  - `cargo test`：全量通过。
+  - `cd renderer && npm run build`：通过。
+  - `cargo fmt --check`：通过。
+  - `git diff --check`：通过。
+- 待完成：
+  - 通过后跑真实 `.env` smoke，观察 latest topology 是否还出现 residual/task-loss 结构性问题；如果仍拒绝，需要看新的 final PNG/quality issue，而不是回到 inference note 微调。
+
+## 2026-06-22 post-projectionless smoke and shared-input middle-slot repair
+
+- 真实 `.env` smoke：
+  - 命令：`SESSION_ID=post_projectionless_multistage_smoke_20260622_061500 REFERENCE_PREVIEWS=required MAX_ITERATIONS=3 MAX_MINUTES=45 bash scripts/run_real_env.sh examples/teacher_student.md`
+  - run dir：`runs/teacher-student-distillation-with-latent-residuals/post_projectionless_multistage_smoke_20260622_061500`
+  - 结果：`accepted=false`、3 轮、`reason="cap reached before acceptance"`；final PPTX `unzip -t` 通过。
+  - 本地 quality：`round_000 score=0/issues=15`，`round_001 score=76/issues=3`，`round_002 score=70/issues=4`，`final score=76/issues=3`。best-round 回退选择 round_001。
+- 验证结论：
+  - 上一轮 projectionless multi-stage stack 问题没有作为 final blocker 复发；新的 final blocker 是 shared input 被模型放在 teacher encoder 和 student encoder 中间但离 teacher 太近，导致 `comp_teacher_encoder`/`comp_input` crowding、`comp_input`/`comp_latent_residual` crowding，以及 `edge_input_to_teacher` 退化短边。
+  - PNG 观察确认 `Input x` 位于 teacher encoder 右侧的窄缝，下面紧贴 latent residual；这不是 vision 看不出来，而是本地 shared-input candidate 只会尝试“放到所有 target 左侧”。当 teacher 已经靠左时，左侧候选撞 teacher，于是旧逻辑退回到当前位置。
+- 已完成 follow-up 实现：
+  - `tests/draw_plan_tests.rs`：
+    - 新增 `model_draw_plan_polish_moves_shared_input_to_clear_middle_slot_from_smoke`，复现本次 final 的 input/teacher/student/residual 几何，要求 input 与 teacher 有真实 horizontal gutter、与 residual 有真实 gutter，且 input-to-teacher 边不退化。
+  - `src/tools/draw_plan.rs`：
+    - `shared_teacher_student_input_candidate` 新增 middle-slot candidate：仅当 input 已经被模型放在左 branch 右侧时触发，避免接管 bottom-margin input 的旧路径。
+    - middle-slot candidate 放在 left target 与 right target 之间，并根据下方/上方 residual hub 调整 y，避免刚好压在 residual 上方。
+    - 只有 middle-slot candidate 使用更严格的 crowding clear；legacy left/current candidates 保持原有 overlap-based clear，避免破坏旧 smoke 中“先把 bottom input 拉回 teacher 左侧”的行为。
+- 调试中遇到的坑：
+  - 初版把严格 crowding clear 套到所有 shared-input candidates，导致旧 bottom-input 回归选择了轻微重叠的 current_x；已改为只对 middle-slot 使用严格 gate。
+  - 初版 middle-slot 对所有 shared input 都可用，影响了旧 reverse-layout fixture；已收窄为 input 已处在 left branch 右侧时才触发。
+- 当前验证：
+  - `cargo test --test draw_plan_tests model_draw_plan_polish_moves_shared_input_to_clear_middle_slot_from_smoke -- --nocapture`：通过。
+  - `cargo test --test draw_plan_tests model_draw_plan_polish_repairs_bottom_input_and_top_losses_from_latest_smoke -- --nocapture`：通过。
+  - `cargo test --test draw_plan_tests model_draw_plan_polish_repairs_teacher_student_reverse_layout_from_latest_smoke -- --nocapture`：通过。
+  - `cargo test --test draw_plan_tests -- --nocapture`：通过（142/142）。
+  - `cargo fmt`：已执行。
+  - `cargo test`：全量通过。测试期间 LibreOffice 打印过一次非致命异常日志，但对应测试和最终退出码均为通过。
+  - `cd renderer && npm run build`：通过。
+  - `cargo fmt --check`：通过。
+  - `git diff --check`：通过。
+- 待完成：
+  - 验证通过后再跑一次真实 `.env` smoke；如果仍拒绝，优先检查新的 final quality/report 和 PNG，而不是继续围绕已解决的 projectionless stack 或 shared-input 问题。
+
+## 2026-06-22 post-shared-input smoke and branch input/output gutter repair
+
+- 真实 `.env` smoke：
+  - 命令：`SESSION_ID=post_shared_input_middle_slot_smoke_20260622_070000 REFERENCE_PREVIEWS=required MAX_ITERATIONS=3 MAX_MINUTES=45 bash scripts/run_real_env.sh examples/teacher_student.md`
+  - run dir：`runs/teacher-student-distillation-with-latent-residuals/post_shared_input_middle_slot_smoke_20260622_070000`
+  - 结果：`accepted=false`、3 轮、`reason="cap reached before acceptance"`；final PPTX `unzip -t` 通过。
+  - 本地 quality：`round_000 score=46/issues=5`，`round_001 score=70/issues=4`，`round_002 score=40/issues=7`，`final score=70/issues=4`。best-round 回退选择 round_001。
+- 验证结论：
+  - 上一轮 shared input middle-slot blocker 没有以相同形式复发；新的 final topology 是 teacher/student 各自有 input + encoder + latent/prediction 的双岛结构。
+  - 本地 final blocker：`teacher_input` 与 `teacher_latent` vertical crowding，`student_input` 与 `student_pred` vertical crowding，`e_residual` 穿过 `teacher_input`，`e_task_loss` 对上下对齐 endpoints 走了矩形 detour。
+  - PNG 观察确认：input 被放在 latent/prediction 下方太近，residual 虚线从 teacher latent 下穿过 teacher input；task loss 本可沿 output 的可用竖直 lane 下接，但当前绕成左侧矩形。
+- 已完成 follow-up 实现：
+  - `tests/draw_plan_tests.rs`：
+    - 新增 `model_draw_plan_polish_repairs_branch_input_output_gutters_from_smoke`，复现本次 final 的双岛 topology，断言 input/output gutter、residual 不穿 input、output-to-task-loss 不再矩形绕行。
+  - `src/tools/draw_plan.rs`：
+    - 新增 `repair_branch_input_output_gutters`：对 `input -> encoder -> output/latent` 分支，如果 input 与上方 output/latent gutter 小于阈值，则把 input 下移到 `0.060` gap。
+    - 新增后期 `reroute_branch_residual_connectors_around_inputs`：residual connector 如果穿过 branch input，最终走上方 rail，避免被后续 residual 简化回退。
+    - 扩展 `simplify_adjacent_output_loss_connectors`：上下对齐的 output-to-task-loss 边可简化为竖线，但必须先确认竖线不穿中间组件。
+    - 新增 `move_task_losses_to_clear_blocked_vertical_output_lanes`：当 output 与 task loss 上下对齐但中间有 input 阻挡时，轻微移动 task loss 到 output 内可用竖直 lane 下方，再由简化逻辑变成短直线。
+- 调试中遇到的坑：
+  - 只在早期 reroute residual 会被后续 residual 简化覆盖；已在 late residual simplification 后再次执行 branch-input reroute。
+  - 直接把上下对齐 output-to-task-loss 全部拉直会破坏已有“必须绕开 student branch”的测试；已加 intermediate-box 检查，直线穿组件时不简化。
+  - task loss lane reposition 早期执行会被 `align_task_loss_boxes_with_outputs` 拉回 output 中心；已在后期、紧挨 connector simplify 前再次执行。
+- 当前验证：
+  - `cargo test --test draw_plan_tests model_draw_plan_polish_repairs_branch_input_output_gutters_from_smoke -- --nocapture`：通过。
+  - `cargo test --test draw_plan_tests model_draw_plan_polish_routes_prediction_to_task_loss_around_student_branch -- --nocapture`：通过。
+  - `cargo test --test draw_plan_tests -- --nocapture`：通过（143/143）。
+  - `cargo fmt`：已执行。
+  - `cargo test`：全量通过。测试期间 LibreOffice 仍打印过一次非致命异常日志，但最终退出码为 0。
+  - `cd renderer && npm run build`：通过。
+  - `cargo fmt --check`：通过。
+  - `git diff --check`：通过。
+- 待完成：
+  - 验证通过后再跑真实 `.env` smoke，确认 branch input/output gutter 和 residual crossing 是否不再作为 final blocker。
+
+## 2026-06-22 post-branch-input-output smoke result
+
+- 真实 `.env` smoke：
+  - 命令：`SESSION_ID=post_branch_input_output_gutter_smoke_20260622_073000 REFERENCE_PREVIEWS=required MAX_ITERATIONS=3 MAX_MINUTES=45 bash scripts/run_real_env.sh examples/teacher_student.md`
+  - run dir：`runs/teacher-student-distillation-with-latent-residuals/post_branch_input_output_gutter_smoke_20260622_073000`
+  - 结果：`accepted=false`、3 轮、`reason="cap reached before acceptance"`；final PPTX `unzip -t` 通过。
+  - 本地 quality：`round_000 score=58/issues=5`，`round_001 score=40/issues=7`，`round_002 score=40/issues=7`，`final score=58/issues=5`。best-round 回退选择 round_000。
+- 验证结论：
+  - 上一轮 branch input/output gutter、residual crossing、task-loss vertical lane 问题没有作为 final blocker 复发；模型本轮 best round 切到另一个 Y-branch topology。
+  - 最新 final blocker：
+    - `inference_note` collapsed：note 在 student 下方很小，仍作为 component box 渲染。
+    - `input_data` 与 `student` horizontal crowding。
+    - `e_student_to_output_label` 的 “Task loss” label 覆盖 student box，且离目标 edge 太远。
+    - `e_input_to_teacher` 走到画布底部形成外侧 detour。
+  - PNG 观察：整体是 Y-branch，student/teacher 主框比早期更清晰；当前主要问题转为 label anchoring、bottom inference note component conversion、input-teacher detour 三类。
+- 当前判断：
+  - 这轮连续真实 smoke 表明本地 deterministic polish 能逐步消掉模型反复生成的具体几何失败，但模型会在下一轮生成新 topology，导致 final best round 切换到新的 blocker。
+  - 下一轮不应继续改 projectionless stack、shared-input middle slot 或 branch input/output gutter；应围绕最新 Y-branch final 写新的回归：bottom compact inference note 转 annotation、connector label snap/off-component、shared input-to-teacher detour repair。
+
+## 2026-06-22 Y-branch final blocker repair
+
+- 根因定位：
+  - 复查 `post_branch_input_output_gutter_smoke_20260622_073000/final/draw_plan.json` 与 `quality_report.json`，latest best round 已切到 Y-branch topology。旧的 branch gutter / projectionless / shared-input middle-slot 问题没有复发；新的 blocker 是 `inference_note` compact box 仍按 component 渲染、`input_data` 与 `student` 水平 gutter 只有约 3mm、`e_student_to_output_label` 被通用 annotation fallback 推离短边并覆盖 student、`e_input_to_teacher` 绕到画布底部。
+  - `inference_note` 的旧转换条件只允许 `bbox[1] >= 0.80` 的底部 note；本次 note 已在 student 下方外围但 top 是 `0.7535`，因此仍保留为 collapsed component。
+  - shared input 的 topology repair 只在 input 右缘接近/侵入 target union 时触发；本次 input 已在左侧但 gap 仍小于 paper-width 可读 gutter，所以不会再左移。
+  - `Task loss` 短 connector label 先被通用 label snap 推到无法清空的位置，再被 `place_annotation_below_component` 当成注释处理，最小宽度回到 `0.14` 并脱离 edge。
+  - `input -> teacher` 的已有 detour repair 只会尝试从 target center 进入 teacher；当 `task_output` 紧贴 teacher 左侧时，center-entry 候选会穿过 output，于是保留了底部外圈 detour。
+- 已完成实现：
+  - `tests/draw_plan_tests.rs` 新增 `model_draw_plan_polish_repairs_y_branch_label_note_and_input_detour_from_smoke`，直接复现 latest final 的 Y-branch 几何，断言：inference cue 不再是 collapsed box、input/student 有可读 gutter、Task loss label 不压 student/output 且贴近短边、input-to-teacher 不再走底部外圈。
+  - `src/tools/draw_plan.rs`：
+    - `convert_peripheral_inference_note_boxes_to_annotations` 增加“位于 student/output 下方外围且 compact/无连接/已锚定”的判定，覆盖本次 `bbox[1] = 0.7535` 的 exact `inference_note`，仍限定 `id == "inference_note"` 以避免误伤受保护 note/badge。
+    - `shared_teacher_student_input_needs_topology_repair` 增加 shared input 与 branch target 水平 gutter 检查，并把左侧候选目标 gap 从 `0.055` 提到 `0.060`，避免浮点边界和 paper-width crowding。
+    - `compact_input_context_route` 增加 target top/bottom edge dogleg candidates，使 input-to-teacher 能沿 teacher 下边缘局部绕开 adjacent output，而不是绕到画布底部。
+    - 新增 `snap_compact_task_loss_labels_near_short_output_edges`：只处理短 main->output edge 上的 compact `Task loss` label，使用更窄 label bbox 贴近 output 上沿，并保持不覆盖 component/connector。
+- 当前验证：
+  - 新增测试先红后绿：最初失败于 `inference_note` collapsed component，随后失败于 shared input gutter 和 Task loss label 脱线，修复后通过。
+  - `cargo test --test draw_plan_tests -- --nocapture` 通过（144/144）。
+- 待完成：
+  - 跑 `cargo fmt`、全量 `cargo test`、`cd renderer && npm run build`、`cargo fmt --check`、`git diff --check`。
+  - 再跑真实 `.env` smoke，确认 latest Y-branch blocker 是否消失；如果仍拒绝，只根据新的 final issue 继续定位，不回退已修复的 branch grammar。
+
+## 2026-06-22 post-Y-branch smoke and residual/output gutter repair
+
+- 真实 `.env` smoke：
+  - 命令：`SESSION_ID=post_y_branch_label_note_detour_smoke_20260622_083000 REFERENCE_PREVIEWS=required MAX_ITERATIONS=3 MAX_MINUTES=45 bash scripts/run_real_env.sh examples/teacher_student.md`
+  - run dir：`runs/teacher-student-distillation-with-latent-residuals/post_y_branch_label_note_detour_smoke_20260622_083000`
+  - 结果：`accepted=false`、3 轮、`reason="cap reached before acceptance"`；final PPTX `unzip -t` 通过。
+  - 本地 quality：`round_000 score=64/issues=4`，`round_001 score=82/issues=2`，`round_002/final score=94/issues=1`。
+- 验证结论：
+  - 上一轮修复的 `inference_note` collapsed component、`Task loss` label 压 student/脱线、`input -> teacher` 底部 detour 均没有作为 final blocker 复发。
+  - 新 final 只剩一个本地 blocker：`latent_residual_supervision` 与 `task_output` 上下相邻且水平重叠，vertical gap 只有约 1.3mm paper-width。PNG 观察确认右侧 residual supervision 和 task output 视觉上贴得太近。
+  - 根因是现有 spacing repair 覆盖 output 与 source、loss/objective 与 branch，但没有覆盖 output 与 residual/supervision hub 的上下相邻关系。
+- 已完成 follow-up 实现：
+  - `tests/draw_plan_tests.rs`：
+    - 新增 `model_draw_plan_polish_separates_residual_supervision_from_task_output_from_smoke`，复现本次 final 的 exact bbox/connector，要求 residual supervision 与 task output 至少保留 `0.055` vertical gutter，并要求 student-output route 仍紧凑且不穿 residual。
+  - `src/tools/draw_plan.rs`：
+    - 新增 `separate_outputs_from_residual_supervision_hubs`，在 output/source spacing 后运行。
+    - 该 repair 只处理 output 与 residual/supervision hub 上下相邻、水平重叠、且 gutter 小于 `0.060` 的场景；优先轻移 output，无法清空时才移动 hub。
+    - 移动后用 `reroute_connectors_touching_box_ids_orthogonally` 重建相关 connector，避免只改 bbox 后留下旧路线。
+- 当前验证：
+  - 新增测试先红后绿。
+  - `cargo test --test draw_plan_tests -- --nocapture` 通过（145/145）。
+- 待完成：
+  - 跑 `cargo fmt`、全量 `cargo test`、`cd renderer && npm run build`、`cargo fmt --check`、`git diff --check`。
+  - 再跑一次真实 `.env` smoke；如果仍未接受，以新的 final blocker 为准继续定位。
+
+## 2026-06-22 post-residual/output smoke and simple Y-branch visual balance repair
+
+- 验证补完：
+  - `cargo fmt`：通过。
+  - `cargo test`：全量通过。
+  - `cd renderer && npm run build`：通过。
+  - `cargo fmt --check`：通过。
+  - `git diff --check`：通过。
+- 真实 `.env` smoke：
+  - 命令：`SESSION_ID=post_residual_output_gutter_smoke_20260622_090000 REFERENCE_PREVIEWS=required MAX_ITERATIONS=3 MAX_MINUTES=45 bash scripts/run_real_env.sh examples/teacher_student.md`
+  - run dir：`runs/teacher-student-distillation-with-latent-residuals/post_residual_output_gutter_smoke_20260622_090000`
+  - 结果：`accepted=false`、3 轮、`reason="cap reached before acceptance"`；final PPTX `unzip -t` 通过。
+  - 本地 quality：final `score=100`、`passed=true`、`issues=[]`。说明几何 gate 已经没有 blocker；拒绝来自 vision review。
+- vision review 的新 blocker：
+  - inference note 仍在主 flow corridor 附近，不够像 compact marginal caption。
+  - teacher branch 虽然 style 字符串为 `muted_module_dashed`，但 renderer 没有把 box border 画成 dashed，实际还是实线。
+  - teacher box 宽度 `0.319`，student box 宽度 `0.240`，简单 Y-branch 视觉不平衡。
+  - `Latent Residual` box 宽度仅 `0.140`，paper-width 下显得拥挤。
+  - `student -> residual` connector 走高 U 形 detour，简单监督信号不应大幅绕行。
+- 根因定位：
+  - 本地 quality gate 主要检查 overlap/crowding/edge crossing；它不会因为 teacher 比 student 宽 33%、residual slot 偏小、branch 语义不够 muted 而失败。
+  - `renderer/src/runtime.ts::drawBox` 只根据 style 决定颜色，没有把 `style.includes("dash")` 映射到 PPTX `dashType`，导致模型/DrawPlan 的 dashed 语义没有落到最终 PPTX。
+  - 现有 `balance_multistage_teacher_student_branches` 只处理 encoder/projection/output 多阶段分支；最新 final 是单 teacher、单 student、共享 residual 的简单 Y-branch，所以没有任何尺寸平衡或 residual-slot 调整。
+  - `remove_asymmetric_branch_annotations` 曾把所有含 `student` 的 annotation 都当作不成对分支标签删除，导致合法 `Inference: student only` caption 容易丢失。
+- 已完成实现：
+  - `tests/draw_plan_tests.rs`：
+    - 新增 `model_draw_plan_polish_balances_simple_y_branch_from_vision_review_smoke`，复现本次 final 的 exact bbox/connector，断言 teacher/student 宽度平衡、teacher 保持 muted/dashed style、latent residual 可读且位于 teacher/student 之间、student-residual route 不再高 U 形、inference caption 下移到 student row 下方边注区。
+    - 该测试先红后绿；红灯首先失败于 teacher/student 宽度比例。
+  - `src/tools/draw_plan.rs`：
+    - 新增 `balance_simple_teacher_student_y_branch_layout`，只识别“单 teacher + 单 student + 共享 residual hub”的简单 Y-branch，避免接管 encoder/head/projection 多阶段拓扑。
+    - 对简单 Y-branch：压缩过宽 teacher box 到 student 宽度约 `1.08x`；把 teacher branch style 补成 muted/dashed；把 teacher-residual 边设为 dashed supervision；把窄/偏高 residual hub 扩到可读宽度并放到 teacher/student 之间的右侧槽位；重建相关 connector 的正交路线；把 inference caption 放到 student 下方紧凑边注区。
+    - 收窄 `remove_asymmetric_branch_annotations`：`Inference: student only` 在非顶边位置不再被当成普通 student 分支标签删除；顶边漂浮 inference phase label 仍会被旧测试覆盖并删除。
+    - 新增 `fold_unconnected_component_inference_notes_into_annotation` 的受控触发：只有当进入 `with_figure_plan` 时已经有 inference text annotation 或 FigurePlan 明确声明 inference annotation，才把无连接的重复 `comp_inference*` context note box 折叠回 `ann_inference`，避免破坏需要保留为 context box 的 note/badge。
+  - `renderer/src/runtime.ts`：
+    - `drawBox` 现在把 `object.style.includes("dash")` 映射为 PptxGenJS `line.dashType = "dash"`，让 DrawPlan 中的 muted/dashed teacher branch 真实反映到 editable PPTX 边框。
+- 当前验证：
+  - 新增测试先红后绿。
+  - `cargo test --test draw_plan_tests -- --nocapture`：通过（146/146）。
+  - `cargo fmt`：已执行。
+  - `cargo test`：全量通过。
+  - `cd renderer && npm run build`：通过。
+  - `cargo fmt --check`：通过。
+  - `git diff --check`：通过。
+- 待完成：
+  - 再跑真实 `.env` smoke，确认 simple Y-branch visual balance 和 dashed teacher border 是否能通过 vision review；如果仍 rejected，以新的 final review/blocker 为准继续定位。
+
+## 2026-06-22 post-simple-Y smoke and same-row teacher branch repair
+
+- 真实 `.env` smoke：
+  - 命令：`SESSION_ID=post_simple_y_branch_balance_smoke_20260622_093000 REFERENCE_PREVIEWS=required MAX_ITERATIONS=3 MAX_MINUTES=45 bash scripts/run_real_env.sh examples/teacher_student.md`
+  - run dir：`runs/teacher-student-distillation-with-latent-residuals/post_simple_y_branch_balance_smoke_20260622_093000`
+  - 结果：`accepted=false`、3 轮、`reason="cap reached before acceptance"`；final PPTX `unzip -t` 通过。
+  - 本地 quality：round_000 `score=34/issues=8`，round_001/final `score=76/issues=4`，round_002 `score=58/issues=6`。best-round 回退选择 round_001。
+- 验证结论：
+  - 上一轮 simple Y 宽度平衡和 dashed teacher border 修复有效，但模型本轮生成了新的 same-row topology：student 主框在左中，teacher 被压到右侧同一行，latent residual 作为右下 standalone hub。
+  - final 本地 blocker：
+    - `comp_task_loss` 与 `comp_output` 水平 gap 只有约 2.1mm。
+    - `ann_inference` 位于 student 和 teacher 之间的主 flow corridor。
+    - `anno_teacher_label` 的 `Frozen` annotation bbox 过大。
+    - `edge_input_to_teacher` 使用长顶部 rail detour。
+  - PNG 观察确认：teacher 与 student 同行导致 input-to-teacher 必须绕过 student；inference caption 横在 student/teacher 之间；`Frozen` 是巨大浮动文字；task loss 和 `ŷ` 在底部相互贴近。
+- 已完成 follow-up 实现：
+  - `tests/draw_plan_tests.rs`：
+    - 新增 `model_draw_plan_polish_repairs_same_row_teacher_branch_from_latest_smoke`，复现本次 final exact topology，断言 teacher 不再压在右侧同一行、task/output sibling 保留可见 gutter、inference caption 离开主 corridor、oversized `Frozen` 被删除或压缩、input-to-teacher 不再长横向 rail。
+  - `src/tools/draw_plan.rs`：
+    - `balance_simple_teacher_student_y_branch_layout` 增加 same-row teacher repair：当单 teacher 和单 student 水平分离但垂直重叠时，将 teacher 移到 student 上方并补足宽度，随后重建相关 connector。
+    - `simple_y_balanced_teacher_candidate` 现在同时处理 teacher 过宽和过窄，避免 right-edge teacher 被压得比 student 小太多。
+    - 新增 `separate_sibling_task_loss_and_output_boxes`：对同一 source 下的 task-loss/output sibling，如果非重叠但水平 gap 太小，则优先移动 output 补足 gutter 并重建 connector。
+    - 新增 `compact_oversized_short_annotations`：短 annotation（如 `Frozen`）如果 bbox 远大于文字需要，压缩并锚到最近 teacher/context；若旧清理链路直接删除该 oversized annotation，也允许，因为它同时消除 Frozen/Trained 不对称。
+    - `move_simple_y_branch_inference_caption_to_periphery` 在普通 polish 和 `with_figure_plan` 后处理末尾运行；候选顺序改为下方优先、右侧 fallback，避免能放下方的旧用例被推到侧边。
+    - `remove_line_overlapping_annotations` 不再删除 inference-specific caption；新增 `remove_inference_annotations_overlapping_other_annotations` 专门删除与其它非 inference annotation 大面积重叠的重复 inference 文本，保留可移动的 inference caption。
+- 调试中遇到的坑：
+  - 初版 final caption 兜底优先右侧，导致旧测试中本可下方放置的 `ann_inference` 被移到侧边或左侧；已改为下方优先。
+  - 初版保护所有 inference annotation 不被 line-overlap 删除，导致一个与 `Frozen / train only` 重叠的旧 inference annotation 保留；最终改为只删除与其它 annotation 重叠的 inference 文本。
+  - 初版 context note fold 把没有替代 annotation 的 `comp_inference_note` 也折叠掉，破坏 context box/badge 用例；最终只在进入 `with_figure_plan` 时已经存在 inference text annotation 或 FigurePlan 明确声明 inference annotation 的情况下才折叠重复 `comp_inference*` box。
+- 当前验证：
+  - 新增测试先红后绿。
+  - `cargo test --test draw_plan_tests -- --nocapture`：通过（147/147）。
+  - `cargo fmt`：已执行。
+  - `cargo test`：全量通过。
+  - `cd renderer && npm run build`：通过。
+  - `cargo fmt --check`：通过。
+  - `git diff --check`：通过。
+- 待完成：
+  - 再跑真实 `.env` smoke，确认 same-row teacher branch、task/output sibling gap 和 inference corridor 是否不再作为 final blocker。
+
+## 2026-06-22 post-same-row smoke and direct teacher-student branch repair
+
+- 真实 `.env` smoke：
+  - 命令：`SESSION_ID=post_same_row_teacher_branch_smoke_20260622_100000 REFERENCE_PREVIEWS=required MAX_ITERATIONS=3 MAX_MINUTES=45 bash scripts/run_real_env.sh examples/teacher_student.md`
+  - run dir：`runs/teacher-student-distillation-with-latent-residuals/post_same_row_teacher_branch_smoke_20260622_100000`
+  - 结果：`accepted=false`、`reason="cap reached before acceptance"`、final PPTX `unzip -t` 通过。
+  - 本地 quality：final `score=100`、`passed=true`、`issues=[]`，说明上一轮 same-row teacher、task/output sibling gutter 和 inference corridor 的本地 blocker 已经消失。
+- vision review 的新 blocker：
+  - standalone `Latent Residual` annotation 与 supervision connector label 重复，造成视觉噪音。
+  - 模型把 teacher 放在 student 左下方/同层附近，破坏 teacher-student supervision 的 Y-branch 阅读顺序。
+  - `Inference: student only` note 虽在 student 下方，但仍贴近 teacher 垂直空间，视觉上拥挤。
+- 根因定位：
+  - 本地 `remove_redundant_residual_supervision_labels` 主要处理 residual/supervision 语义重复，但没有通用删除“文本 annotation 与 connector label 完全同名”的情况。
+  - 上一轮 `balance_simple_teacher_student_y_branch_layout` 依赖 standalone residual hub；本次 final 没有 residual box，而是 teacher 直接连 student 并把 `Latent Residual` 写成 edge label，所以旧 simple-Y repair 不会触发。
+  - inference caption 的 periphery repair 已经把 note 放到 student 下方，但当 teacher 仍在 student 左下方时，note 无法摆脱 teacher 垂直空间；真正根因是 direct teacher-student supervision branch 没有先恢复 teacher-above-student 的语义布局。
+- 已完成 follow-up 实现：
+  - `tests/draw_plan_tests.rs`：
+    - 新增 `model_draw_plan_polish_repairs_direct_teacher_student_residual_label_from_vision_smoke`，复现本次 final exact topology，断言重复 standalone `residual_label` 被删除、direct teacher-student supervision branch 将 teacher 放到 student 上方、inference note 与 teacher 保持可见分离。
+    - 该测试先红后绿；红灯首先失败于 standalone `residual_label` 未删除。
+  - `src/tools/draw_plan.rs`：
+    - 新增 `remove_duplicate_connector_label_annotations`，收集 connector label 的 normalized phrase，删除同名普通 text annotation；排除 inference-specific caption，避免误删学生推理说明。
+    - 新增 `balance_direct_teacher_student_supervision_branches`，识别 teacher -> student 直连且 edge style/label 表示 supervision/residual 的拓扑；若 teacher 与 student 垂直重叠、同层或在 student 下方，则把 teacher 移到 student 上方，并补 `muted/dashed` teacher style、重建相关 connector。
+    - 该 repair 独立于 standalone residual hub，只处理 direct supervision edge，避免接管 multi-stage encoder/head/projection 布局。
+- 当前验证：
+  - `cargo test --test draw_plan_tests model_draw_plan_polish_repairs_direct_teacher_student_residual_label_from_vision_smoke -- --nocapture`：通过。
+  - `cargo test --test draw_plan_tests -- --nocapture`：通过（148/148）。
+  - `cargo fmt`：已执行。
+  - `cargo test`：全量通过。
+  - `cd renderer && npm run build`：通过。
+- 待完成：
+  - 跑 `cargo fmt --check`、`git diff --check`。
+  - 再跑真实 `.env` smoke，确认 duplicate residual label 与 direct teacher-student branch 顺序是否不再作为 final blocker；如果仍未 accepted，只根据新的 final blocker 继续定位。
+
+## 2026-06-22 post-direct-branch smoke and training-only annotation repair
+
+- 真实 `.env` smoke：
+  - 命令：`SESSION_ID=post_direct_teacher_branch_vision_smoke_20260622_103000 REFERENCE_PREVIEWS=required MAX_ITERATIONS=3 MAX_MINUTES=45 bash scripts/run_real_env.sh examples/teacher_student.md`
+  - run dir：`runs/teacher-student-distillation-with-latent-residuals/post_direct_teacher_branch_vision_smoke_20260622_103000`
+  - 结果：`accepted=false`、3 轮、`reason="cap reached before acceptance"`；final PPTX `unzip -t` 通过。
+  - 本地 quality：final `score=94`、`passed=false`、唯一 issue 是 `annotation_excessive_whitespace`，target `ann_training_only`。
+- 验证结论：
+  - 上一轮 direct teacher-student branch 的三个 vision blocker 没有作为 final blocker 复发：duplicate `Latent Residual` label、teacher/student direct supervision 顺序、inference note 贴 teacher 的问题都已消失。
+  - 新的唯一 blocker 是 `ann_training_only` 被 FigurePlan 以 `[0.625, 0.7125, 1.0, 1.0]` 回填到右下角大框，文本只有 `training only`。
+- 根因定位：
+  - `polish_model_draw_plan_geometry_inner` 内部已经有 `compact_oversized_short_annotations`，但 `polish_model_draw_plan_geometry_with_figure_plan` 会在 inner polish 之后调用 `upsert_meaningful_annotations_from_figure_plan`。
+  - `upsert_meaningful_annotations_from_figure_plan` 对非 inference annotation 直接保留 FigurePlan bbox；`ann_training_only` 因此在最后阶段被重新放大，后续没有再次压缩。
+  - `short_annotation_anchor_bbox` 只把 `frozen`/`teacher` 归到 teacher/context anchor；`training only` 即使进入压缩，也可能退化为最近组件而非 teacher branch。
+- 已完成 follow-up 实现：
+  - `tests/draw_plan_tests.rs`：
+    - 新增 `model_draw_plan_polish_compacts_training_only_annotation_from_latest_smoke`，用 latest final 的 DrawPlan + FigurePlan annotation 复现 `with_figure_plan` 路径；旧实现红灯，`ann_training_only` 保持 `[0.625, 0.7125, 1.0, 1.0]`。
+  - `src/tools/draw_plan.rs`：
+    - 在 `polish_model_draw_plan_geometry_with_figure_plan` 的 FigurePlan annotation 回填和 annotation/inference 移动后，再执行一次 `compact_oversized_short_annotations`。
+    - `short_annotation_anchor_bbox` 将 `training`/`train` annotation 归到 teacher/context branch，避免短注释锚到 student 或 output。
+- 当前验证：
+  - 新增测试先红后绿。
+  - `cargo test --test draw_plan_tests -- --nocapture`：通过（149/149）。
+  - `cargo fmt`：已执行。
+  - `cargo test`：全量通过。
+  - `cd renderer && npm run build`：通过。
+  - `cargo fmt --check`：通过。
+  - `git diff --check`：通过。
+- 待完成：
+  - 再跑真实 `.env` smoke，确认 `annotation_excessive_whitespace` 不再作为 final blocker；如果还没 accepted，继续只针对新的 final blocker 做 TDD 修复。
+
+## 2026-06-22 post-training-annotation smoke and two-stage branch repair
+
+- 真实 `.env` smoke：
+  - 命令：`SESSION_ID=post_training_annotation_compact_smoke_20260622_110000 REFERENCE_PREVIEWS=required MAX_ITERATIONS=3 MAX_MINUTES=45 bash scripts/run_real_env.sh examples/teacher_student.md`
+  - run dir：`runs/teacher-student-distillation-with-latent-residuals/post_training_annotation_compact_smoke_20260622_110000`
+  - 结果：`accepted=false`、3 轮、`reason="cap reached before acceptance"`；final PPTX `unzip -t` 通过。
+  - `ann_training_only` 已不再出现，上一轮 annotation excessive whitespace blocker 消失。
+- 新 final blocker：
+  - best round 切到新的 two-stage teacher/student topology：student encoder/head 在左侧，teacher encoder/head 在右侧，task loss 和 residual alignment 都在上方。
+  - 本地 quality：`score=64`、6 个 issue，包括 student encoder/head vertical crowding、student encoder/task loss crowding、task loss/residual horizontal crowding、`ann_inference` 贴近 `edge_input_to_teacher`、`edge_teacher_to_residual_label` 脱线、`edge_input_to_teacher` 底部长绕线。
+  - PNG 观察确认：student stack 竖向挤压，input-to-teacher 走底部超长 rail，`r = h_t - h_s` 被放到画布底部，`ŷ` label 浮在 unrelated whitespace。
+- 根因定位：
+  - 现有 `repair_projectionless_multistage_teacher_student_layout` 覆盖的是 encoder/latent/head 三段或同列 projectionless 结构；本次只有 encoder/head 两段，且 teacher/student 左右分支，因此未进入旧 repair。
+  - 通用 `repair_outer_input_context_detours` 会在后期把 input-to-teacher 又改回底部 rail；因此两阶段专用 reroute 需要在 polish 尾部再运行一次。
+  - Connector label snap 在短 residual/task-loss objective edge 上找不到清晰位置时，会退化到远处；这类 label 更适合删除或折入 objective box，而不是作为远离 edge 的 floating label。
+- 已完成 follow-up 实现：
+  - `tests/draw_plan_tests.rs`：
+    - 新增 `model_draw_plan_polish_repairs_two_stage_branch_crowding_from_latest_smoke`，复现 final exact DrawPlan，断言 student encoder/head gutter、task loss 与 student/residual 分离、input-to-teacher 不保留底部 rail、inference caption 远离该 edge、脱线 objective labels 被移除或贴回 route。
+  - `src/tools/draw_plan.rs`：
+    - 新增 `repair_two_stage_teacher_student_branch_layout`，仅在同时找到 `student encoder/head` 与 `teacher encoder/head` 的两阶段结构时触发。
+    - 对该结构：压缩 student encoder 给 student head 留出竖向 gutter；压缩过高 teacher encoder；将 task loss 放到 student head 下方；把 inference caption 移到 student/task-loss periphery；重走 input-to-teacher 局部路线；对明显脱离 route 或冗余的 objective connector labels 执行删除。
+    - 在 multistage balance 后运行一次，并在 polish 尾部再运行一次，覆盖后续通用 detour repair 的副作用。
+- 当前验证：
+  - 新增测试先红后绿。
+  - `cargo test --test draw_plan_tests -- --nocapture`：通过（150/150）。
+  - `cargo fmt`：已执行。
+  - `cargo test`：全量通过。
+  - `cd renderer && npm run build`：通过。
+  - `cargo fmt --check`：通过。
+  - `git diff --check`：通过。
+- 待完成：
+  - 再跑真实 `.env` smoke，确认 two-stage branch crowding、bottom rail 和 detached labels 是否不再作为 final blocker。
+
+## 2026-06-22 post-two-stage smoke and prediction/residual bottom-edge repair
+
+- 真实 `.env` smoke：
+  - 命令：`SESSION_ID=post_two_stage_branch_repair_smoke_20260622_113000 REFERENCE_PREVIEWS=required MAX_ITERATIONS=3 MAX_MINUTES=45 bash scripts/run_real_env.sh examples/teacher_student.md`
+  - run dir：`runs/teacher-student-distillation-with-latent-residuals/post_two_stage_branch_repair_smoke_20260622_113000`
+  - 结果：`accepted=false`、3 轮、`reason="cap reached before acceptance"`；final PPTX `unzip -t` 通过。
+  - 上一轮 two-stage branch 本地 blocker 已不再作为 final issue；新的 final topology 是 simple teacher/student + residual hub + prediction output。
+- 新 final blocker：
+  - 本地 quality：`score=82`、2 个 issue：`prediction` 对单字符 `ŷ` 仍然过高；`e_residual_student` 竖向虚线穿过 non-endpoint `prediction`。
+  - vision 额外指出 `task_loss_obj` 贴到画布底边并被裁切，`ann_inference` 也在底边附近，且 final best round 使用 `deterministic_fallback`。
+- 根因定位：
+  - `compact_tall_output_boxes_for_short_labels` 能压缩大多数短 output，但后续 residual/output 路由组合仍可能留下 residual feedback 穿过刚压缩前后的 prediction badge。
+  - `normalize_draw_plan_bounds` 允许 bbox 到 `1.0`，但真实 paper preview 会让底边 task loss/inference 看起来被裁切；需要更严格的 bottom safe-area repair。
+- 已完成 follow-up 实现：
+  - `tests/draw_plan_tests.rs`：
+    - 新增 `model_draw_plan_polish_compacts_prediction_and_routes_residual_from_latest_smoke`，复现 final exact DrawPlan，断言单字符 prediction 被压缩、residual-to-student connector 不穿 prediction、task loss 和 inference caption 不贴底边。
+  - `src/tools/draw_plan.rs`：
+    - 新增 `move_bottom_edge_objectives_and_inference_notes_inside_safe_area`，把底边 task loss 上移到 `0.94` safe area 内，并把底边 inference caption 优先移到 student 上方/侧边清晰位置。
+    - 该 repair 在 polish 尾部运行，覆盖后续 layout normalize 之前的最终安全区约束。
+- 当前验证：
+  - 新增测试先红后绿。
+  - `cargo test --test draw_plan_tests -- --nocapture`：通过（151/151）。
+  - `cargo fmt`：已执行。
+  - `cargo test`：全量通过；期间 LibreOffice 打印一次历史上见过的非致命异常日志，但最终退出码为 0。
+  - `cd renderer && npm run build`：通过。
+  - `cargo fmt --check`：通过。
+  - `git diff --check`：通过。
+- 待完成：
+  - 再跑真实 `.env` smoke，确认 prediction/residual crossing 与 bottom-edge clipping 是否消失；若仍未 accepted，以新的 final blocker 为准继续迭代。
+
+## 2026-06-22 post-prediction smoke panic and clamp repair
+
+- 真实 `.env` smoke：
+  - 命令：`SESSION_ID=post_prediction_residual_bottom_smoke_20260622_120000 REFERENCE_PREVIEWS=required MAX_ITERATIONS=3 MAX_MINUTES=45 bash scripts/run_real_env.sh examples/teacher_student.md`
+  - 结果：进程退出码 `101`；panic 信息为 `min > max, or either was NaN. min = 0.1, max = 0.09999999999999998`。
+  - 该 run 只写出 `round_000/figure_plan.json` 和 setup artifacts，没有生成可用 final PPTX。
+- 根因定位：
+  - `reroute_two_stage_student_task_loss` 里对极窄 `student_head` 使用了 `center_x(task_loss.bbox).clamp(student_head.bbox[0] + 0.015, student_head.bbox[2] - 0.015)`。
+  - 当模型或 fallback 把 `student_head` 压到约 `0.03` 宽时，下界会大于上界；Rust `f64::clamp` 对这种输入会直接 panic。
+  - 单轮 debug smoke 没有复现，说明这是模型路径/布局随机性触发的窄框边界条件；因此需要用最小回归测试锁住。
+- 已完成修复：
+  - `src/tools/draw_plan.rs`：
+    - 在 `reroute_two_stage_student_task_loss` 中显式检查 `min_x <= max_x`；若窄框导致范围非法，则使用 `center_x(student_head.bbox)` 作为竖向路由 x 坐标。
+    - 这个分支只处理异常窄框，不改变正常宽度下的路由策略。
+  - `tests/draw_plan_tests.rs`：
+    - 新增 `model_draw_plan_polish_handles_narrow_two_stage_student_head_without_clamp_panic`，构造宽度约 `0.03` 的 `student_head`，确保 polish 不再 panic。
+- 当前验证：
+  - `cargo test --test draw_plan_tests model_draw_plan_polish_handles_narrow_two_stage_student_head_without_clamp_panic -- --nocapture`：通过。
+  - `cargo test --test draw_plan_tests model_draw_plan_polish_compacts_prediction_and_routes_residual_from_latest_smoke -- --nocapture`：通过。
+  - `cargo test --test draw_plan_tests -- --nocapture`：通过（152/152）。
+  - `cargo fmt`：通过。
+  - `cargo test`：全量通过。
+  - `cd renderer && npm run build`：通过。
+  - `cargo fmt --check`：通过。
+  - `git diff --check`：通过。
+- 待完成：
+  - 重新跑真实 `.env` smoke，确认 panic 已消失，并检查 prediction/residual/bottom-edge 修复后的新 final blocker。
+
+## 2026-06-22 post-clamp smoke and right-side loss/output corridor repair
+
+- 真实 `.env` smoke：
+  - 命令：`SESSION_ID=post_clamp_panic_fix_smoke_20260622_121500 REFERENCE_PREVIEWS=required MAX_ITERATIONS=3 MAX_MINUTES=45 bash scripts/run_real_env.sh examples/teacher_student.md`
+  - run dir：`runs/teacher-student-distillation-with-latent-residuals/post_clamp_panic_fix_smoke_20260622_121500`
+  - 结果：`accepted=false`、3 轮、`reason="cap reached before acceptance"`；没有复现 `f64::clamp` panic。
+  - final PPTX `unzip -t` 通过；`renderer_status.json` 为 `source="model_generated_code"`、`used_fallback=false`。
+- 新 final blocker：
+  - 本地 quality：`score=94`、唯一 issue 是 `component_crowding`，target `task_loss_obj` 与 `output_pred`，横向 gap 只有约 `1.0mm`。
+  - vision review 还指出同一局部：`e_residual_supervise`、`e_task_supervise` 和 student/output corridor 聚在 student 右侧，`ann_inference` 停在 student 正下方主图区。
+- 根因定位：
+  - 旧 `separate_sibling_task_loss_and_output_boxes` 只处理同一 source 发出的 task-loss/output sibling；本次 `output_pred` 是 `student -> output`，而 task loss 是 `task_loss -> student` 的反向 supervision 源，因此不属于 sibling pair。
+  - 前面的通用 align/compact 会把 output 调整到更贴近 student 的水平线上；如果 repair 过早运行，后续仍可能把局部间距打回去，所以需要在 polish 尾部再做一次局部安全检查。
+- 已完成 follow-up 实现：
+  - `tests/draw_plan_tests.rs`：
+    - 新增 `model_draw_plan_polish_separates_right_side_task_loss_output_and_inference_from_latest_smoke`，用 latest final exact bbox/connector 复现 loss/output 1mm crowding 和 inference corridor 问题。
+    - 该测试先红后绿；红灯首先失败于 `task_loss_obj` 与 `output_pred` 仍然过近。
+  - `src/tools/draw_plan.rs`：
+    - 新增 `separate_right_side_task_loss_output_and_inference_corridor`，在 polish 尾部识别 `main/student -> output` 且同一 main/student 还连着 task-loss supervision box 的右侧局部模式。
+    - 当 task loss 与 output 横向 gap 小且纵向重叠/近邻时，优先把 task loss 移到 output 左下方的 supervision column，并重走被移动 box 的 connectors。
+    - 对同一局部中的 `Inference: student only` annotation，如果停在 student 正下方主图区，则移到右下外侧紧凑位置，避免遮挡主 flow corridor。
+    - 所有新坐标 clamp 都先判断范围合法，避免再次触发 `min > max` panic。
+- 当前验证：
+  - `cargo test --test draw_plan_tests model_draw_plan_polish_separates_right_side_task_loss_output_and_inference_from_latest_smoke -- --nocapture`：先红后绿。
+  - `cargo test --test draw_plan_tests -- --nocapture`：通过（153/153）。
+  - `cargo fmt`：通过。
+  - `cargo test`：全量通过。
+  - `cd renderer && npm run build`：通过。
+  - `cargo fmt --check`：通过。
+  - `git diff --check`：通过。
+- 待完成：
+  - 再跑真实 `.env` smoke，确认 right-side loss/output crowding 和 inference corridor 是否不再作为 final blocker。
+
+## 2026-06-22 post-right-side repair smoke and left-teacher crossing topology repair
+
+- 真实 `.env` smoke：
+  - 命令：`SESSION_ID=post_right_side_loss_output_corridor_smoke_20260622_130000 REFERENCE_PREVIEWS=required MAX_ITERATIONS=3 MAX_MINUTES=45 bash scripts/run_real_env.sh examples/teacher_student.md`
+  - run dir：`runs/teacher-student-distillation-with-latent-residuals/post_right_side_loss_output_corridor_smoke_20260622_130000`
+  - 结果：`accepted=false`、3 轮、`reason="cap reached before acceptance"`；final PPTX `unzip -t` 通过；`renderer_status.json` 为 `source="model_generated_code"`、`used_fallback=false`。
+  - 上一轮 right-side `task_loss_obj`/`output_pred` 1mm crowding 没有作为 final issue 复发。
+- 新 final blocker：
+  - best round 为 round_001，quality `score=58`。
+  - 本地 issues：`ann_inference` 贴近 `edge_student_to_output`，`edge_input_to_student` 和 `edge_student_to_output` 过度绕线，`edge_input_to_student` 与 `edge_teacher_to_latent` crossing，`edge_student_to_output` 与 `edge_teacher_to_objective` crossing。
+  - PNG 观察确认：teacher 被模型放到左下角，student 在中间，latent/objective 在右侧；多条边被迫走大矩形绕线并交叉。
+- 根因定位：
+  - 现有 simple Y branch repair 只识别 teacher/student 共享 residual hub 的模式；本次 FigurePlan 是 teacher -> latent -> combined objective，同时 student -> objective/output，因此旧 simple-Y 条件不会触发。
+  - 通用 crossing reroute 只能尝试改线；但 student-output 的直接竖线会和 teacher-objective 的长横线交叉，必须先恢复 teacher/student peer branch 几何，再重走相关 connector。
+- 已完成 follow-up 实现：
+  - `tests/draw_plan_tests.rs`：
+    - 新增 `model_draw_plan_polish_repairs_left_teacher_crossing_objective_topology_from_latest_smoke`，复现 latest final exact topology。
+    - 断言 teacher 回到 student 上方 peer branch、`input->student` 与 `teacher->latent` 不交叉、`student->output` 变成短竖线、`student->output` 与 `teacher->objective` 不交叉、inference annotation 离开 output edge。
+  - `src/tools/draw_plan.rs`：
+    - 新增 `repair_left_teacher_central_student_objective_topology`，只在 teacher/context box 位于 student 左侧且同层/更低，并且存在 `input->student`、`student->output`、`teacher->latent`、student/teacher objective 边时触发。
+    - 将 teacher 移到 student 上方并做宽度 peer-balance，保留 muted/dashed teacher 视觉语义。
+    - 对该局部重走：`input->student` 低位 L 形、`input->teacher` 短水平、`student->output` 直接竖线、`teacher->latent` 短正交、`teacher->objective` 右侧外绕线，避免与主输出边交叉。
+    - 将同局部 inference annotation 移到右下外侧，避免压在 `student->output` edge 上。
+- 当前验证：
+  - 新增测试先红后绿。
+  - `cargo test --test draw_plan_tests -- --nocapture`：通过（154/154）。
+  - `cargo fmt`：通过。
+  - `cargo test`：全量通过。
+  - `cd renderer && npm run build`：通过。
+  - `cargo fmt --check`：通过。
+  - `git diff --check`：通过。
+- 待完成：
+  - 再跑真实 `.env` smoke，确认 left-teacher/crossing topology 是否不再作为 final blocker。
+
+## 2026-06-22 post-left-teacher repair smoke and teacher-alignment stair-step repair
+
+- 真实 `.env` smoke：
+  - 命令：`SESSION_ID=post_left_teacher_crossing_repair_smoke_20260622_140000 REFERENCE_PREVIEWS=required MAX_ITERATIONS=3 MAX_MINUTES=45 bash scripts/run_real_env.sh examples/teacher_student.md`
+  - run dir：`runs/teacher-student-distillation-with-latent-residuals/post_left_teacher_crossing_repair_smoke_20260622_140000`
+  - 结果：`accepted=false`、3 轮、`reason="cap reached before acceptance"`；final PPTX `unzip -t` 通过；`renderer_status.json` 为 `source="model_generated_code"`、`used_fallback=false`。
+  - 本地 quality：final 选择 round_001，`score=100`、`passed=true`、`issues=[]`。说明上一轮 left-teacher/crossing blocker 已被 geometry gate 消掉。
+- vision blocker：
+  - 唯一 blocking issue 是 `e_teacher_align` 使用 5 段 stair-step route：teacher 右边先下到 `y≈0.581`，再右、再上到 alignment center，形成不必要的阶梯。
+  - 同时 `h_t` label 漂在 whitespace，离 dashed route 不够近。
+- 根因定位：
+  - 现有 `straighten_residual_alignment_rails` 主要处理 objective/residual 到 main box 的 rail；本次是 teacher/context -> alignment objective，且 target 不是 main，因此旧函数不会处理。
+  - 不能把所有 teacher->residual connector 都简化，否则会误伤旧的 latent residual crossing repair；触发条件必须要求 target 是 `alignment` 节点。
+- 已完成 follow-up 实现：
+  - `tests/draw_plan_tests.rs`：
+    - 新增 `model_draw_plan_polish_simplifies_teacher_alignment_stair_step_from_latest_smoke`，复现 round_001 final 的 `e_teacher_align` 5 点 stair-step 和 `h_t` label。
+    - 初版实现误伤 `model_draw_plan_polish_unmerges_task_loss_and_reroutes_residual_crossing_from_smoke`；已收窄触发条件并保留该旧测试。
+  - `src/tools/draw_plan.rs`：
+    - 新增 `simplify_teacher_alignment_stair_step_connectors`，只处理 teacher/context -> residual/alignment objective，且 target 文本/role/id 必须包含 `align`，当前 route 点数过多或存在短 jog 时触发。
+    - 将 route 简化为 teacher 右侧到中间 x、竖到 alignment center y、再横到 alignment 左侧的 3 段正交路线。
+    - 将 label 重新贴到 elbow/竖线附近，避免 `h_t` 漂浮。
+- 当前验证：
+  - 新增目标测试先红后绿。
+  - 误伤回归测试 `model_draw_plan_polish_unmerges_task_loss_and_reroutes_residual_crossing_from_smoke`：通过。
+  - `cargo test --test draw_plan_tests -- --nocapture`：通过（155/155）。
+  - `cargo fmt`：通过。
+  - `cargo test`：全量通过。
+  - `cd renderer && npm run build`：通过。
+  - `cargo fmt --check`：通过。
+  - `git diff --check`：通过。
+- 待完成：
+  - 再跑真实 `.env` smoke，确认 teacher-alignment stair-step 是否不再被 vision reviewer 拒绝。
+
+## 2026-06-22 post-teacher-align stair-step smoke and remaining projector topology blocker
+
+- 真实 `.env` smoke：
+  - 命令：`SESSION_ID=post_teacher_align_stair_step_smoke_20260622_143000 REFERENCE_PREVIEWS=required MAX_ITERATIONS=3 MAX_MINUTES=45 bash scripts/run_real_env.sh examples/teacher_student.md`
+  - run dir：`runs/teacher-student-distillation-with-latent-residuals/post_teacher_align_stair_step_smoke_20260622_143000`
+  - 结果：`accepted=false`、3 轮、`reason="cap reached before acceptance"`；final PPTX `unzip -t` 通过；`renderer_status.json` 为 `source="model_generated_code"`、`used_fallback=false`。
+  - 上一轮 `e_teacher_align` 5 段 stair-step blocker 没有作为 final blocker 复发。
+- 当前剩余 blocker：
+  - final quality `score=58`、`passed=false`。
+  - 新 topology 是 projector/encoder 多阶段分支：`student_proj`、`teacher_proj` 被模型生成成巨大容器，`teacher_proj` 与 `teacher_enc` 重叠，`inference_note` 位于 teacher/student corridor，`e_input_teacher` 绕到底部再进 teacher。
+  - 这不是 teacher-alignment stair-step 的回归，而是新的 multistage projector/encoder layout 失败。
+- 结论：
+  - 已完成的局部 repairs 对各自 smoke blocker 有效，并且基础验证通过。
+  - 下一步应新增一个针对 multistage projector/encoder pair 的末端 repair：压缩过大的 projector/encoder box、消除同分支 overlap、把 inference note 移到 student periphery，并将 `input -> teacher` 改成局部直连/短 L 形。
+
+## 2026-06-22 multistage projector/encoder overlap repair
+
+- 用户目标：
+  - 继续执行上一节计划，针对 latest real smoke 中 projector/encoder 巨框、重叠、inference note 卡在 corridor、`input -> teacher` 底部绕线的问题做实际修复。
+- TDD 过程：
+  - 在 `tests/draw_plan_tests.rs` 新增 `model_draw_plan_polish_repairs_projector_encoder_overlap_from_latest_smoke`，用 `post_teacher_align_stair_step_smoke_20260622_143000` final 的 exact `DrawPlan` 复现问题。
+  - 初次运行目标测试先因缺少测试 helper `box_height_for_test` 编译失败；补齐 helper 后，测试红灯失败于 `teacher_proj` 仍是宽 `0.36` 的巨大空框，证明旧实现确实没有覆盖该行为。
+- 根因定位：
+  - 旧 `balance_multistage_teacher_student_stage_sizes` 只比较 teacher/student 同阶段之间的高度差；如果两个 projector 同样巨大，或者 teacher projector 与 teacher encoder 同分支重叠，它不会触发。
+  - 旧 `repair_two_stage_teacher_student_branch_layout` 只识别 encoder/head 两阶段，不覆盖 encoder/projector/output 三阶段。
+  - 旧 inference note repairs 主要看注释是否离 student/output 足够近；本次 note 处在 teacher/student 中间 corridor，但仍可能被视为“附近”，所以需要在该 topology repair 之后强制移到 student periphery。
+- 已完成实现：
+  - `src/tools/draw_plan.rs`：
+    - 新增 `repair_multistage_projector_encoder_overlap_layout`，在两个 polish 入口末端调用，位于 teacher-alignment stair-step repair 之后、normalize 之前。
+    - 触发条件基于结构和几何：必须存在 multistage teacher/student encoder + projector pair，且 projector 位于 encoder 上方或与 encoder 重叠，并出现过大 box、同分支 overlap/gutter 不足，或 `input -> teacher` 有外部绕路。
+    - 将 encoder/projector 重新压缩为紧凑竖向 stack：projector 高度上限 `0.16`、宽度上限 `0.22`，encoder 高度上限 `0.18`、宽度上限 `0.22`，保留 teacher/student 分支中心而不是套死模板。
+    - 把 `Inference: student only` 类 Text 移到 student encoder 下方或左侧 periphery，避免停在 teacher/student corridor。
+    - 将 multistage `input -> teacher` 的底部外绕线路径改为局部三点路径，并避免向左越过 `x < 0.10`。
+    - 修复过程中发现两个回归风险：`f64::clamp(min > max)` 和误伤“teacher encoder 在上、projector 在下”的旧 stacked teacher fixture；已通过 `min_encoder_bottom > 0.94` 提前返回、detour x 手动边界检查、以及触发条件要求 projector 在 encoder 上方/重叠来收窄影响面。
+- 当前验证：
+  - `cargo test --test draw_plan_tests model_draw_plan_polish_repairs_projector_encoder_overlap_from_latest_smoke -- --nocapture`：先红后绿。
+  - 回归点测：
+    - `model_draw_plan_polish_repairs_stacked_teacher_residual_smoke_layout`：通过。
+    - `model_draw_plan_polish_moves_task_loss_label_off_head_and_edge_from_smoke`：通过。
+    - `model_draw_plan_polish_balances_multistage_teacher_student_branches_from_latest_smoke`：通过。
+  - `cargo test --test draw_plan_tests -- --nocapture`：通过（156/156）。
+  - `cargo fmt`：通过。
+  - `cargo test`：全量通过。
+  - `cd renderer && npm run build`：通过。
+  - `cargo fmt --check`：通过。
+  - `git diff --check`：通过。
+- 待完成：
+  - 重新跑真实 `.env` smoke，确认 projector/encoder blocker 是否消失，并检查下一轮 final blocker。
+
+## 2026-06-22 post-projector repair smoke and two-stage route repair
+
+- 真实 `.env` smoke：
+  - 命令：`SESSION_ID=post_projector_encoder_overlap_repair_smoke_20260622_151500 REFERENCE_PREVIEWS=required MAX_ITERATIONS=3 MAX_MINUTES=45 bash scripts/run_real_env.sh examples/teacher_student.md`
+  - run dir：`runs/teacher-student-distillation-with-latent-residuals/post_projector_encoder_overlap_repair_smoke_20260622_151500`
+  - 结果：`accepted=false`、3 轮、`reason="cap reached before acceptance"`；final PPTX `unzip -t` 通过；`renderer_status.json` 为 `source="model_generated_code"`、`used_fallback=false`。
+  - 上一轮 projector/encoder 巨框、teacher projector overlap blocker 没有作为 final issue 复发。
+- 新 final blocker：
+  - final quality `score=46`、`passed=false`。
+  - 本地 issues：`teacher_out` 对短标签过大，`latent_residual` 太窄/塌缩，`inference_note` 太小/在主 flow corridor，`e_student_head_out` 与 `e_task_to_student` 绕线，`e_student_head_out` 与 `e_residual_to_student` crossing。
+  - PNG 观察确认：左侧 student encoder/head 被蓝色 task feedback 大 U 形线包住；`student_head -> student_out` 绕到右侧再上去；`residual -> student` 贴着 student encoder 边并与 output route 交叉；`input -> teacher` 仍是底部长 rail。
+- 根因定位：
+  - 现有 `repair_two_stage_teacher_student_branch_layout` 只处理 encoder/head 间距、teacher encoder 高度、少量 task-loss crowding；它没有处理“output 在 head 上方”的直接竖线、task-loss feedback 大外绕线、residual-to-student 贴边穿框、或 residual equation box 的 paper-width 读数问题。
+  - `move_two_stage_inference_caption_to_periphery` 只处理 Text annotation，且旧候选会把 note 放在 input-to-teacher 水平线附近；本次 final 的 `inference_note` 是 Box，后续又会被折叠成 `ann_inference`，因此移动逻辑必须同时覆盖 Box/Text。
+- 已完成 follow-up 实现：
+  - `tests/draw_plan_tests.rs`：
+    - 新增 `model_draw_plan_polish_repairs_two_stage_head_output_and_feedback_routes_from_latest_smoke`，用本次 final exact `DrawPlan` 复现二阶段 blocker。
+    - 断言 residual box 宽/高足够、inference note 离开 student-residual corridor、`student_head -> output` 为直接竖线、`task_loss -> student` 不再左上大绕线、`residual -> student` 不穿 student encoder 且不再与 output route crossing。
+  - `src/tools/draw_plan.rs`：
+    - 扩展 `repair_two_stage_teacher_student_branch_layout`，新增 `repair_two_stage_head_output_and_feedback_routes`。
+    - 对 residual/equation loss box 做局部宽高扩展，避免 13.1pt paper-width 下塌缩。
+    - 对 teacher tiny output 做局部收紧，减少短标签大空框。
+    - 将 Box 或 Text 形式的 inference note 移到 student stack 右下 periphery，并把候选位置下移到离 input-teacher route 有可见间距。
+    - 将 `student_head -> output` 改成直接竖线；将 `task_loss -> student_enc` 改成 student 右侧局部 route；将 `latent_residual -> student_enc` 改成 student 右侧外侧 route，避免穿框和交叉。
+- 当前验证：
+  - 新增目标测试先红后绿。
+  - 回归点测 `model_draw_plan_polish_repairs_two_stage_branch_crowding_from_latest_smoke`：通过。
+  - `cargo test --test draw_plan_tests -- --nocapture`：通过（157/157）。
+  - `cargo fmt`：通过。
+  - `cargo test`：全量通过。
+  - `cd renderer && npm run build`：通过。
+  - `cargo fmt --check`：通过。
+  - `git diff --check`：通过。
+- 待完成：
+  - 再跑真实 `.env` smoke，确认 two-stage head/output/feedback blocker 是否消失，并检查下一轮 final blocker。
+
+## 2026-06-22 smoke retry schema compatibility fix
+
+- 真实 `.env` smoke 尝试：
+  - 命令：`SESSION_ID=post_two_stage_route_repair_smoke_20260622_154500 REFERENCE_PREVIEWS=required MAX_ITERATIONS=3 MAX_MINUTES=45 bash scripts/run_real_env.sh examples/teacher_student.md`
+  - 结果：失败于 reasoner 输出 schema 兼容性，尚未进入绘图/渲染阶段。
+  - 错误：`reading_order` 返回了 `bottom_to_top`，而旧 `ReadingOrder` 只接受 `left_to_right` / `top_to_bottom`。
+- 根因定位：
+  - 这是模型输出容错缺口，不是二阶段几何修复失败。语义上 `bottom_to_top` 属于纵向阅读顺序，可以安全归一到 `top_to_bottom`。
+- 已完成实现：
+  - `tests/schema_tests.rs`：新增 `figure_plan_accepts_bottom_to_top_reading_order_alias_from_model`，先红后绿。
+  - `src/schema.rs`：给 `ReadingOrder::TopToBottom` 添加 serde alias `bottom_to_top`。
+- 当前验证：
+  - `cargo test --test schema_tests figure_plan_accepts_bottom_to_top_reading_order_alias_from_model -- --nocapture`：先红后绿。
+  - `cargo fmt`：通过。
+  - `cargo test`：全量通过。
+  - `cd renderer && npm run build`：通过。
+  - `cargo fmt --check`：通过。
+  - `git diff --check`：通过。
+- 待完成：
+  - 重新跑真实 `.env` smoke。
+
+## 2026-06-22 post-two-stage smoke final-pass corridor and duplicate-note repair
+
+- 真实 `.env` smoke：
+  - 命令：`SESSION_ID=post_two_stage_route_repair_smoke_20260622_160000 REFERENCE_PREVIEWS=required MAX_ITERATIONS=3 MAX_MINUTES=45 bash scripts/run_real_env.sh examples/teacher_student.md`
+  - 结果：`accepted=false`、3 轮、`reason="cap reached before acceptance"`；final PPTX `unzip -t` 通过；`renderer_status.json` 为 `source="model_generated_code"`、`used_fallback=false`。
+  - 上一轮二阶段 blocker 已明显改善：final quality 从 `46` 提升到 `94`；`student_head_out`/residual crossing/collapsed residual 等 issues 不再复发。
+- 新 final blocker：
+  - 本地唯一 issue：`task_loss_in_branch_corridor`，target `task_loss`, `teacher_model`, `student_model`。
+  - vision blocker 还指出 `inference_note` 与 `ann_inference` 几乎同 bbox 重叠，造成 double-printed text。
+- 根因定位：
+  - 早期 `move_task_loss_boxes_out_of_teacher_student_branch_corridors` 已存在，但后续 `with_figure_plan` 尾部可能再次 upsert/move，使 task loss 回到 teacher/student corridor。
+  - 旧 inference 去重只覆盖 box-vs-annotation 或 note component 场景，没有处理两个 Text annotation bbox 高度重叠且都含 `inference` 的情况。
+- 已完成实现：
+  - `tests/draw_plan_tests.rs`：
+    - 新增 `model_draw_plan_polish_removes_duplicate_inference_and_moves_task_loss_from_branch_corridor`，复现本次 final exact layout。
+    - 断言 inference 文本最多保留一个、task loss 不再位于 teacher/student row corridor 且移动到 student 侧、`student -> task` 不再向上反阅读方向。
+  - `src/tools/draw_plan.rs`：
+    - 在两个 polish 入口的 final tail 追加 `remove_overlapping_duplicate_inference_texts` 和 `move_task_loss_boxes_out_of_teacher_student_branch_corridors`，作为最后一次几何清理。
+    - 新增 `remove_overlapping_duplicate_inference_texts`：仅处理 bbox overlap ratio >= 0.55 的 inference Text，优先保留更完整的 `student only` 文本，删除 `ann_*`/箭头短标签。
+- 当前验证：
+  - 新增目标测试通过。
+  - `cargo test --test draw_plan_tests -- --nocapture`：通过（158/158）。
+  - `cargo fmt`：通过。
+  - `cargo test`：全量通过。
+  - `cd renderer && npm run build`：通过。
+  - `cargo fmt --check`：通过。
+  - `git diff --check`：通过。
+- 待完成：
+  - 跑真实 `.env` smoke。
+
+## 2026-06-22 failed final-pass smoke and degenerate optimizer connector repair
+
+- 真实 `.env` smoke 尝试：
+  - 命令：`SESSION_ID=post_final_pass_corridor_duplicate_repair_smoke_20260622_163000 REFERENCE_PREVIEWS=required MAX_ITERATIONS=3 MAX_MINUTES=45 bash scripts/run_real_env.sh examples/teacher_student.md`
+  - 结果：round 0 生成和评审完成，但 round 1 在写出 `draw_plan.json` 前失败。
+  - 错误：`draw connector e_teacher_residual needs at least two points`。
+- 根因定位：
+  - round 1 已写出 `figure_plan.json`，但没有 `draw_plan.json`；因此失败不是 renderer，也不是 deterministic `FigurePlan -> DrawPlan`。
+  - pipeline 在 revision 分支中先调用 `revise_draw_plan_from_feedback`，模型返回的修订 `DrawPlan` 会在统一 `polish_model_draw_plan_geometry_with_figure_plan` 前执行 `normalize_draw_plan_bounds` 和 `validate_draw_plan`。
+  - 旧 `normalize_draw_plan_bounds` 只 clamp 点和 bbox，不会修复模型返回的单点 connector，所以 LLM optimizer 的坏 connector 直接打断整个 loop。
+- 已完成实现：
+  - `tests/draw_plan_tests.rs`：
+    - 新增 `teacher_student_round_trip_keeps_residual_connector_valid_from_real_smoke`，固化本次 round 1 的 `FigurePlan`，证明 deterministic 生成链路本身不会产生单点 residual connector。
+    - 新增 `normalize_draw_plan_bounds_repairs_single_point_connector_from_endpoint_boxes`，先红后绿，覆盖 optimizer 返回单点 connector 的入库前容错。
+  - `src/tools/draw_plan.rs`：
+    - 扩展 `normalize_draw_plan_bounds` 为两遍处理：第一遍移动 box 并收集 box map，第二遍 clamp connector。
+    - 对 `<2 points` 且存在 `from/to` box 的 connector，保留模型已有单点作为起点，并用目标 box 面向该点的一侧补终点；没有已有点时退回现有 `orthogonal_connector_points_between_boxes`。
+    - 对缺少 endpoint box 但已有单点的 connector，补一个很短的可绘制水平线段，避免 validation 直接中断。
+- 当前验证：
+  - `cargo test --test draw_plan_tests normalize_draw_plan_bounds_repairs_single_point_connector_from_endpoint_boxes -- --nocapture`：先红后绿。
+  - `cargo test --test draw_plan_tests -- --nocapture`：通过（160/160）。
+  - `cargo fmt`：通过。
+- 待完成：
+  - 重新跑真实 `.env` smoke，确认 round 1 不再因单点 connector 中断，并继续观察 final quality blocker。
+
+## 2026-06-22 post-degenerate smoke and residual/task feedback route repair
+
+- 真实 `.env` smoke：
+  - 命令：`SESSION_ID=post_degenerate_connector_repair_smoke_20260622_164500 REFERENCE_PREVIEWS=required MAX_ITERATIONS=3 MAX_MINUTES=45 bash scripts/run_real_env.sh examples/teacher_student.md`
+  - 结果：`accepted=false`、3 轮、`reason="cap reached before acceptance"`；final PPTX `unzip -t` 通过；`renderer_status.json` 为 `source="model_generated_code"`、`used_fallback=false`。
+  - 单点 connector 中断已消失，round 1/2 均能生成 PPTX/PDF。
+- 新 final blocker：
+  - final quality `score=82`、`passed=false`。
+  - local blocker：`edge_student_to_residual` 与 `edge_taskloss_to_student` crossing；`edge_input_to_teacher` route detour。
+  - vision blocker：`comp_inference` 被完全遗漏，`∇L_task` / `∇L_res` 标签贴线，task-loss feedback 与 residual route 交叉。
+- 已完成实现：
+  - `tests/draw_plan_tests.rs`：新增 `model_draw_plan_polish_repairs_comp_named_residual_task_feedback_smoke`，固化本次 final 的 `comp_*` / `edge_*` 命名布局。
+  - `src/tools/draw_plan.rs`：
+    - 新增 `repair_comp_named_residual_task_feedback_topology`，处理 input 位于 teacher 左下、residual/task loss 在 student 上方的 residual+task feedback 拓扑。
+    - 将 `input -> teacher` 改为短直连，将 `task_loss -> student` 移到 student 右侧外绕，将 `residual -> student` 改为靠 student 左上侧的局部 route，并把梯度标签移离线段。
+    - 新增 `restore_missing_inference_components_as_annotations`，但触发条件收窄为存在 `residual -> student` 与 `task_loss -> student` feedback 的复杂训练图；避免误伤普通 inference note component 仍需作为可连接 Box 的旧行为。
+- 当前验证：
+  - 新增目标测试先红后绿。
+  - 回归点测 `model_draw_plan_polish_adds_missing_figure_plan_note_components`、`model_draw_plan_polish_converts_note_text_components_to_connectable_boxes`、`model_draw_plan_polish_removes_auxiliary_inference_note_connectors_from_smoke`：通过。
+  - `cargo test --test draw_plan_tests -- --nocapture`：通过（161/161）。
+  - `cargo fmt`：通过。
+  - `cargo test`：全量通过。
+  - `cd renderer && npm run build`：通过。
+
+## 2026-06-22 post-feedback smoke and student-head output column repair
+
+- 真实 `.env` smoke：
+  - 命令：`SESSION_ID=post_feedback_route_inference_note_repair_smoke_20260622_171500 REFERENCE_PREVIEWS=required MAX_ITERATIONS=3 MAX_MINUTES=45 bash scripts/run_real_env.sh examples/teacher_student.md`
+  - 结果：`accepted=false`、3 轮、`reason="cap reached before acceptance"`；final PPTX `unzip -t` 通过；`renderer_status.json` 为 `source="model_generated_code"`、`used_fallback=false`。
+  - 上一轮 `edge_taskloss_to_student`/`edge_student_to_residual` crossing 和缺失 inference note 不再是 final local quality issue。
+- 新 final blocker：
+  - final quality `score=82`、`passed=false`。
+  - local blocker：`e_student_to_output` 穿过 `task_loss_box`，`task_loss_box` 与 `output_pred` 垂直距离太小。
+  - PNG 确认：`Student Head -> Prediction` 是竖线，`Task Loss` 占在这条竖线和 output 上方；`ann_inference` 位于 output/task-loss corridor 附近。
+- 已完成实现：
+  - `tests/draw_plan_tests.rs`：新增 `model_draw_plan_polish_moves_task_loss_out_of_student_head_output_column_from_smoke`，复现 head 同时连 task loss 与 output 时 task loss 占住 output column 的问题。
+  - `src/tools/draw_plan.rs`：
+    - 新增 `repair_student_head_output_task_loss_column`，识别同一 source 同时连 output 与 task-loss，且 task loss 与 output 同列/穿线时，将 task loss 挪到 output 左侧，保留 output 竖线为主路径。
+    - 新增 `move_inference_annotations_away_from_output_column`，把 inference annotation 移离 output/task-loss corridor。
+- 当前验证：
+  - 新增目标测试先红后绿。
+  - `cargo test --test draw_plan_tests -- --nocapture`：通过（162/162）。
+  - `cargo fmt`：通过。
+- 待完成：
+  - 重新跑真实 `.env` smoke，确认 output column blocker 是否消失，并跑最终 `cargo test` / renderer build / fmt check / diff check。
+
+## 2026-06-22 post-output-column smoke and residual-equation annotation repair
+
+- 真实 `.env` smoke：
+  - 命令：`SESSION_ID=post_output_column_repair_smoke_20260622_174500 REFERENCE_PREVIEWS=required MAX_ITERATIONS=3 MAX_MINUTES=45 bash scripts/run_real_env.sh examples/teacher_student.md`
+  - 结果：`accepted=false`、3 轮、`reason="cap reached before acceptance"`；final PPTX `unzip -t` 通过；`renderer_status.json` 为 `source="model_generated_code"`、`used_fallback=false`。
+  - 上一轮 `e_student_to_output` 穿过 `task_loss_box` 和 output/task-loss crowding 不再复发；final quality 升至 `score=94`。
+- 新 final blocker：
+  - local 唯一 issue：`annotation_in_main_corridor`，target `ann_residual_eq`, `teacher_enc_mod`, `student_pred_mod`。
+  - PNG 确认 `||z_T - z_S||^2` 被放在 teacher/student 中间主通道，应该贴近 `residual_mod` 右侧或上方。
+- 已完成实现：
+  - `tests/draw_plan_tests.rs`：新增 `model_draw_plan_polish_moves_residual_equation_annotation_out_of_main_corridor_from_smoke`，复现 residual equation annotation 在 residual box 左侧主 corridor 的问题。
+  - `src/tools/draw_plan.rs`：
+    - 新增 `move_residual_equation_annotations_out_of_main_corridors`，仅匹配残差公式类 Text（`||`、`z_t`、`z_s`、`residual`）且位于 residual box 左侧/同一行附近时触发。
+    - 将该 annotation 移到 residual box 右侧，避免占据 teacher/student 主通道。
+- 当前验证：
+  - 新增目标测试先红后绿。
+  - `cargo test --test draw_plan_tests -- --nocapture`：通过（163/163）。
+  - `cargo fmt`：通过。
+- 待完成：
+  - 重新跑真实 `.env` smoke，确认 residual equation blocker 是否消失。
+
+## 2026-06-22 post-inference restore smoke and current residual risk
+
+- 真实 `.env` smoke：
+  - 命令：`SESSION_ID=post_inference_component_restore_smoke_20260622_184500 REFERENCE_PREVIEWS=required MAX_ITERATIONS=3 MAX_MINUTES=45 bash scripts/run_real_env.sh examples/teacher_student.md`
+  - 结果：`accepted=false`、3 轮、`reason="cap reached before acceptance"`；final PPTX `unzip -t` 通过；`renderer_status.json` 为 `source="model_generated_code"`、`used_fallback=false`。
+  - 上一轮 inference duplicate/outside-main-area blocker 没有作为 final local issue 复发。
+- 新 final blocker：
+  - final quality `score=64`、`passed=false`。
+  - 新拓扑退化为 teacher/projector/latent 分支：`inference_note` collapsed，`task_loss` 又进入 teacher/student branch corridor，`e_input_to_student` 绕线，`teacher_latent`/`teacher_proj` 拥挤。
+  - 这说明模型仍会在不同 round 重新生成新拓扑，已有末端 repairs 能处理已见 blocker，但还不能保证 3 轮内全局收敛。
+- 已完成实现：
+  - `tests/draw_plan_tests.rs`：新增 `model_draw_plan_polish_restores_missing_inference_component_box_from_latest_smoke`，覆盖 FigurePlan 有 `inference_only` component 但 DrawPlan 只剩重复 floating Text 的情况。
+  - `src/tools/draw_plan.rs`：新增 `restore_missing_inference_components_as_boxes`，仅在 FigurePlan 存在 `student -> student` loss self-loop 的错误拓扑时恢复 inference component Box，并移除重复 floating inference Text；该触发条件避免误伤原先需要折叠成 Text 的 standalone inference note 测试。
+- 当前验证：
+  - 新增目标测试先红后绿。
+  - `cargo test --test draw_plan_tests -- --nocapture`：通过（164/164）。
+- 剩余风险：
+  - 真实 `.env` smoke 仍未 accepted；最新失败是新的 teacher/projector 拓扑，不是本轮修复的 inference duplicate/outside issue。
+  - 若继续追，需要再为 latest final 的 `teacher_latent`/`teacher_proj` 拥挤、collapsed `inference_note`、`task_loss_in_branch_corridor`、`e_input_to_student` detour 增加 exact regression tests。
+
+## 2026-06-22 projected latent topology repair
+
+- 当前目标：
+  - 按最新真实 smoke 的 final PNG/quality report 继续修复 projected-latent teacher/student 拓扑退化，避免每轮重新生成后又出现 teacher latent/projector 被挤到 input 下方、task loss 回到 branch corridor、inference note 塌缩、input-to-student 长绕线的问题。
+- 根因定位：
+  - 这不是单纯配色或 prompt 问题，而是模型在后续 round 可能生成新的局部拓扑；已有 repairs 只覆盖之前见过的 residual/task/output/inference 模式，没有覆盖 `input_text -> teacher_encode/student_encode` 加 `teacher_latent -> teacher_proj -> student_latent` 的 projector 分支。
+  - 该拓扑下 `teacher_latent`、`teacher_proj` 被放到 `input_text` 下方左侧，破坏 teacher branch 的从左到右阅读顺序；`e_input_to_student` 变成 4 点 U 形 detour；`inference_note` 被早期 note folding 转成或压成不可读对象；`task_loss` 位于 teacher/student 主通道。
+- 已完成实现：
+  - `tests/draw_plan_tests.rs`：新增 `model_draw_plan_polish_repairs_projection_latent_branch_from_latest_smoke`，复现 `post_inference_component_restore_smoke_20260622_184500` 的 final layout。
+  - `src/tools/draw_plan.rs`：
+    - 新增 `repair_projection_latent_teacher_student_topology`，只在存在 `input_text`、`teacher_encode`、`teacher_latent`、`teacher_proj`、`student_encode`、`student_latent`、`student_head`、`output_text`、`task_loss` 且 latent/projector 被挤到 input 下方或 input-to-student 出现同层四点绕线时触发。
+    - 将 teacher branch 重新排成 `input -> teacher encoder -> z_T -> projector` 的水平上轨，将 student branch 排成 `input -> student encoder -> z_S -> prediction head -> output` 的下轨。
+    - 将 `task_loss` 移到 student output row 下方，将 `inference_note` 恢复/替换为可编辑 Box 并放到 main flow 外侧。
+    - 重写相关 connector，移除 `e_input_to_student` 的 U 形 detour，并把 `e_latent_residual` label 放到 connector 外侧。
+- 当前验证：
+  - 新增目标测试先红后绿，最终 `cargo test --test draw_plan_tests model_draw_plan_polish_repairs_projection_latent_branch_from_latest_smoke -- --nocapture` 通过。
+  - `cargo test --test draw_plan_tests -- --nocapture`：通过（165/165）。
+  - `cargo fmt`：通过。
+  - `cargo test`：全量通过。
+  - `cd renderer && npm run build`：通过。
+  - `cargo fmt --check`：通过。
+  - `git diff --check`：通过。
+- 待完成：
+  - 跑新的真实 `.env` smoke，确认 latest projected-latent blocker 是否消失，并检查是否还有新的 final blocker。
+
+## 2026-06-22 post-projection smoke and split-input residual hub repair
+
+- 真实 `.env` smoke：
+  - 命令：`SESSION_ID=post_projection_latent_topology_repair_smoke_20260622_191500 REFERENCE_PREVIEWS=required MAX_ITERATIONS=3 MAX_MINUTES=45 bash scripts/run_real_env.sh examples/teacher_student.md`
+  - 结果：`accepted=false`、3 轮、`reason="cap reached before acceptance"`；final PPTX `unzip -t` 通过；`renderer_status.json` 为 `source="model_generated_code"`、`used_fallback=false`。
+  - 质量变化不是原地打转：round quality 从 `0 -> 46 -> 88`，final 只剩 1 个本地 blocking issue。
+- 已确认改善：
+  - 上一轮 `teacher_latent`/`teacher_proj` 被挤在 input 下方、`task_loss` 回到 branch corridor、`e_input_to_student` 四点绕线的 projected-latent blocker 没有复发为 final blocker。
+- 新 final blocker：
+  - 本地 `quality_report.json`：`score=88`，唯一 blocker 是 `component_collapsed`，target `inference_note`，原因是 bbox 高度 `0.07 < 0.08`。
+  - 人工查看 final PNG：模型改成了左右两套 `Task Input`、顶部 residual hub、浮动 `Teacher`/`Student` 标签和三段 residual dashed routes；图面比上一轮干净，但 still 有 duplicate input、inference note 位于主通道、residual route 过复杂的问题。
+  - vision review 同步指出：`inference_note` 位于主流程通道，`e_residual` 是不必要的折线路径，`branch_label_teacher`/`branch_label_student` 是无锚点浮动标签，左右两套 Task Input 不如共享入口清楚。
+- 已完成实现：
+  - `tests/draw_plan_tests.rs`：新增 `model_draw_plan_polish_repairs_split_input_residual_hub_from_latest_smoke`，先红后绿，复现本次 final `draw_plan`。
+  - `src/tools/draw_plan.rs`：
+    - 新增 `repair_split_duplicate_input_residual_hub_topology`，窄触发于 `teacher_input`/`student_input` 两个重复 `Task Input`、teacher/student latent、`residual_obj`、student decode/output/loss、inference note-like object 同时存在的布局。
+    - 将两套 Task Input 合并成一个共享 `teacher_input` 视觉入口，并把 `e_student_in` 的 source 更新为共享 input，删除 `student_input`。
+    - 删除浮动 `branch_label_teacher`/`branch_label_student`，避免无锚点 branch label 占用 residual 区。
+    - 将 `inference_note` 从 Box 或 `ann_inference` Text 形式恢复为右上角可编辑 Box，bbox 高度提高到 `0.09`，避免 `component_collapsed`。
+    - 将 teacher/student latent 与 residual hub 对齐成水平 residual rail，删除冗余 `e_residual` 折线，保留 `e_residual_up`/`e_residual_down` 两条短水平 supervision rail。
+- 当前验证：
+  - `cargo test --test draw_plan_tests model_draw_plan_polish_repairs_split_input_residual_hub_from_latest_smoke -- --nocapture`：先红后绿。
+  - `cargo test --test draw_plan_tests -- --nocapture`：通过（166/166）。
+  - `cargo fmt`：通过。
+  - `cargo test`：全量通过。
+  - `cd renderer && npm run build`：通过。
+  - `cargo fmt --check`：通过。
+  - `git diff --check`：通过。
+- 待完成：
+  - 再跑真实 `.env` smoke，确认 split-input/residual-hub blocker 是否消失，以及 final 是否达到 accepted 或暴露下一类 blocker。
+
+## 2026-06-22 post-split-input smoke and simple branch compaction repair
+
+- 真实 `.env` smoke：
+  - 命令：`SESSION_ID=post_split_input_residual_hub_repair_smoke_20260622_201500 REFERENCE_PREVIEWS=required MAX_ITERATIONS=3 MAX_MINUTES=45 bash scripts/run_real_env.sh examples/teacher_student.md`
+  - 结果：`accepted=false`、3 轮、`reason="cap reached before acceptance"`；final PPTX `unzip -t` 通过；`renderer_status.json` 为 `source="model_generated_code"`、`used_fallback=false`。
+  - final `quality_report.json` 已经 `passed=true`、`score=100`、`issues=[]`，说明前一轮的 duplicate input、collapsed inference note、projected-latent branch blocker 已从本地 gate 消失。
+- 新 final blocker：
+  - 未 accepted 的原因转移到 vision review：没有 blocking issue，但仍有多个 major localized issues，主要是 `teacher_branch`/`student_branch`/`task_input`/`task_output` 框过高留白、`input_to_teacher`/`input_to_student` 长折线、`latent_residual_edge_label` 贴近虚线、`anno_student_inference` 像浮动边注。
+  - 人工查看 final PNG 后确认：这版已经是可读的简单 Y 分支图，不再有明显重叠，但确实还有草图感；本地 quality gate 给 100 说明它仍缺少对“短文本大框”和“标签贴近边”的更强审美约束。
+- 已完成实现：
+  - `tests/draw_plan_tests.rs`：新增 `model_draw_plan_polish_tightens_simple_branch_from_latest_review_smoke`，先红后绿，固化本次 final 的简单 Y 分支布局。
+  - `src/tools/draw_plan.rs`：
+    - 新增 `repair_simple_teacher_student_branch_compaction`，只在出现 `task_input`、`teacher_branch`、`student_branch`、`task_output` 且 teacher/student 之间有 residual connector 的简单分支布局时触发。
+    - 收紧 `teacher_branch`、`student_branch`、`task_input`、`task_output` bbox，保持 13.1pt paper-width 字号下不塌缩，同时降低框内留白。
+    - 将 `input_to_teacher`/`input_to_student` 从长三点折线改为短二点连接，降低左侧长竖线造成的草图感。
+    - 重新定位 `latent_residual_edge` label 到虚线右侧，并把 `anno_student_inference` 拉近 student branch，避免像无锚点浮动边注。
+- 当前验证：
+  - `cargo test --test draw_plan_tests model_draw_plan_polish_tightens_simple_branch_from_latest_review_smoke -- --nocapture`：先红后绿。
+  - `cargo test --test draw_plan_tests -- --nocapture`：通过（167/167）。
+  - `cargo fmt`：通过。
+  - `cargo test`：全量通过。
+  - `cd renderer && npm run build`：通过。
+  - `cargo fmt --check`：通过。
+  - `git diff --check`：通过。
+- 待完成：
+  - 再跑真实 `.env` smoke，确认 simple branch compaction 在真实 loop 中是否继续提升 vision review。
+
+## 2026-06-22 post-simple-branch smoke and stop condition
+
+- 真实 `.env` smoke：
+  - 命令：`SESSION_ID=post_simple_branch_compaction_smoke_20260622_210000 REFERENCE_PREVIEWS=required MAX_ITERATIONS=3 MAX_MINUTES=45 bash scripts/run_real_env.sh examples/teacher_student.md`
+  - 结果：`accepted=false`、3 轮、`reason="cap reached before acceptance"`；final PPTX `unzip -t` 通过；`renderer_status.json` 为 `source="model_generated_code"`、`used_fallback=false`。
+  - final `quality_report.json`：`score=76`，2 个 blocking issues：`component_collapsed` on `inference_note`，以及 `e_input_to_teacher` 与 `e_student_to_task_loss` crossing。
+- 观察结论：
+  - 这次 final 不是上一轮 simple branch compaction case，而是模型又生成了一个新拓扑：student 分支在左、teacher 分支在右，`teacher_head` 位于 `teacher_enc` 上方造成反向阅读，latent residual loss 在顶部中心，多条绿色虚线路由跨越主图。
+  - 这说明继续为每个 smoke final 增加 exact local repair 会进入“局部补丁追着随机拓扑跑”的模式。当前新增 repairs 已经证明能修掉已见的 projected-latent、split-input/residual-hub、simple-branch-loose-box 三类问题，但真实 loop 仍可能在下一轮产生新拓扑退化。
+- 当前验证：
+  - 本轮新增代码在第三次 smoke 前已通过 `cargo test --test draw_plan_tests -- --nocapture`（167/167）、全量 `cargo test`、`cd renderer && npm run build`、`cargo fmt --check`、`git diff --check`。
+  - 第三次 smoke 证明 PPTX/PNG 生成链路仍正常，且没有 fallback，但没有达到 accepted。
+- 剩余风险和下一步建议：
+  - 当前瓶颈已经从“某一类几何 bug”转为“模型每轮可能重开新拓扑”。应停止继续叠 exact repair，改为把 topology contract 前移到 reasoner/coder 的 hard constraints：teacher/student branch 的允许拓扑、reading order、loss/inference note placement、branch orientation 必须作为 `DrawPlan` 生成前的约束，而不是等 final PNG 再补丁。
+  - 可执行方向：新增一个 topology validator/gate，直接拒绝 teacher/student 反向、duplicate input、training-only note in main corridor、branch orientation inversion、loss edge crossing 等高层拓扑，而不是只在 `draw_plan.rs` 末端重排。
+
+## 2026-06-22 topology quality gate implementation
+
+- 当前目标：
+  - 执行上一节建议，不再继续给最新 final 叠 exact geometry repair，而是把第三次 smoke 暴露的 teacher/student 反向拓扑变成本地 `quality_report` 的 blocking issue。
+- 根因定位：
+  - `quality_report` 是更合适的数据流入口：它会进入 `apply_render_quality_gate` 的 review blocking issues，也会参与 best-round ranking、issue binding、下一轮 workspace 反馈。
+  - 最新坏图的核心不是单个 bbox，而是 teacher encoder 低于 student encoder、teacher head 位于 teacher encoder 上方，导致 teacher branch 阅读顺序反向；旧 gate 只看到 collapsed note 和 edge crossing，没有把拓扑错误表达给下一轮模型。
+- 已完成实现：
+  - `tests/review_tests.rs`：
+    - 新增 `quality_report_flags_teacher_student_topology_inversion_from_latest_smoke`，复现 `post_simple_branch_compaction_smoke_20260622_210000` 的 final `layout_map`，要求输出 `teacher_student_branch_inversion` 和 `teacher_internal_flow_reversed` 两个 blocking issue。
+    - 新增 `quality_report_allows_teacher_above_student_encoder_topology`，确认正常 teacher-above-student、encoder-to-head 左右流不被误报。
+  - `src/tools/review.rs`：
+    - 在 `quality_issues_from_map` 中加入 `push_teacher_student_topology_issues`。
+    - 新增 `primary_teacher_student_encoder_component`、`role_encoder_like_component`、`teacher_head_like_component`，仅匹配明确的 teacher/student encoder-head 结构，避免把普通横向流程或非 encoder 模块误判。
+    - 当 teacher encoder 比 student encoder 低超过阈值时输出 `teacher_student_branch_inversion`；当 teacher encoder 到 teacher head 的 edge 向上流动时输出 `teacher_internal_flow_reversed`。
+- 当前验证：
+  - `cargo test --test review_tests quality_report_flags_teacher_student_topology_inversion_from_latest_smoke -- --nocapture`：先红后绿。
+  - `cargo test --test review_tests quality_report_allows_teacher_above_student_encoder_topology -- --nocapture`：通过。
+  - `cargo test --test review_tests -- --nocapture`：通过（47/47）。
+- 第一次真实 `.env` smoke：
+  - 命令：`SESSION_ID=post_topology_quality_gate_smoke_20260622_220000 REFERENCE_PREVIEWS=required MAX_ITERATIONS=3 MAX_MINUTES=45 bash scripts/run_real_env.sh examples/teacher_student.md`
+  - 结果：`accepted=false`、3 轮、`reason="cap reached before acceptance"`；final PPTX `unzip -t` 通过；`renderer_status.json` 为 `source="model_generated_code"`、`used_fallback=false`。
+  - 质量变化：round 0 `score=88`、2 个本地 issue；round 1/2 `score=100`、`issues=[]`。最终图已经回到 teacher 上、student 下的清楚 Y 分支，没有复发 teacher/student 反向拓扑。
+  - 新问题：vision review 仍给出 major issue，包括 `Task loss` label 贴在 student-to-output prediction edge 上、`ann_inference` 被放到画布底边、`h_s`/supervision labels 贴线、teacher-to-residual 虚线有不必要折弯。本地 `quality_report` 当时没有捕获前两个通用问题，导致下一轮模型缺少稳定的本地 target ids。
+- 追加实现：
+  - `tests/review_tests.rs`：
+    - 新增 `quality_report_flags_task_loss_label_on_prediction_edge_from_latest_smoke`，要求把 loss label 贴在 prediction edge 上报告为 `loss_label_on_prediction_edge`。
+    - 新增 `quality_report_flags_bottom_margin_inference_annotation_from_latest_smoke`，要求把 bottom-margin inference caption 报告为 `inference_annotation_in_bottom_margin`。
+  - `src/tools/review.rs`：
+    - 新增 `loss_label_on_prediction_edge`，只在 label 含 loss 且 target edge 连接 student 与 output、没有 loss endpoint 时触发，避免误伤正常 loss objective edge。
+    - 新增 `inference_annotation_in_bottom_margin` 和更窄的 `is_student_only_inference_cue`，只拦截 student-only inference cue 被推到画布底边的情况，避免把 residual/supervision 普通注释误判为 inference。
+- 追加验证：
+  - 两个新增目标测试均先红后绿。
+  - `cargo test --test review_tests -- --nocapture`：通过（49/49）。
+  - `cargo fmt`：通过。
+  - `cargo test`：全量通过。
+  - `cd renderer && npm run build`：通过。
+  - `cargo fmt --check`：通过。
+  - `git diff --check`：通过。
+- 待完成：
+  - 再跑一次真实 `.env` smoke，确认新增 label/margin gate 是否能进入下一轮反馈，并观察是否仍由 vision review 阻塞。
+
+## 2026-06-22 post-label-margin gate smoke and prompt tightening
+
+- 第二次真实 `.env` smoke：
+  - 命令：`SESSION_ID=post_label_margin_quality_gate_smoke_20260622_224500 REFERENCE_PREVIEWS=required MAX_ITERATIONS=3 MAX_MINUTES=45 bash scripts/run_real_env.sh examples/teacher_student.md`
+  - 结果：`accepted=false`、3 轮、`reason="cap reached before acceptance"`；final PPTX `unzip -t` 通过；`renderer_status.json` 为 `source="model_generated_code"`、`used_fallback=false`。
+  - 每轮本地质量：round 0 `score=0`、21 个 issue，其中包含新增 `teacher_student_branch_inversion`；round 1 `score=0`、13 个 issue；round 2/final `score=52`、7 个 issue。
+- 观察结论：
+  - topology gate 确实生效：round 0 抓到了 teacher/student branch inversion，后续 final 不再是 teacher 在 student 下方的反向拓扑。
+  - 但真实 loop 仍未稳定收敛：模型在后续轮次生成了新的 projection/residual 拓扑，final 仍有 `component_crowding`、`annotation_too_close_to_edge`、`label_far_from_edge`、`route_detour`、`degenerate_edge` 等本地 blocker/major issue；PNG 中可见 `h_T`、`z_S` 等标签漂移，student/output/task-loss 路由缠绕。
+  - 这说明“视觉模型看不出来”的问题已有部分被本地化为 issue，但 reasoner 对新增 issue type 的下一轮修复建议还不够具体，容易继续给出大范围新拓扑而不是针对上一轮 target ids 局部改。
+- 已完成追加实现：
+  - `tests/prompt_tests.rs`：
+    - 扩展 `round_improvement_prompt_uses_regression_budget_as_repair_contract`，要求 prompt 明确包含 `teacher_student_branch_inversion`、`teacher_internal_flow_reversed`、`loss_label_on_prediction_edge`、`inference_annotation_in_bottom_margin`。
+  - `src/agent.rs`：
+    - 在 `build_round_improvement_prompt` 的 issue-specific 指南中加入新增 gate 的修复语义。
+    - 对 `teacher_student_branch_inversion` 要求命名 teacher/student encoder ids，并做局部 branch reorder，不重规划无关对象。
+    - 对 `teacher_internal_flow_reversed` 要求命名 encoder/head/edge ids，并改为水平或下游 encoder-to-head route。
+    - 对 `inference_annotation_in_bottom_margin` 要求移到 student/output 附近并避开 connector corridor/canvas margin。
+    - 对 `loss_label_on_prediction_edge` 要求把 loss cue 移到单独 objective component 或 supervision edge，而不是挂在 prediction edge 上。
+- 最终验证：
+  - `cargo test --test prompt_tests round_improvement_prompt_uses_regression_budget_as_repair_contract -- --nocapture`：先红后绿。
+  - `cargo test --test prompt_tests -- --nocapture`：通过（10/10）。
+  - `cargo fmt`：通过。
+  - `cargo test`：全量通过。
+  - `cd renderer && npm run build`：通过。
+  - `cargo fmt --check`：通过。
+  - `git diff --check`：通过。
+- 剩余风险：
+  - 本轮没有在 prompt tightening 之后再跑第三次真实 smoke；当前最新真实证据仍是 `post_label_margin_quality_gate_smoke_20260622_224500`，它证明 gate 会抓住新问题，但还没有证明新增 prompt 文案能让下一次真实 loop 收敛。
+  - 下一步更根本的方向应是把 `revision_source` 约束升成执行层面的 hard policy：当上一轮已有可渲染图时，限制后续 `DrawPlan` material diff 的范围，只允许修改当前 `QualityReport`/review target ids 相关对象，除非 IssueHistory 证明需要 reference_replan。
+
+## 2026-06-22 localized revision guard
+
+- 当前目标：
+  - 把上一节的“只基于上一轮局部修补，不重画拓扑”从 prompt 约束提升为执行层 hard policy。
+- 根因定位：
+  - `revise_draw_plan_from_feedback` 之前只检查模型返回的 `DrawPlan` 是否有 material change；只要有变化就接受，未限制变化是否绑定到当前 `QualityReport` / review / issue binding 的 target ids。
+  - 因此模型可以在修一个 label 或 route 时顺手新增 projector、移动 teacher/input、删除无关 connector，导致每轮出现新拓扑而不是稳定局部收敛。
+- 已完成实现：
+  - `src/agent.rs`：
+    - 新增 `constrain_draw_plan_revision_to_current_targets`，在模型返回 `DrawPlan`、执行 `preserve_semantic_draw_objects` 后、`normalize_draw_plan_bounds` 前运行。
+    - 从 `RoundImprovementPlan`、vision localized issues、`quality_report.json`、`issue_binding.json` 收集当前 target ids；`*_label` target 会映射到对应 edge id。
+    - 若 plan 是 `reference_replan`、`rejected_as_unusable` 或含 `global_layout` target，则允许全局 replan；否则进入 localized guard。
+    - localized guard 对无关既有对象恢复上一轮版本，对无关新增对象删除；仅允许 target ids 及触碰 target component 的 connectors 发生 material change。
+  - `src/agent.rs` tests：
+    - 新增 `localized_draw_plan_guard_reverts_unrelated_revision_changes`，复现 localized action 只应修改 `task_loss` / `e_student_to_loss`，但模型同时移动 `input`、`teacher`、删除 `e_input_teacher`、新增 `new_projector` 的失败模式。
+    - 新增 `localized_draw_plan_guard_allows_reference_replan_changes`，确认 `reference_replan` 不被 guard 错误限制。
+- 当前验证：
+  - `cargo test agent::tests::localized_draw_plan_guard_reverts_unrelated_revision_changes -- --nocapture`：先红后绿。
+  - `cargo test agent::tests::localized_draw_plan_guard_allows_reference_replan_changes -- --nocapture`：通过。
+- 待完成：
+  - 跑格式化、agent/prompt/review 相关测试、全量 `cargo test`、renderer build、`cargo fmt --check`、`git diff --check`。
+  - 跑真实 `.env` smoke，确认 localized revision guard 是否减少后续轮次重开拓扑。
+
+## 2026-06-22 localized revision smoke, route gates, and clamp panic fix
+
+- localized guard 后的验证：
+  - `cargo test agent::tests -- --nocapture`：通过。
+  - `cargo test`：全量通过。
+  - `cd renderer && npm run build`：通过。
+  - `cargo fmt --check`：通过。
+  - `git diff --check`：通过。
+- 第三次真实 `.env` smoke：
+  - 命令：`SESSION_ID=post_localized_revision_guard_smoke_20260622_233000 REFERENCE_PREVIEWS=required MAX_ITERATIONS=3 MAX_MINUTES=45 bash scripts/run_real_env.sh examples/teacher_student.md`
+  - 结果：`accepted=false`、3 轮、`reason="cap reached before acceptance"`；final PPTX 有效，`renderer_status.json` 为 `source="model_generated_code"`、`used_fallback=false`。
+  - 每轮本地质量：round 0 `score=70`、3 个 issue；round 1 `score=94`、1 个 issue；round 2/final `score=100`、`issues=[]`。
+  - 观察：localized guard 生效后没有再出现大范围拓扑重开，本地质量能单调提升到 100。但人工查看 final PNG 和 vision review 后，仍有本地 gate 漏检：`e_input_student` 长 U 形/矩形 detour、`e_residual_student` 残差虚线绕远、`student_predict_out` 把 `ŷ` 和 `Task Loss` 混在同一个 output 框、`ann_inference` 挤在主 corridor 内。
+- 已完成追加实现：
+  - `tests/review_tests.rs`：
+    - 新增 `quality_report_flags_input_to_student_rectangular_detour_from_guard_smoke`，覆盖 shared input 到 student 的矩形绕行。
+    - 新增 `quality_report_flags_residual_student_wandering_route_from_guard_smoke`，覆盖 residual-to-student 虚线绕远。
+    - 新增 `quality_report_flags_prediction_box_mixing_task_loss_from_guard_smoke`，覆盖 prediction output 框混入 task-loss 语义。
+  - `src/tools/review.rs`：
+    - 将上述两类真实 route failure 接入 `route_detour` 判定。
+    - 新增 `prediction_loss_semantic_mix` issue，要求 prediction 和 task loss 保持为不同 editable objects。
+  - `src/agent.rs` / `tests/prompt_tests.rs`：
+    - 在 `RoundImprovementPlan` prompt 中加入 `prediction_loss_semantic_mix` 的 issue-specific 修复要求，必须命名 output component id 并拆分/relabel，不允许只给泛泛审美建议。
+- 追加验证：
+  - 三个新增 review 测试均先红后绿。
+  - `cargo test --test review_tests -- --nocapture`：通过（52/52）。
+  - `cargo test --test prompt_tests round_improvement_prompt_uses_regression_budget_as_repair_contract -- --nocapture`：先红后绿。
+  - `cargo test`：全量通过。
+  - `cd renderer && npm run build`、`cargo fmt --check`、`git diff --check`：通过。
+- 第四次真实 `.env` smoke 暴露的新问题：
+  - 命令：`SESSION_ID=post_guard_route_semantic_gate_smoke_20260622_240000 REFERENCE_PREVIEWS=required MAX_ITERATIONS=4 MAX_MINUTES=60 bash scripts/run_real_env.sh examples/teacher_student.md`
+  - 结果：运行到 round 2 前崩溃，panic 为 `min > max, or either was NaN. min = 0.1, max = 0.09999999999999998`。
+  - 已完成轮次质量：round 0 `score=34`、7 个 issue；round 1 `score=64`、4 个 issue。新增 gate 已进入真实反馈，但 run 被 deterministic geometry polish 的浮点边界截断。
+  - 复现命令：`RUST_BACKTRACE=1 cargo run -- resume --run runs/teacher-student-distillation-with-latent-residuals/post_guard_route_semantic_gate_smoke_20260622_240000`
+  - 根因：`src/tools/draw_plan.rs::readable_shared_input_width` 把 `box_width(input.bbox).min(0.16)` 直接作为 `f64::clamp` 上界。模型输出的 shared input bbox 宽度可能是 `0.09999999999999998`，略低于 readability floor `0.10`，导致 `clamp(0.10, 0.09999999999999998)` panic。
+- 当前修复：
+  - `src/tools/draw_plan.rs`：
+    - 将 `readable_shared_input_width` 的动态上界改为 `box_width(input.bbox).min(0.16).max(0.10)`，允许极窄/浮点误差输入扩到最小可读宽度，避免上界小于下界。
+    - 新增私有单元测试 `readable_shared_input_width_handles_float_width_below_floor`，先复现上述 panic，再验证修复。
+  - `tests/draw_plan_tests.rs`：
+    - 新增集成层回归 `model_draw_plan_polish_handles_shared_input_width_below_readability_floor`，保证 public geometry polish 在类似 shared-input fixture 上不破坏 DrawPlan。
+- 当前已跑验证：
+  - `cargo test tools::draw_plan::tests::readable_shared_input_width_handles_float_width_below_floor -- --nocapture`：先红后绿。
+  - `cargo test --test draw_plan_tests model_draw_plan_polish_handles_shared_input_width_below_readability_floor -- --nocapture`：通过。
+- 待完成：
+  - 跑 `cargo fmt --check`、全量 `cargo test`、`cd renderer && npm run build`、`git diff --check`。
+  - 恢复或重跑 `post_guard_route_semantic_gate_smoke_20260622_240000`，确认 round 2 不再 panic，并继续观察 route/semantic gate 是否带来有效改动。
+
+## 2026-06-22 resume cap fix and top-heavy layout gate
+
+- 恢复真实 run 的结果：
+  - 命令：`cargo run -- resume --run runs/teacher-student-distillation-with-latent-residuals/post_guard_route_semantic_gate_smoke_20260622_240000`
+  - 结果：shared-input width panic 已修复，run 成功越过 round 002，并生成 round 002/003/004/005 的 PPTX/PDF。
+  - 中途发现 resume 继续写到了 `round_005`，而 `config_snapshot.json` 中 `max_iterations` 是 4。该行为来自旧 resume 语义：`run_pipeline_inner` 用 `rounds_this_invocation` 从 0 计数，恢复中断 run 时没有扣除已有 completed rounds。
+  - 为避免真实 smoke 被额外续跑，手动中断该 resume 后修复控制流。修复后再次执行 resume，命令快速完成，没有继续追加新 round，并生成 `final/`；输出 `accepted=false, rounds=6, reason=cap reached before acceptance`。`rounds=6` 是因为修复前已经额外完成到 round 005，修复只防止继续追加。
+  - `final/figure.pptx` 通过 `unzip -t`，确认仍是有效 PPTX。
+- resume cap 修复：
+  - `tests/pipeline_tests.rs`：
+    - 新增 `resume_pipeline_without_final_respects_existing_iteration_cap`，模拟无 `final/status.json` 的 interrupted/capped run；旧实现会追加 `round_001` 并错误 accepted，测试先红。
+    - 保留并复测 `resume_pipeline_continues_rejected_run_directory`，确认已有 rejected final 的手动 resume 仍允许追加下一批轮次。
+  - `src/pipeline.rs`：
+    - `ResumeState` 新增 `rounds_this_invocation_offset`。
+    - 当 run 没有 `final/status.json` 时，resume 视为崩溃/中断恢复，`rounds_this_invocation` 从已有 completed rounds 开始，尊重原 `max_iterations` 总轮数上限。
+    - 当已有 rejected `final/status.json` 时，resume 视为用户手动续跑，offset 仍为 0，保留原有“继续追加一批”的语义。
+- 真实 final 质量观察：
+  - 每轮本地质量：round 0 `score=34`、7 issues；round 1 `score=64`、4 issues；round 2 `score=76`、3 issues；round 3 `score=58`、5 issues；round 4/5 `score=64`、4 issues。
+  - 说明 panic 修复后能继续迭代，但质量仍会在局部修补后回退，当前 loop 还没有保证每轮单调变好。
+  - 人工查看 `final/figure.png`：语义基本可读，PPTX 可编辑，但整图集中在上半部分，底部大面积空白；`Task Loss` 到 `Student` 的 connector 在顶部长距离绕行；`Frozen at train time` annotation 过宽；`Inference: student only` 被本地 gate 判为 collapsed。
+  - 结论：这不是“视觉模型完全看不出来”。`review.json` 和 `improvement_plan.json` 已经给出具体建议，但本地 gate 缺少“整图 vertical packing / top-heavy whitespace”约束，导致模型围绕单个 bbox 做局部小修，而不是调整整体重心。
+- top-heavy layout gate：
+  - `tests/review_tests.rs`：
+    - 新增 `quality_report_flags_top_heavy_vertical_underutilization_from_guard_smoke`，用真实 final bbox 复现“横向铺满但上半页拥挤、底部空白”的失败模式，测试先红后绿。
+    - 扩展 `quality_report_allows_wide_compact_horizontal_flow`，确保垂直居中的一行流程不会被新 gate 误伤。
+  - `src/tools/review.rs`：
+    - 新增 `vertical_under_utilization` major issue。当 main component union 横向覆盖足够、纵向跨度不足且上下空白明显不平衡时触发，target ids 绑定到整组成分。
+    - 旧 `under_utilized` 保留原语义，只抓横向和纵向都缩成小团的情况；新 gate 专门抓 top-heavy/bottom-heavy 版面。
+  - `src/agent.rs` / `tests/prompt_tests.rs`：
+    - 在 DrawPlan revision prompt 中加入 `vertical_under_utilization` 的修复语义：成组移动或扩展 main component group，使 union bbox 垂直居中并利用 paper-height canvas。
+    - 在 RoundImprovementPlan prompt 中要求此 issue 必须命名 `global_layout` 或完整 component group，并给出 union bbox 垂直跨度和上下空白平衡的 success check。
+- 当前验证：
+  - `cargo test tools::draw_plan::tests::readable_shared_input_width_handles_float_width_below_floor -- --nocapture`：先红后绿。
+  - `cargo test --test draw_plan_tests model_draw_plan_polish_handles_shared_input_width_below_readability_floor -- --nocapture`：通过。
+  - `cargo test --test pipeline_tests resume_pipeline_without_final_respects_existing_iteration_cap -- --nocapture`：先红后绿。
+  - `cargo test --test pipeline_tests resume_pipeline_continues_rejected_run_directory -- --nocapture`：通过。
+  - `cargo test --test review_tests quality_report_flags_top_heavy_vertical_underutilization_from_guard_smoke -- --nocapture`：先红后绿。
+  - `cargo test --test review_tests quality_report_allows_wide_compact_horizontal_flow -- --nocapture`：通过。
+  - `cargo test --test prompt_tests draw_plan_revision_prompt_uses_autofigure_style_visual_optimization_contract -- --nocapture`：先红后绿。
+  - `cargo test --test prompt_tests round_improvement_prompt_uses_regression_budget_as_repair_contract -- --nocapture`：先红后绿。
+- 最终验证：
+  - `cd renderer && npm run build`：通过。
+  - `git diff --check`：通过。
+  - `cargo fmt --check`：首次提示 `src/tools/review.rs` 一个 if 条件格式，运行 `cargo fmt` 后复测通过。
+  - `cargo test`：全量通过。测试过程中 LibreOffice 仍打印一次历史上出现过的外部 `DeploymentException`，但所有测试 exit 0。
+  - 由于本轮已经真实恢复到 6 个 round 且修了 resume 超额追加问题，暂不再自动续跑 rejected final；下一次真实 run 应新开有限 `SESSION_ID` 或由用户明确触发 manual resume。
+
+## 2026-06-22 stale revision-plan fix and bottom-margin inference guard
+
+- 新开真实 `.env` smoke：
+  - 命令：`SESSION_ID=post_vertical_gate_smoke_20260622_010000 REFERENCE_PREVIEWS=required MAX_ITERATIONS=4 MAX_MINUTES=75 bash scripts/run_real_env.sh examples/teacher_student.md`
+  - 结果：生成 `round_000..003` 和 `final/`，`accepted=false`，`reason="cap reached before acceptance"`；final PPTX `unzip -t` 通过。
+  - 本地质量：round 0 `score=58`、5 issues；round 1 `score=58`、5 issues；round 2 `score=40`、6 issues；round 3 `score=40`、6 issues。
+  - 人工查看 PNG 后的结论：round 1 的 `task_loss` 被移入中间 corridor；round 2/3 进一步把 `inference_note` 折进 student label 附近，并产生 overlap / crossed edge。final 选择了相对最好的 round 1，而不是更差的 round 2/3。
+- 根因定位：
+  - pipeline 确实从 best source round 重修，但 `revise_draw_plan_from_feedback` 仍读取 source round 的 `improvement_plan.json`。
+  - 当 round 2 已证明某个修复计划会退化时，round 3 虽然从 round 1 的 draw plan 起步，却仍复用 round 1 的 stale improvement plan，导致重复执行上一轮失败策略。
+- 已完成 stale-plan 修复：
+  - `src/pipeline.rs`：
+    - 新增 `select_revision_improvement_plan`。
+    - 当 revision source 是 best round、latest attempt 是失败轮次时，优先把 latest attempt 的 `improvement_plan.json` 传给下一次 `revise_draw_plan_from_feedback`；缺失时才回退到 source round plan。
+  - `src/pipeline.rs` tests：
+    - 新增 `revision_improvement_plan_prefers_latest_attempt_plan_when_revising_from_best_source`，先红后绿，确保不会继续用 stale source plan。
+  - 验证：`cargo test pipeline::tests::revision_improvement_plan_prefers_latest_attempt_plan_when_revising_from_best_source -- --nocapture` 通过；`cargo test --test workspace_pipeline_tests -- --nocapture` 通过。
+- stale-plan 修复后的真实 `.env` smoke：
+  - 命令：`SESSION_ID=post_latest_plan_selector_smoke_20260622_020000 REFERENCE_PREVIEWS=required MAX_ITERATIONS=4 MAX_MINUTES=75 bash scripts/run_real_env.sh examples/teacher_student.md`
+  - 结果：生成 `round_000..003` 和 `final/`，`accepted=false`，`reason="cap reached before acceptance"`；final PPTX `unzip -t` 通过。
+  - 本地质量：round 0 `score=46`、7 issues；round 1 `score=82`、2 issues；round 2 `score=88`、1 issue；round 3 `score=82`、3 issues。
+  - regression：round 1 `+36`、round 2 `+6`，说明 latest-attempt plan selector 明显减少了原地重复退化；round 3 `-6`，新增 `inference_annotation_in_bottom_margin`、`label_outside_main_area`、`text_wrap_risk`。
+  - 人工查看 PNG 后的结论：round 2 已较干净，只剩 `Inference: student only` collapsed；round 3 为修 collapsed note，把 inference cue 移到页面底部 margin 作为裸文本，引入新的视觉退化。
+- bottom-margin inference 修复：
+  - `tests/draw_plan_tests.rs`：
+    - 新增 `model_draw_plan_polish_moves_bottom_margin_inference_text_near_student`，用 `post_latest_plan_selector_smoke_20260622_020000/round_003` 的真实几何复现 bottom-margin inference text，测试先红。
+  - `src/tools/draw_plan.rs`：
+    - 新增 late-stage `move_bottom_margin_inference_texts_near_student`，仅处理明显落入底部边缘的 student-only inference 文本。
+    - 候选位置限制在 student 左侧/右侧/上方，或在不会进入 bottom margin 时放到 student 下方，并复用已有 box / connector / text clearance 检查。
+    - 撤回之前对通用 `student_inference_note_candidates` 的泛化试探，避免把旧的 teacher-student corridor 保护测试打破。
+  - 验证：
+    - `cargo test --test draw_plan_tests model_draw_plan_polish_moves_bottom_margin_inference_text_near_student -- --nocapture`：先红后绿。
+    - `cargo test --test draw_plan_tests model_draw_plan_polish_moves_inference_text_out_of_teacher_student_corridor_from_smoke -- --nocapture`：通过。
+    - `cargo test --test draw_plan_tests inference -- --nocapture`：通过（42/42）。
+    - `cargo fmt --check`：先提示新增 fixture 格式，运行 `cargo fmt` 后复测通过。
+- 待完成：
+  - 用 bottom-margin guard 后的代码再跑一个有限真实 `.env` smoke，确认 round 3 类型的修复不会再把 inference cue 推到页面底边。
+  - 跑全量 `cargo test`、renderer build、`git diff --check`。
+
+## 2026-06-22 bottom-margin guard smoke and right-edge inference follow-up
+
+- bottom-margin guard 后的真实 `.env` smoke：
+  - 命令：`SESSION_ID=post_bottom_margin_inference_guard_smoke_20260622_133702 REFERENCE_PREVIEWS=required MAX_ITERATIONS=4 MAX_MINUTES=75 bash scripts/run_real_env.sh examples/teacher_student.md`
+  - 结果：生成 `round_000..003` 和 `final/`，`accepted=false`，`reason="cap reached before acceptance"`；final PPTX `unzip -t` 通过。
+  - 本地质量：round 0 `score=40`、8 issues；round 1 `score=82`、3 issues；round 2 `score=82`、2 issues；round 3/final `score=82`、3 issues。
+  - regression：round 1 `+42`，解决 collapsed/crowding/overlap/corridor；round 2 从 source round 1 重修但引入 `inference_annotation_in_bottom_margin` 和 `edge_crosses_component`；round 3 回到 source round 1 同等质量，final 没有选择 round 2 的 bottom-margin 退化。
+- 人工查看 final PNG 后的新发现：
+  - `Inference: student only` 仍作为裸文本贴在右下角，bbox 为 `[0.7895, 0.875, 0.98, 0.94]`。
+  - 本地 quality 只报 `label_outside_main_area`，没有报 `inference_annotation_in_bottom_margin`，说明前一版 guard 只覆盖了 `y1 >= 0.88` 或 `bottom >= 0.95` 的极端底部情况，漏掉了“贴右边界且低于 student/output 路径”的边缘外漂。
+- right-edge inference 修复：
+  - `tests/draw_plan_tests.rs`：
+    - 新增 `model_draw_plan_polish_moves_right_edge_inference_text_near_student`，使用 `post_bottom_margin_inference_guard_smoke_20260622_133702/final` 的真实 `figure_plan` / `draw_plan` 几何复现右下角 `inference_note`，测试先红后绿。
+  - `src/tools/draw_plan.rs`：
+    - `move_bottom_margin_inference_texts_near_student` 现在只接管组件型 `inference_note` / `*_inference_note*` 文本，不抢管已有专门 corridor/periphery pass 的 `ann_inference`。
+    - 新增 right-edge-low 判定：当 inference note 贴右边界、低于 student 且离 student 水平过远时，也拉回 student periphery。
+    - 候选顺序调整为右侧、可用的 student 下方、左侧、上方；同时当 student 本身已接近底部时，不再强制把合法的底部 periphery note 拉走，避免破坏 projector/encoder 旧烟测。
+- 追加验证：
+  - `cargo test --test draw_plan_tests model_draw_plan_polish_moves_right_edge_inference_text_near_student -- --nocapture`：先红后绿。
+  - `cargo test --test draw_plan_tests model_draw_plan_polish_moves_bottom_margin_inference_text_near_student -- --nocapture`：通过。
+  - `cargo test --test draw_plan_tests model_draw_plan_polish_moves_upserted_inference_annotation_below_student_corridor_from_smoke -- --nocapture`：通过。
+  - `cargo test --test draw_plan_tests model_draw_plan_polish_separates_right_side_task_loss_output_and_inference_from_latest_smoke -- --nocapture`：通过。
+  - `cargo test --test draw_plan_tests model_draw_plan_polish_repairs_projector_encoder_overlap_from_latest_smoke -- --nocapture`：通过。
+  - `cargo test --test draw_plan_tests inference -- --nocapture`：通过（43/43）。
+- 最终验证：
+  - `cargo test`：全量通过。测试过程中 LibreOffice 仍打印一次历史外部 `DeploymentException`，但所有测试 exit 0。
+  - `cd renderer && npm run build`：通过。
+  - `cargo fmt --check`：通过。
+  - `git diff --check`：通过。
+- 剩余风险：
+  - 最新真实 smoke 仍未 accepted，且分数在 82 附近停住；剩余主要问题是 `vertical_under_utilization`、`label_outside_main_area`、`text_wrap_risk`。right-edge guard 已用真实 final fixture 覆盖，但尚未再跑下一次真实 `.env` smoke 来证明该局部修复会进入完整 loop 的 final。
+  - 当前 loop 已能避免明显更差的 round 进入 final，但还不能保证每一轮单调提升；后续需要把 `same/regressed` 轮次的反馈压缩成更明确的局部 action，尤其是 vertical recenter 和 output width 这两类仍反复出现的问题。
+
+## 2026-06-22 post-right-edge smoke, task-loss reverse gate, and narrow simple-Y clamp fix
+
+- right-edge inference guard 后的真实 `.env` smoke：
+  - 命令：`SESSION_ID=post_right_edge_guard_smoke_20260622_140051 REFERENCE_PREVIEWS=required MAX_ITERATIONS=5 MAX_MINUTES=90 bash scripts/run_real_env.sh examples/teacher_student.md`
+  - 结果：`accepted=false`、5 轮、`reason="cap reached before acceptance"`；final PPTX 有效。
+  - 本地质量：round 0 `score=0`，round 1 `score=76`，round 2 `score=94`，round 3 `score=94`，round 4 `score=70`，final `score=94`。
+  - 人工查看 final PNG 后确认 `ann_inference` 位于 student/output 右侧 periphery，不应被 `annotation_in_main_corridor` 判为阻塞；这是一处本地 false positive。
+- 已完成 review false positive 修复：
+  - `tests/review_tests.rs`：新增 `quality_report_allows_inference_annotation_at_right_student_periphery_from_latest_smoke`，先红后绿。
+  - `src/tools/review.rs`：`annotation_sits_between_branch_rows` 现在要求 annotation center-x 仍落在 teacher/student branch span 附近，避免把右侧 periphery inference note 误判成 branch corridor annotation。
+- 已完成 task-loss reverse-flow gate：
+  - `tests/review_tests.rs`：新增 `quality_report_flags_task_loss_reverse_flow_from_right_edge_smoke`，覆盖 student source 向左/backward 指向 task-loss 的失败模式。
+  - `src/tools/review.rs`：新增 `task_loss_reverse_flow`，对 student/main source 到 task-loss 的左向 connector 报 `task_loss_reverse_flow` major。
+  - `src/agent.rs` / `tests/prompt_tests.rs`：DrawPlan revision 和 RoundImprovementPlan prompt 都加入 `task_loss_reverse_flow` 的局部修复契约，要求 task-loss cue 放到 student source 右侧或右上方，并使用 x-increasing connector。
+- task-loss reverse gate 后的真实 `.env` smoke：
+  - 命令：`SESSION_ID=post_task_loss_reverse_gate_smoke_20260622_142312 REFERENCE_PREVIEWS=required MAX_ITERATIONS=5 MAX_MINUTES=90 bash scripts/run_real_env.sh examples/teacher_student.md`
+  - 初始质量：round 0 `score=64`，round 1 `score=76`，round 2 `score=88`。
+  - run 在生成 round 003 前崩溃，panic 为 `min > max, or either was NaN. min = 0.2, max = 0.15120000000000003`。
+  - 复现命令：`RUST_BACKTRACE=1 cargo run -- resume --run runs/teacher-student-distillation-with-latent-residuals/post_task_loss_reverse_gate_smoke_20260622_142312`
+  - 根因：`simple_y_teacher_above_student_candidate` 对窄 student bbox 使用 `clamp(0.20, box_width(student) * 1.08)`；当 model 输出 student width 约 `0.14` 时，上界低于 readability floor。相邻的 `simple_y_balanced_teacher_candidate` 也有同形态风险。
+- 已完成 narrow simple-Y clamp 修复：
+  - `src/tools/draw_plan.rs`：`simple_y_teacher_above_student_candidate` 和 `simple_y_balanced_teacher_candidate` 的动态 clamp 上界现在至少为 `0.20`，允许窄框扩到最低可读宽度而不是 panic。
+  - `src/tools/draw_plan.rs` tests：
+    - 新增 `simple_y_teacher_candidate_handles_narrow_student_width_below_floor`。
+    - 新增 `simple_y_balanced_teacher_candidate_handles_narrow_student_width_below_floor`。
+    - 两个测试均先红后绿。
+- 恢复中断真实 run：
+  - 命令：`cargo run -- resume --run runs/teacher-student-distillation-with-latent-residuals/post_task_loss_reverse_gate_smoke_20260622_142312`
+  - 结果：不再 panic，生成 round 003/004 和 final；`accepted=false`、5 轮、`reason="cap reached before acceptance"`。
+  - 本地质量：round 0 `score=64`，round 1 `score=76`，round 2 `score=88`，round 3 `score=82`，round 4/final `score=88`。
+  - final 本地 issue：`vertical_under_utilization`、`route_detour`。
+  - 人工查看 final PNG：版面上方大空白、main group 靠下；`e_input_teacher` 顶部长 dogleg；`inference_note`、student label 仍有视觉问题。vision review 也指出 connector/annotation/box whitespace 问题。
+
+## 2026-06-22 vertical rebalance guard and latest smoke review leakage
+
+- 针对 `post_task_loss_reverse_gate_smoke_20260622_142312/final` 的版心根因：
+  - main component union 约为 `y=0.3975..0.87`，上空白约 `0.40`，下空白约 `0.13`。
+  - `improvement_plan.json` 反而建议把整组下移到 `y≈0.55..0.95`，说明 reasoner 对 normalized y 坐标/版心的判断会给出反方向建议；只靠 prompt 容易继续打转。
+- 已完成 deterministic vertical rebalance：
+  - `tests/draw_plan_tests.rs`：新增 `model_draw_plan_polish_recenters_top_blank_teacher_student_group_from_latest_smoke`，用真实 final 几何先复现 bottom-heavy/top-blank 失败。
+  - `src/tools/draw_plan.rs`：新增末端 `rebalance_vertically_underutilized_main_group`。
+    - 只在主组件组横向跨度足够、纵向跨度未充分利用、且“上方大空白/内容偏下”时触发。
+    - 只允许上移，不自动下移，避免破坏 `with_figure_plan` 的语义同步 fixture。
+    - 平移 boxes/text/connectors/connector labels，保持相对结构，不重画拓扑。
+  - 回归处理：初版 pass 误触发 `model_draw_plan_polish_removes_connectors_absent_from_figure_plan`，随后收窄为只处理 top-blank 的上移场景；`draw_plan_tests` 全量通过。
+- vertical rebalance 后的新真实 `.env` smoke：
+  - 命令：`SESSION_ID=post_vertical_rebalance_smoke_20260622_150000 REFERENCE_PREVIEWS=required MAX_ITERATIONS=5 MAX_MINUTES=90 bash scripts/run_real_env.sh examples/teacher_student.md`
+  - 结果：`accepted=false`、5 轮、`reason="cap reached before acceptance"`；final PPTX `unzip -t` 通过，renderer `source="model_generated_code"`、`used_fallback=false`。
+  - 本地质量：round 0 `score=100`、0 issue；round 1 `score=76`；round 2 `score=82`；round 3 `score=76`；round 4 `score=70`；final 正确选择 round 0，final local `score=100`。
+  - 结论：best-round selection 能保留本地最佳，但“本地 score=100 仍被 vision reject”，说明本地 quality gate 仍漏掉 vision 的主要视觉失败。
+  - final vision localized issues：
+    - `teacher_model`：oversized box with tiny centered label。
+    - `e_input_student`：simple input→student flow 使用了大折线。
+    - `e_teacher_supervision_label`：connector label 离 dashed line 太近/压线。
+    - `anno_inference`：边缘 inference note 仍有视觉杂讯。
+    - `latent_residuals`：Y-branch supervision node 不够居中。
+- 已完成两处本地漏检补强：
+  - `tests/review_tests.rs`：
+    - 新增 `quality_report_flags_connector_label_crowding_own_edge_from_latest_smoke`，覆盖 connector label 与自身 edge 仅有约 1.5mm 间距的 blocking 问题。
+    - 新增 `quality_report_flags_three_point_input_student_detour_from_latest_smoke`，覆盖 input→student 的 3 点大折线路由。
+  - `src/tools/review.rs`：
+    - 新增 `label_crowds_own_edge` / `label_crowds_segment`，对 connector label 贴近自身水平/垂直 segment 的情况复用 `label_overlaps_edge` blocking issue。为避免误伤旧的 detached-label fixture，要求 label center 到 segment 也足够近。
+    - 新增 `has_three_point_input_student_elbow_detour`，对 input→student 的 3 点长 vertical/horizontal elbow 报 `route_detour` major。
+- 当前验证：
+  - `cargo test tools::draw_plan::tests::simple_y_ -- --nocapture`：通过。
+  - `cargo test --test draw_plan_tests -- --nocapture`：通过（171/171）。
+  - `cargo test --test review_tests -- --nocapture`：通过（57/57）。
+  - `cargo test --test prompt_tests -- --nocapture`：通过（10/10）。
+  - `cargo fmt`：通过。
+  - `cargo test`：全量通过；测试过程中 LibreOffice 仍打印一次历史外部 `DeploymentException`，但所有测试 exit 0。
+  - `cd renderer && npm run build`：通过。
+  - `cargo fmt --check`：通过。
+  - `git diff --check`：通过。
+- 剩余风险 / 下一步：
+  - 尚未在新增 `label_crowds_own_edge` 和 `has_three_point_input_student_elbow_detour` 之后再跑真实 `.env` smoke；最新真实证据仍显示 `accepted=false`。
+  - 本地 gate 现在能抓住 latest final 的两个 vision major/blocking，但还没有覆盖 `teacher_model` oversized tiny-label、`latent_residuals` Y-branch symmetry、`anno_inference` visual clutter 这三类 vision issue。
+  - 下一步应继续把这些 vision issue 转成本地结构化 issue，并优先让 `round_000 local score=100 but vision reject` 这种情况不再发生；否则 loop 会继续“本地满分但视觉不过，再迭代引入回退”。
+
+## 2026-06-22 semantic/style/input gates and deterministic repair closure
+
+- 本轮用户目标：
+  - 针对“框内文字空隙特别多、框和框挤、线条/块重叠、配色和审美差、后期整体提升很小”继续定位根因并实施计划。
+  - 用户特别强调：不要每轮重构；coding 模型要先读上一轮代码和反馈，对应问题做局部修改；模板只能作为参考；视觉模型理论上应能看出问题，但要给足 prompt 和结构化证据。
+- 当前结论：
+  - 视觉模型确实能看出不少问题，但只靠 vision/reasoner 自然语言建议不稳定。真实 smoke 中同一类问题会被指出，却不一定在下一轮被 coder 稳定修成；有时还会把 style、label、input width 这类局部问题修坏。
+  - 因此架构上需要“两层闭环”：vision/reasoner 负责发现和提出意图，本地 quality gate/DrawPlan repair 负责把可判定几何、样式一致性和可读性 invariant 变成确定性约束。
+  - 本轮没有做大重构，而是围绕真实 run 暴露的具体坏图做 TDD：先把每个失败模式转成 review/draw_plan/prompt 测试，再做最小修复。
+- 新增/修复的本地 quality gate：
+  - `src/tools/review.rs`：
+    - `label_far_from_edge` 现在会检查显式绑定到 connector 的 fan-in label，即使目标节点有多条 incoming edge，也不能把 `vision_to_fusion_label` / `text_to_fusion_label` 留在远离实际 polyline 的空白区。
+    - `text_wrap_risk` 不再只看最长 token，也检查短 input phrase 的可读宽度，覆盖真实 smoke 中 `Input x` bbox 太窄但单词不长的漏检。
+    - 增加 teacher/training-only 大框留白、supervision branch asymmetry 等真实 smoke 失败模式的本地 issue。
+  - `src/pipeline.rs`：
+    - 在 `QualityReport` 中注入 FigurePlan 与 DrawPlan 的 connector style mismatch，尤其是 FigurePlan 要求 solid/dashed 但 DrawPlan 变成另一种样式时，直接给 `edge_style_mismatch` major issue。
+  - `src/agent.rs` 与 `tests/prompt_tests.rs`：
+    - prompt 契约同步补充 `supervision_branch_asymmetry`、`longest token or short input phrase`、`edge_style_mismatch`，要求 reasoner/coder 给出可执行几何或样式修复，而不是泛泛审美建议。
+- 新增/修复的 deterministic DrawPlan repair：
+  - `src/tools/draw_plan.rs`：
+    - 在 `polish_model_draw_plan_geometry_with_figure_plan` 末端增加 style-only connector sync，只同步 connector style，不重新添加已折叠/删除的 label，避免 full sync 反复恢复噪声 label。
+    - `readable_shared_input_width` 不再把当前 bbox 宽度作为不可突破上界；短 input phrase 可扩到最低可读宽度。
+    - 新增 outer-edge input phrase widening，仅处理 `input`/`source`、短文本、贴左右边界的 input box，避免误扩 branch 内部 input。
+    - `repair_draw_plan_geometry_inner` 末端也执行 connector label finalization，因为 mock/repair 路径不会走完整 polish；这修复了 mock multimodal pipeline 中 fan-in label 被推远的问题。
+    - `snap_connector_labels_to_final_routes` 先保留“已经清晰且离 route 足够近”的 label，只重吸附真正漂远的 label；对多段 task/loss feedback route 优先选择最长水平反馈段下方的候选，避免把 `L_task` label 拉回 student-output 主线附近。
+- 新增关键测试：
+  - `tests/review_tests.rs`：
+    - `quality_report_flags_training_only_teacher_box_whitespace_from_latest_smoke`
+    - `quality_report_flags_supervision_branch_asymmetry_from_latest_smoke`
+    - `quality_report_flags_explicit_fanin_edge_label_far_from_edge_from_latest_smoke`
+    - `quality_report_flags_input_phrase_too_narrow_from_latest_smoke`
+  - `src/pipeline.rs` 单元测试：
+    - `quality_report_injects_draw_plan_edge_style_mismatch`
+  - `tests/draw_plan_tests.rs`：
+    - `model_draw_plan_polish_resyncs_solid_teacher_residual_after_topology_repairs_from_smoke`
+    - `model_draw_plan_polish_widens_shared_task_input_phrase_from_semantic_gate_smoke`
+    - `model_draw_plan_polish_widens_left_edge_task_input_phrase_from_real_smoke`
+    - `repair_draw_plan_geometry_resnaps_multimodal_fanin_labels_from_mock_smoke`
+- 真实 `.env` smoke 记录：
+  - `post_supervision_whitespace_gate_smoke_20260622_163000`
+    - 命令：`SESSION_ID=post_supervision_whitespace_gate_smoke_20260622_163000 REFERENCE_PREVIEWS=required MAX_ITERATIONS=5 MAX_MINUTES=90 bash scripts/run_real_env.sh examples/teacher_student.md`
+    - 结果：`accepted=false`，5 轮达到上限；质量分数 `40 -> 64 -> 88 -> 82 -> 82`，final 选择 88。
+    - 观察：新增 gate 能把 teacher whitespace / supervision asymmetry 反馈进 loop，但后续又暴露 explicit fan-in label、style mismatch、residual route detour、`task_input` narrow phrase。
+  - `post_semantic_quality_gates_smoke_20260622_171500`
+    - 命令：`SESSION_ID=post_semantic_quality_gates_smoke_20260622_171500 REFERENCE_PREVIEWS=required MAX_ITERATIONS=5 MAX_MINUTES=90 bash scripts/run_real_env.sh examples/teacher_student.md`
+    - 结果：`accepted=false`；round 分数为 `70, 34, 40, 52, 22`，final 选择 70。
+    - 观察：`edge_style_mismatch` 和 `text_wrap_risk` 已稳定进入本地反馈，但模型每轮没有可靠执行 style-only 修复，说明这类 invariant 需要 deterministic repair，而不是只靠 prompt。
+  - `post_deterministic_style_input_smoke_20260622_183000`
+    - 命令：`SESSION_ID=post_deterministic_style_input_smoke_20260622_183000 REFERENCE_PREVIEWS=required MAX_ITERATIONS=3 MAX_MINUTES=60 bash scripts/run_real_env.sh examples/teacher_student.md`
+    - 结果：`accepted=false`，3 轮上限；round 分数 `70 -> 88 -> 100`，final local quality `score=100`、`issues=[]`；final PPTX `unzip -t` 通过。
+    - 观察：确定性 style sync 与 shared input width repair 生效；未 accepted 是因为 vision review 没在 3 轮内通过，而不是本地 gate 阻塞。
+  - `post_input_width_gate_smoke_20260622_190000`
+    - 命令：`SESSION_ID=post_input_width_gate_smoke_20260622_190000 REFERENCE_PREVIEWS=required MAX_ITERATIONS=1 MAX_MINUTES=35 bash scripts/run_real_env.sh examples/teacher_student.md`
+    - 结果：`accepted=false`，单轮上限；final quality `score=70`，issue 只剩 `annotation_in_main_corridor`、`edge_crosses_component`、`edge_crossing`。
+    - 观察：`text_wrap_risk` 和 `edge_style_mismatch` 已消失；`input_data` bbox 约 `[0.028, 0.7033, 0.1803, 0.8973]`，`Input x` 已达到可读宽度。人工查看 PNG 后确认剩余主要是 residual dashed connector 穿过 teacher latent/main corridor、inference note 和 route crossing，不是 input width/style 问题。
+- mock pipeline 回归与修复：
+  - 全量 `cargo test` 首次暴露 `resume_pipeline_uses_existing_run_directory` 失败。
+  - 根因：新增 `label_far_from_edge` 正确捕获 mock multimodal 的 `vision_to_fusion_label` / `text_to_fusion_label`，但 mock pipeline 只走 `repair_draw_plan_geometry_with_figure_plan`，不走完整 `polish_model_draw_plan_geometry_with_figure_plan`，所以 connector label finalization 没覆盖 repair 主路径。
+  - 先用 `tmp/debug_resume_multimodal` 复现：两轮均 `score=88`，`quality_report.json` 只有两个 `label_far_from_edge`。
+  - 新增红测 `repair_draw_plan_geometry_resnaps_multimodal_fanin_labels_from_mock_smoke` 后修复 repair 末端 label snap；再处理二阶回归，避免 `L_task` feedback label 被拉回主线附近。
+  - 复测命令：`rm -rf tmp/debug_resume_multimodal_after_label_fix && cargo run -- run --method examples/multimodal_fusion.md --out tmp/debug_resume_multimodal_after_label_fix --style wps-clean --aspect paper-wide --target-width-mm 85 --max-iterations 2 --max-cost-usd 3.0 --max-minutes 20 --reference-previews auto --image-provider none --mock-models --keep-intermediate`
+  - 结果：`accepted=true, rounds=2, reason=accepted`。
+- 最终验证：
+  - `cargo test --test draw_plan_tests`：通过（175/175）。
+  - `cargo test --test pipeline_tests resume_pipeline_uses_existing_run_directory -- --nocapture`：通过。
+  - `cargo test`：全量通过；LibreOffice 仍打印一次历史外部 `DeploymentException`，但所有测试 exit 0。
+  - `npm run build`（`renderer/`）：通过。
+  - `cargo fmt --check`：通过。
+  - `git diff --check`：通过。
+- 剩余风险 / 下一步：
+  - 最新真实 smoke 仍未 accepted；style mismatch 与 input phrase width 已稳定消除，但剩余 `annotation_in_main_corridor`、`edge_crosses_component`、`edge_crossing` 说明 route/annotation 层还需要继续补本地 gate 与 deterministic reroute。
+  - 视觉模型能看出问题，但不能保证每轮做出有用、单调的局部修改。后续应继续把 vision issue 转成本地可复现 fixture，并优先处理 connector crossing、annotation corridor、residual supervision route 三类仍反复出现的问题。
+
+## 2026-06-22 late-round closure: y-branch annotations, labels, schema robustness
+
+- 本轮后半段目标：
+  - 继续按真实 `.env` loop 的上一轮反馈做局部修复，不再大重构。
+  - 优先处理 teacher-student 图中反复出现的 inference note、task loss label、frozen annotation、JSON/schema 解析阻断。
+  - 收尾时保留当前真实 smoke 证据，避免把未完成的右侧拥挤问题伪装成已解决。
+- 已完成的 DrawPlan 局部修复：
+  - `src/tools/draw_plan.rs`
+    - 新增/接入 compact teacher-student Y-branch annotation repair：当模型把 `Inference: student only` 作为独立小框塞进 input/student corridor 时，将其转换成 editable text annotation，并清理相关拥挤组件语义。
+    - 将 output/student prediction edge 上的 `L_task` 类 label 转成独立 task-loss cue，避免 loss label 压在主 prediction edge 上。
+    - 对 input→teacher、input→student 的不必要 dogleg 做局部短路由修复。
+    - 扩展 compact task-loss label snapping：`L_task`/`ltask` 这类短 label 也会被吸附到真实 task-loss edge，而不是漂到空白处。
+    - 扩展 teacher-state annotation anchoring：`frozen` / `teacher frozen` / `freeze` id 的 annotation 不再被当成 margin 噪声删除，而是锚到 teacher 附近。
+  - `tests/draw_plan_tests.rs`
+    - 新增真实 smoke fixture 回归：
+      - `model_draw_plan_polish_clears_y_branch_inference_lane_loss_label_and_input_detours`
+      - `model_draw_plan_polish_resnaps_task_loss_label_to_short_loss_edge_from_latest_smoke`
+      - `model_draw_plan_polish_anchors_bottom_frozen_annotation_near_teacher_from_latest_smoke`
+- 已完成的模型 JSON/schema 鲁棒性修复：
+  - `src/agent.rs`
+    - `RoundImprovementPlan` 解析先转 `serde_json::Value` 再转强类型 schema，容忍模型 JSON 中重复字段；真实失败例是 `expected_visible_effect` 重复导致整轮中断。
+    - 新增单元测试 `round_improvement_parser_tolerates_duplicate_model_fields`。
+  - `src/schema.rs`
+    - `ComponentRole::Loss` 接受 `supervision` 作为输入 alias；真实失败例是 reasoner 在 FigurePlan component role 中输出 `"supervision"`。
+  - `tests/schema_tests.rs`
+    - 新增 `component_role_accepts_supervision_alias_from_model`。
+- 真实 `.env` smoke 记录：
+  - `post_inference_note_readability_smoke_20260622_212000`
+    - 命令：`SESSION_ID=post_inference_note_readability_smoke_20260622_212000 REFERENCE_PREVIEWS=required MAX_ITERATIONS=5 MAX_MINUTES=90 bash scripts/run_real_env.sh examples/teacher_student.md`
+    - 结果：`accepted=false`，5 轮上限；final local score `76`。
+    - 主要 issue：`standalone_inference_lane`、`loss_label_on_prediction_edge`、`route_detour`。人工查看确认 inference note 在 input/student corridor，`L_task` 仍压在 prediction/loss 相关边附近。
+  - `post_y_branch_annotation_repair_smoke_20260622_214500`
+    - 命令：`SESSION_ID=post_y_branch_annotation_repair_smoke_20260622_214500 REFERENCE_PREVIEWS=required MAX_ITERATIONS=5 MAX_MINUTES=90 bash scripts/run_real_env.sh examples/teacher_student.md`
+    - 结果：`accepted=false`，5 轮上限；final local score `94`，PPTX `unzip -t` 通过，renderer `source="model_generated_code"`、`used_fallback=false`。
+    - 主要剩余 issue：`label_far_from_edge`，目标为 `e_task_loss_label,e_task_loss`。这证明 Y-branch inference note/loss-label/detour 修复有效，但 compact task-loss label 仍需 resnap。
+  - `post_task_loss_label_snap_smoke_20260622_220500`
+    - 命令：`SESSION_ID=post_task_loss_label_snap_smoke_20260622_220500 REFERENCE_PREVIEWS=required MAX_ITERATIONS=5 MAX_MINUTES=90 bash scripts/run_real_env.sh examples/teacher_student.md`
+    - 结果：`accepted=false`，5 轮上限；final local score `94`，PPTX 通过，renderer 无 fallback。
+    - 主要剩余 issue：`label_outside_main_area`，目标 `a_freeze`；人工查看是 `frozen` annotation 漂在顶部/边缘，随后用 teacher-state anchoring 修复。
+  - `post_frozen_anchor_smoke_20260622_222500`
+    - 命令：`SESSION_ID=post_frozen_anchor_smoke_20260622_222500 REFERENCE_PREVIEWS=required MAX_ITERATIONS=2 MAX_MINUTES=45 bash scripts/run_real_env.sh examples/teacher_student.md`
+    - 结果：执行失败，不是绘图失败；原因是 reasoner 返回的 `RoundImprovementPlan` JSON 有重复 `expected_visible_effect` 字段，旧强类型解析直接报错。
+    - 修复：`parse_round_improvement_plan_text` 先解析为 `serde_json::Value`，重复 key 由 JSON object 归并后再进 schema。
+  - `post_duplicate_json_parser_smoke_20260622_223500`
+    - 命令：`SESSION_ID=post_duplicate_json_parser_smoke_20260622_223500 REFERENCE_PREVIEWS=required MAX_ITERATIONS=2 MAX_MINUTES=45 bash scripts/run_real_env.sh examples/teacher_student.md`
+    - 结果：执行失败于 FigurePlan schema；原因是模型输出 component role `"supervision"`，旧 `ComponentRole` 只接受 `loss`/`main`/`context` 等固定枚举。
+    - 修复：`ComponentRole::Loss` 增加 `alias = "supervision"`，保留序列化输出仍为 `"loss"`。
+  - `post_component_role_alias_smoke_20260622_224500`
+    - 命令：`SESSION_ID=post_component_role_alias_smoke_20260622_224500 REFERENCE_PREVIEWS=required MAX_ITERATIONS=2 MAX_MINUTES=45 bash scripts/run_real_env.sh examples/teacher_student.md`
+    - 结果：命令 exit 0；`accepted=false`，2 轮上限；PPTX `unzip -t` 通过；renderer `source="model_generated_code"`、`used_fallback=false`。
+    - 本地质量从 round 0 score `0` 提升到 round 1/final score `52`，说明 loop 能继续迭代且 parser/schema 阻断已解除。
+    - final 仍有 `task_loss_in_branch_corridor`、`component_collapsed`、多处 `component_crowding`、`edge_crossing`。人工查看发现具体残留形态：`student_latent` 右下大框、`student_output`/`task_loss` 贴右侧边界且互相拥挤，`e_teacher_to_residual` 长虚线横穿 `e_student_encode_latent`。这部分尚未实现新的 deterministic repair，作为下一步保留。
+- 最终本地验证：
+  - `cargo test --test schema_tests component_role_accepts_supervision_alias_from_model -- --nocapture`：通过。
+  - `cargo fmt --check`：通过。
+  - `cargo test`：全量通过；LibreOffice 仍打印一次历史外部 `DeploymentException`，但所有测试 exit 0。
+  - `cd renderer && npm run build`：通过。
+  - `git diff --check`：通过。
+- 收尾状态：
+  - 已修复本轮两个“无法继续迭代”的真实阻断：重复 JSON field、`ComponentRole=supervision`。
+  - 已把多个视觉失败转成确定性 repair 和回归测试：inference note corridor、task-loss label 漂移、frozen annotation 边缘漂移。
+  - 尚未解决最新 2-round smoke 的右侧 latent/output/task-loss 拥挤与 residual crossing；已定位到具体 topology，下一轮应先把 `post_component_role_alias_smoke_20260622_224500/final/draw_plan.json` 固化为红测，再做一个窄范围 repair，不建议继续泛泛调 prompt。

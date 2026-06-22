@@ -414,7 +414,7 @@ pub struct Story {
 pub enum ReadingOrder {
     #[serde(rename = "left_to_right")]
     LeftToRight,
-    #[serde(rename = "top_to_bottom")]
+    #[serde(rename = "top_to_bottom", alias = "bottom_to_top")]
     TopToBottom,
 }
 
@@ -481,7 +481,7 @@ pub enum ComponentRole {
     Input,
     #[serde(rename = "output")]
     Output,
-    #[serde(rename = "loss")]
+    #[serde(rename = "loss", alias = "supervision")]
     Loss,
     #[serde(rename = "data")]
     Data,

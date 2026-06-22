@@ -1,7 +1,7 @@
 use std::fs;
 use std::time::Duration;
 
-use methodfig::pipeline::{run_pipeline, RunOptions};
+use methodfig::pipeline::{resume_pipeline, run_pipeline, RunOptions};
 use methodfig::schema::{CanvasAspect, ImageProviderKind, ReferencePreviewMode, StyleName};
 
 #[test]
@@ -51,10 +51,20 @@ fn mock_pipeline_writes_agentic_workspace_and_draw_plan_artifacts() {
     assert!(round_dir.join("validation_report.json").exists());
     assert!(round_dir.join("reference_selection.json").exists());
     assert!(round_dir.join("improvement_plan.json").exists());
+    assert!(round_dir.join("quality_report.json").exists());
+    assert!(round_dir.join("regression_report.json").exists());
+    assert!(round_dir.join("issue_binding.json").exists());
+    assert!(round_dir.join("issue_history.json").exists());
+    assert!(round_dir.join("repair_report.json").exists());
     assert!(round_dir.join("renderer_status.json").exists());
     assert!(out_dir.join("final/draw_plan.json").exists());
     assert!(out_dir.join("final/reference_selection.json").exists());
     assert!(out_dir.join("final/improvement_plan.json").exists());
+    assert!(out_dir.join("final/quality_report.json").exists());
+    assert!(out_dir.join("final/regression_report.json").exists());
+    assert!(out_dir.join("final/issue_binding.json").exists());
+    assert!(out_dir.join("final/issue_history.json").exists());
+    assert!(out_dir.join("final/repair_report.json").exists());
     assert!(out_dir.join("final/figure.ts").exists());
     assert!(out_dir.join("final/renderer_status.json").exists());
 
@@ -141,8 +151,79 @@ fn mock_pipeline_revises_generated_code_from_previous_round_context() {
         .join("round_001/workspace/readable/previous_code/figure.ts")
         .exists());
     assert!(out_dir
+        .join("round_001/workspace/readable/previous_quality_report.json")
+        .exists());
+    assert!(out_dir
+        .join("round_001/workspace/readable/previous_regression_report.json")
+        .exists());
+    assert!(out_dir
+        .join("round_001/workspace/readable/previous_issue_binding.json")
+        .exists());
+    assert!(out_dir
+        .join("round_001/workspace/readable/previous_issue_history.json")
+        .exists());
+    assert!(out_dir
+        .join("round_001/workspace/readable/previous_repair_report.json")
+        .exists());
+    assert!(out_dir
         .join("round_001/workspace/writable/code/figure.ts")
         .exists());
     assert!(!out_dir.join("round_000/patch_plan.json").exists());
     assert!(!out_dir.join("round_001/patch_plan.json").exists());
+}
+
+#[test]
+fn resume_workspace_exposes_previous_renderer_error_to_coder() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let method_path = temp.path().join("method.md");
+    let out_dir = temp.path().join("run");
+    fs::write(
+        &method_path,
+        "# Method\n\nA teacher model supervises a compact student with latent residuals.",
+    )
+    .expect("write method");
+
+    let first = run_pipeline(RunOptions {
+        method_path,
+        out_dir: out_dir.clone(),
+        style: StyleName::WpsClean,
+        aspect: CanvasAspect::PaperWide,
+        target_width_mm: 85,
+        max_iterations: 1,
+        max_cost_usd: 3.0,
+        max_minutes: 20,
+        image_provider: ImageProviderKind::None,
+        reference_previews: ReferencePreviewMode::Auto,
+        mock_models: true,
+        keep_intermediate: true,
+        renderer_timeout: Duration::from_secs(20),
+    })
+    .expect("first capped mock run should complete");
+
+    assert!(!first.accepted);
+    fs::write(
+        out_dir.join("round_000/figure.model_error.log"),
+        "generated TypeScript violates DrawPlan runtime contract: unsupported runtime method getDrawPlan",
+    )
+    .expect("write synthetic renderer error");
+
+    let resumed = resume_pipeline(out_dir.clone()).expect("resume should produce next round");
+    assert!(resumed.accepted);
+    let readable_error = out_dir.join("round_001/workspace/readable/previous_renderer_error.txt");
+    assert!(readable_error.exists());
+    assert!(fs::read_to_string(readable_error)
+        .unwrap()
+        .contains("unsupported runtime method getDrawPlan"));
+
+    let manifest: serde_json::Value = serde_json::from_slice(
+        &fs::read(out_dir.join("round_001/workspace/manifest.json")).unwrap(),
+    )
+    .unwrap();
+    assert!(manifest["readable"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|entry| {
+            entry["path"] == "readable/previous_renderer_error.txt" && entry["format"] == "text"
+        }));
 }

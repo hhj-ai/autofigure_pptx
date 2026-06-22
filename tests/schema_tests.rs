@@ -1,5 +1,6 @@
 use methodfig::schema::{
-    figure_plan_schema_json, validate_stable_ids, CanvasAspect, FigurePlan, StyleName, Template,
+    figure_plan_schema_json, validate_stable_ids, CanvasAspect, ComponentRole, FigurePlan,
+    ReadingOrder, StyleName, Template,
 };
 
 #[test]
@@ -81,6 +82,47 @@ fn figure_plan_roundtrips_with_required_goal_fields() {
 
     let encoded = serde_json::to_string(&plan).expect("FigurePlan should serialize");
     assert!(encoded.contains("teacher_student"));
+}
+
+#[test]
+fn figure_plan_accepts_bottom_to_top_reading_order_alias_from_model() {
+    let json = serde_json::json!({
+        "version": "0.1",
+        "canvas": {"aspect": "paper-wide", "target_width_mm": 85, "safe_margin": 0.06},
+        "story": {
+            "main_message": "Bottom-up encoder stack.",
+            "visual_focus": ["input", "encoder"],
+            "reading_order": "bottom_to_top"
+        },
+        "layout": {
+            "template": "teacher_student",
+            "grid": {"columns": 12, "rows": 6},
+            "regions": [{"id": "main", "bbox": [0.1, 0.1, 0.9, 0.9]}]
+        },
+        "components": [],
+        "edges": [],
+        "annotations": [],
+        "assets": [],
+        "design": {
+            "style": "wps-clean",
+            "max_colors": 3,
+            "font_policy": "wps_friendly",
+            "avoid_arrow_crossing": true,
+            "prefer_native_shapes": true
+        }
+    });
+
+    let plan: FigurePlan =
+        serde_json::from_value(json).expect("model reading_order alias should deserialize");
+    assert_eq!(plan.story.reading_order, ReadingOrder::TopToBottom);
+}
+
+#[test]
+fn component_role_accepts_supervision_alias_from_model() {
+    let role: ComponentRole =
+        serde_json::from_value(serde_json::json!("supervision")).expect("alias should deserialize");
+
+    assert_eq!(role, ComponentRole::Loss);
 }
 
 #[test]

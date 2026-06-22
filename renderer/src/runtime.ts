@@ -42,6 +42,7 @@ interface FigurePlan {
 
 interface DrawPlan {
   canvas: FigurePlan["canvas"];
+  style_tokens?: Record<string, string>;
   objects: DrawObject[];
 }
 
@@ -154,6 +155,12 @@ interface Box {
   h: number;
 }
 
+interface TextLayoutMeta {
+  text: string;
+  font_size_pt: number;
+  margin_in: number;
+}
+
 export function createFigureRuntime(payload: RenderPayload): FigureRuntime {
   return new FigureRuntime(payload);
 }
@@ -162,9 +169,35 @@ export function createDrawPlanRuntime(payload: DrawRenderPayload): DrawPlanRunti
   return new DrawPlanRuntime(payload);
 }
 
+export function createDrawPlanRuntimeFromEnv(): DrawPlanRuntime {
+  return new DrawPlanRuntime(loadDrawRenderPayloadFromEnv());
+}
+
+function loadDrawRenderPayloadFromEnv(): DrawRenderPayload {
+  const payloadPath =
+    process.env.METHODFIG_RENDER_PAYLOAD_PATH ??
+    path.join(process.env.METHODFIG_RENDER_OUT_DIR ?? ".", "renderer_payload.json");
+  return JSON.parse(fs.readFileSync(payloadPath, "utf8")) as DrawRenderPayload;
+}
+
 function trustedOutDir(payloadOutDir: string): string {
   // 输出目录由 Rust orchestrator 控制，避免模型代码把产物写到其他 round。
   return process.env.METHODFIG_RENDER_OUT_DIR || payloadOutDir;
+}
+
+function drawPalette(payload: DrawRenderPayload): StyleSpec["palette"] {
+  const tokens = payload.draw_plan.style_tokens ?? {};
+  return {
+    ...payload.style.palette,
+    background: tokens.background ?? payload.style.palette.background,
+    text: tokens.text ?? payload.style.palette.text,
+    muted_text: tokens.muted_text ?? payload.style.palette.muted_text,
+    stroke: tokens.stroke ?? payload.style.palette.stroke,
+    muted_fill: tokens.neutral_fill ?? tokens.muted_fill ?? payload.style.palette.muted_fill,
+    primary: tokens.primary ?? payload.style.palette.primary,
+    accent: tokens.accent ?? payload.style.palette.accent,
+    warning: tokens.warning ?? payload.style.palette.warning
+  };
 }
 
 export class DrawPlanRuntime {
@@ -191,8 +224,9 @@ export class DrawPlanRuntime {
     this.pptx.title = "methodfig generated editable figure";
     this.pptx.lang = "zh-CN";
 
+    const palette = this.palette();
     this.slide = this.pptx.addSlide();
-    this.slide.background = { color: this.payload.style.palette.background };
+    this.slide.background = { color: palette.background };
 
     const objects = [...this.payload.draw_plan.objects].sort((left, right) => left.z - right.z);
     const connectorLabels: Array<Extract<DrawObject, { kind: "connector" }>> = [];
@@ -226,81 +260,108 @@ export class DrawPlanRuntime {
   }
 
   private drawBox(object: Extract<DrawObject, { kind: "box" }>): void {
+    const palette = this.palette();
     const isPrimary = object.style.includes("primary") || object.role === "main";
+    const isAccent = object.style.includes("accent") || object.style.includes("loss") || object.role.includes("loss");
     const forceRegular = object.style.includes("regular");
     const isMuted = object.style.includes("muted");
-    const fill = isPrimary ? lighten(this.payload.style.palette.primary, 0.86) : this.payload.style.palette.muted_fill;
-    const stroke = isPrimary ? this.payload.style.palette.primary : this.payload.style.palette.stroke;
-    const color = isMuted ? this.payload.style.palette.muted_text : this.payload.style.palette.text;
+    const fill = isPrimary ? lighten(palette.primary, 0.86) : isAccent ? lighten(palette.accent, 0.82) : palette.muted_fill;
+    const stroke = isPrimary ? palette.primary : isAccent ? palette.accent : palette.stroke;
+    const color = isMuted ? palette.muted_text : palette.text;
+    const fontSize = this.scaledFontSize(this.payload.style.font_sizes.module_label);
+    const margin = adaptiveTextMarginIn(this.size, object.bbox, "component");
     this.slide.addText(object.text, {
       ...this.toBox(object.bbox),
       shape: this.shape("roundRect"),
       rectRadius: this.payload.style.corner_radius.module,
-      margin: 0.05,
+      margin,
       fit: "shrink",
       breakLine: false,
       valign: "mid",
       align: "center",
       fontFace: this.payload.style.fonts.font_cjk,
-      fontSize: this.payload.style.font_sizes.module_label,
+      fontSize,
       bold: isPrimary && !forceRegular,
       color,
       fill: { color: fill },
-      line: { color: stroke, width: isPrimary ? this.payload.style.line_widths.strong_focus : this.payload.style.line_widths.normal },
+      line: {
+        color: stroke,
+        width: isPrimary ? this.payload.style.line_widths.strong_focus : this.payload.style.line_widths.normal,
+        dashType: object.style.includes("dash") ? "dash" : "solid"
+      },
       shapeName: `methodfig_draw_box_${object.id}`
     });
-    this.track(object.id, "component", object.bbox);
+    this.track(object.id, "component", object.bbox, undefined, undefined, undefined, {
+      text: object.text,
+      font_size_pt: fontSize,
+      margin_in: margin
+    });
   }
 
   private drawText(object: Extract<DrawObject, { kind: "text" }>): void {
+    const palette = this.palette();
+    const fontSize = this.scaledFontSize(this.payload.style.font_sizes.auxiliary_label);
+    const margin = adaptiveTextMarginIn(this.size, object.bbox, "label");
     this.slide.addText(object.text, {
       ...this.toBox(object.bbox),
-      margin: 0.02,
+      margin,
       fit: "shrink",
       align: "center",
       valign: "mid",
       fontFace: this.payload.style.fonts.font_cjk,
-      fontSize: this.payload.style.font_sizes.auxiliary_label,
-      color: this.payload.style.palette.muted_text,
-      fill: { color: this.payload.style.palette.background, transparency: 100 },
-      line: { color: this.payload.style.palette.background, transparency: 100 },
+      fontSize,
+      color: palette.muted_text,
+      fill: { color: palette.background, transparency: 100 },
+      line: { color: palette.background, transparency: 100 },
       shapeName: `methodfig_draw_text_${object.id}`
     });
-    this.track(object.id, "annotation", object.bbox);
+    this.track(object.id, "annotation", object.bbox, undefined, undefined, undefined, {
+      text: object.text,
+      font_size_pt: fontSize,
+      margin_in: margin
+    });
   }
 
   private drawGroup(object: Extract<DrawObject, { kind: "group" }>): void {
+    const palette = this.palette();
     this.slide.addShape(this.shape("rect"), {
       ...this.toBox(object.bbox),
-      fill: { color: this.payload.style.palette.background, transparency: 100 },
-      line: { color: this.payload.style.palette.stroke, width: this.payload.style.line_widths.auxiliary, dashType: "dash" },
+      fill: { color: palette.background, transparency: 100 },
+      line: { color: palette.stroke, width: this.payload.style.line_widths.auxiliary, dashType: "dash" },
       shapeName: `methodfig_draw_group_${object.id}`
     });
     if (object.label) {
       const [x1, y1, x2] = object.bbox;
       const labelBox: NormalizedBox = normalizeBox([x1 + 0.01, y1 + 0.01, Math.min(x2, x1 + 0.22), y1 + 0.07]);
+      const fontSize = this.scaledFontSize(this.payload.style.font_sizes.auxiliary_label);
+      const margin = adaptiveTextMarginIn(this.size, labelBox, "label");
       this.slide.addText(object.label, {
         ...this.toBox(labelBox),
-        margin: 0.01,
+        margin,
         fit: "shrink",
         fontFace: this.payload.style.fonts.font_cjk,
-        fontSize: this.payload.style.font_sizes.auxiliary_label,
-        color: this.payload.style.palette.muted_text,
-        fill: { color: this.payload.style.palette.background, transparency: 100 },
-        line: { color: this.payload.style.palette.background, transparency: 100 },
+        fontSize,
+        color: palette.muted_text,
+        fill: { color: palette.background, transparency: 100 },
+        line: { color: palette.background, transparency: 100 },
         shapeName: `methodfig_draw_group_label_${object.id}`
       });
-      this.track(`${object.id}_label`, "label", labelBox);
+      this.track(`${object.id}_label`, "label", labelBox, undefined, undefined, undefined, {
+        text: object.label,
+        font_size_pt: fontSize,
+        margin_in: margin
+      });
     }
     this.track(object.id, "region", object.bbox);
   }
 
   private drawConnector(object: Extract<DrawObject, { kind: "connector" }>): void {
+    const palette = this.palette();
     const points = object.points.map(point => [clamp01(point[0]), clamp01(point[1])] as [number, number]);
     if (points.length < 2) return;
     const isMain = object.style.includes("main");
     const isDash = object.style.includes("dash") || object.style.includes("supervision");
-    const color = isDash ? this.payload.style.palette.accent : this.payload.style.palette.primary;
+    const color = isDash ? palette.accent : palette.primary;
     const width = isMain ? this.payload.style.line_widths.main_flow : this.payload.style.line_widths.normal;
     for (let index = 0; index < points.length - 1; index += 1) {
       const start = points[index];
@@ -316,25 +377,32 @@ export class DrawPlanRuntime {
         shapeName: `methodfig_draw_edge_${object.id}_${index}`
       });
     }
-    this.track(object.id, "edge", pointsToBox(points), points);
+    this.track(object.id, "edge", pointsToBox(points), points, object.from, object.to);
   }
 
   private drawConnectorLabel(object: Extract<DrawObject, { kind: "connector" }>): void {
     if (!object.label) return;
+    const palette = this.palette();
+    const fontSize = this.scaledFontSize(this.payload.style.font_sizes.auxiliary_label);
+    const margin = adaptiveTextMarginIn(this.size, object.label.bbox, "label");
     this.slide.addText(object.label.text, {
       ...this.toBox(object.label.bbox),
-      margin: 0.01,
+      margin,
       fit: "shrink",
       align: "center",
       valign: "mid",
       fontFace: this.payload.style.fonts.font_cjk,
-      fontSize: this.payload.style.font_sizes.auxiliary_label,
-      color: this.payload.style.palette.muted_text,
-      fill: { color: this.payload.style.palette.background, transparency: 8 },
-      line: { color: this.payload.style.palette.background, transparency: 100 },
+      fontSize,
+      color: palette.muted_text,
+      fill: { color: palette.background, transparency: 8 },
+      line: { color: palette.background, transparency: 100 },
       shapeName: `methodfig_draw_edge_label_${object.id}`
     });
-    this.track(`${object.id}_label`, "label", object.label.bbox);
+    this.track(`${object.id}_label`, "label", object.label.bbox, undefined, undefined, undefined, {
+      text: object.label.text,
+      font_size_pt: fontSize,
+      margin_in: margin
+    });
   }
 
   private drawImage(object: Extract<DrawObject, { kind: "image" }>): void {
@@ -377,11 +445,29 @@ export class DrawPlanRuntime {
     id: string,
     kind: LayoutObject["kind"],
     bbox: NormalizedBox,
-    points?: Array<[number, number]>
+    points?: Array<[number, number]>,
+    from?: string,
+    to?: string,
+    text?: TextLayoutMeta
   ): void {
     const object: LayoutObject = { id, kind, bbox: normalizeBox(bbox) };
     if (points) object.points = points.map(point => [clamp01(point[0]), clamp01(point[1])]);
+    if (from) object.from = from;
+    if (to) object.to = to;
+    if (text) {
+      object.text = text.text;
+      object.font_size_pt = text.font_size_pt;
+      object.margin_in = text.margin_in;
+    }
     this.objects.push(object);
+  }
+
+  private palette(): StyleSpec["palette"] {
+    return drawPalette(this.payload);
+  }
+
+  private scaledFontSize(basePt: number): number {
+    return scaledFontSizeForTargetWidth(basePt, this.size, this.payload.draw_plan.canvas.target_width_mm);
   }
 }
 
@@ -455,21 +541,27 @@ export class FigureRuntime {
       if (!normalized) continue;
       if (isCaptionComponent(component, normalized)) {
         const box = this.toBox(normalized);
+        const fontSize = this.scaledFontSize(this.payload.style.font_sizes.auxiliary_label);
+        const margin = adaptiveTextMarginIn(this.size, normalized, "label");
         this.slide.addText(component.label, {
           ...box,
-          margin: 0.02,
+          margin,
           fit: "shrink",
           breakLine: false,
           valign: "mid",
           align: "center",
           fontFace: this.payload.style.fonts.font_cjk,
-          fontSize: this.payload.style.font_sizes.auxiliary_label,
+          fontSize,
           color: this.payload.style.palette.muted_text,
           fill: { color: this.payload.style.palette.background, transparency: 100 },
           line: { color: this.payload.style.palette.background, transparency: 100 },
           shapeName: `methodfig_caption_${component.id}`
         });
-        this.track(component.id, "annotation", normalized);
+        this.track(component.id, "annotation", normalized, undefined, undefined, undefined, {
+          text: component.label,
+          font_size_pt: fontSize,
+          margin_in: margin
+        });
         continue;
       }
       const box = this.toBox(normalized);
@@ -479,18 +571,20 @@ export class FigureRuntime {
       const stroke = isStrong ? this.payload.style.palette.primary : this.payload.style.palette.stroke;
       const text = isMuted ? this.payload.style.palette.muted_text : this.payload.style.palette.text;
       const width = isStrong ? this.payload.style.line_widths.strong_focus : this.payload.style.line_widths.normal;
+      const fontSize = this.scaledFontSize(this.payload.style.font_sizes.module_label);
+      const margin = adaptiveTextMarginIn(this.size, normalized, "component");
 
       this.slide.addText(component.label, {
         ...box,
         shape: this.shape("roundRect"),
         rectRadius: this.payload.style.corner_radius.module,
-        margin: 0.05,
+        margin,
         fit: "shrink",
         breakLine: false,
         valign: "mid",
         align: "center",
         fontFace: this.payload.style.fonts.font_cjk,
-        fontSize: this.payload.style.font_sizes.module_label,
+        fontSize,
         bold: isStrong,
         color: text,
         fill: { color: fill },
@@ -502,7 +596,11 @@ export class FigureRuntime {
         this.drawAsset(component.allowed_asset_id, normalized);
       }
 
-      this.track(component.id, "component", normalized);
+      this.track(component.id, "component", normalized, undefined, undefined, undefined, {
+        text: component.label,
+        font_size_pt: fontSize,
+        margin_in: margin
+      });
     }
   }
 
@@ -550,23 +648,29 @@ export class FigureRuntime {
 
       if (edge.label) {
         const labelBox = edgeLabelBox(start, end);
+        const fontSize = this.scaledFontSize(this.payload.style.font_sizes.auxiliary_label);
+        const margin = adaptiveTextMarginIn(this.size, labelBox, "label");
         this.slide.addText(edge.label, {
           ...this.toBox(labelBox),
-          margin: 0.01,
+          margin,
           fit: "shrink",
           align: "center",
           valign: "mid",
           fontFace: this.payload.style.fonts.font_cjk,
-          fontSize: this.payload.style.font_sizes.auxiliary_label,
+          fontSize,
           color: this.payload.style.palette.muted_text,
           fill: { color: this.payload.style.palette.background, transparency: 8 },
           line: { color: this.payload.style.palette.background, transparency: 100 },
           shapeName: `methodfig_edge_label_${edge.id}`
         });
-        this.track(`${edge.id}_label`, "label", labelBox);
+        this.track(`${edge.id}_label`, "label", labelBox, undefined, undefined, undefined, {
+          text: edge.label,
+          font_size_pt: fontSize,
+          margin_in: margin
+        });
       }
 
-      this.track(edge.id, "edge", normalizeBox([start[0], start[1], end[0], end[1]]), [start, end]);
+      this.track(edge.id, "edge", normalizeBox([start[0], start[1], end[0], end[1]]), [start, end], edge.from, edge.to);
     }
   }
 
@@ -574,20 +678,26 @@ export class FigureRuntime {
     for (const annotation of this.payload.plan.annotations) {
       if (!annotation.bbox) continue;
       const box = this.toBox(annotation.bbox);
+      const fontSize = this.scaledFontSize(this.payload.style.font_sizes.auxiliary_label);
+      const margin = adaptiveTextMarginIn(this.size, annotation.bbox, "label");
       this.slide.addText(annotation.label, {
         ...box,
-        margin: 0.03,
+        margin,
         fit: "shrink",
         align: "center",
         valign: "mid",
         fontFace: this.payload.style.fonts.font_cjk,
-        fontSize: this.payload.style.font_sizes.auxiliary_label,
+        fontSize,
         color: this.payload.style.palette.muted_text,
         fill: { color: this.payload.style.palette.background, transparency: 100 },
         line: { color: this.payload.style.palette.stroke, width: this.payload.style.line_widths.auxiliary, dashType: "dash" },
         shapeName: `methodfig_annotation_${annotation.id}`
       });
-      this.track(annotation.id, "annotation", annotation.bbox);
+      this.track(annotation.id, "annotation", annotation.bbox, undefined, undefined, undefined, {
+        text: annotation.label,
+        font_size_pt: fontSize,
+        margin_in: margin
+      });
     }
   }
 
@@ -723,12 +833,52 @@ export class FigureRuntime {
     id: string,
     kind: LayoutObject["kind"],
     bbox: NormalizedBox,
-    points?: Array<[number, number]>
+    points?: Array<[number, number]>,
+    from?: string,
+    to?: string,
+    text?: TextLayoutMeta
   ): void {
     const object: LayoutObject = { id, kind, bbox: normalizeBox(bbox) };
     if (points) object.points = points.map(point => [clamp01(point[0]), clamp01(point[1])]);
+    if (from) object.from = from;
+    if (to) object.to = to;
+    if (text) {
+      object.text = text.text;
+      object.font_size_pt = text.font_size_pt;
+      object.margin_in = text.margin_in;
+    }
     this.objects.push(object);
   }
+
+  private scaledFontSize(basePt: number): number {
+    return scaledFontSizeForTargetWidth(basePt, this.size, this.payload.plan.canvas.target_width_mm);
+  }
+}
+
+function scaledFontSizeForTargetWidth(basePt: number, size: CanvasSize, targetWidthMm: number): number {
+  const canvasWidthMm = size.width * 25.4;
+  if (!Number.isFinite(basePt) || basePt <= 0 || !Number.isFinite(targetWidthMm) || targetWidthMm <= 0) {
+    return basePt;
+  }
+  const paperScale = Math.min(targetWidthMm / canvasWidthMm, 1);
+  const scaled = basePt / Math.sqrt(Math.max(paperScale, 0.35));
+  return roundTo(Math.min(24, Math.max(basePt, scaled)), 1);
+}
+
+function adaptiveTextMarginIn(size: CanvasSize, bbox: NormalizedBox, kind: "component" | "label"): number {
+  const [x1, y1, x2, y2] = normalizeBox(bbox);
+  const widthIn = Math.max(0.001, (x2 - x1) * size.width);
+  const heightIn = Math.max(0.001, (y2 - y1) * size.height);
+  const shortest = Math.min(widthIn, heightIn);
+  const floor = kind === "component" ? 0.012 : 0.006;
+  const cap = kind === "component" ? 0.035 : 0.022;
+  const ratio = kind === "component" ? 0.055 : 0.04;
+  return roundTo(Math.min(cap, Math.max(floor, shortest * ratio)), 3);
+}
+
+function roundTo(value: number, decimals: number): number {
+  const scale = 10 ** decimals;
+  return Math.round(value * scale) / scale;
 }
 
 function canvasSize(aspect: FigurePlan["canvas"]["aspect"]): CanvasSize {

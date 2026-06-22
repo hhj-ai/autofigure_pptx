@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, Context, Result};
@@ -27,9 +27,10 @@ use crate::tools::draw_plan::{
 use crate::tools::generated_code::{normalize_generated_code_bundle, GeneratedCodeBundle};
 use crate::tools::pptx_codegen::generate_typescript;
 use crate::tools::render::scan_generated_typescript;
+use crate::tools::review::sanitize_review_false_positives;
 use crate::tools::template_library::{
-    method_template_pack_json, reference_pack_json, select_reference_for_method,
-    selected_reference_json,
+    complete_reference_selection_from_pack, method_template_pack_json, reference_pack_json,
+    select_reference_for_method, selected_reference_json,
 };
 
 pub fn validate_required_model_config(config: &AppConfig, mock_models: bool) -> Result<()> {
@@ -79,7 +80,7 @@ pub fn create_reference_selection(
     let text = block_on(provider.complete(request))?;
     let mut selection: ReferenceSelection = serde_json::from_str(strip_json_fence(&text))
         .with_context(|| "reasoner did not return valid ReferenceSelection JSON")?;
-    selection.preview_mode = preview_mode;
+    complete_reference_selection_from_pack(&mut selection, preview_mode)?;
     Ok(selection)
 }
 
@@ -234,6 +235,10 @@ pub fn create_revised_code_bundle(
     review: &Review,
     layout_map: &str,
     validation_report: &str,
+    quality_report: &str,
+    issue_history: &str,
+    issue_binding: &str,
+    regression_report: &str,
     style: &StyleSpec,
     round_dir: &Path,
     renderer_root: &Path,
@@ -278,6 +283,10 @@ pub fn create_revised_code_bundle(
                     review,
                     layout_map,
                     validation_report,
+                    quality_report,
+                    issue_history,
+                    issue_binding,
+                    regression_report,
                     style,
                     renderer_root,
                     asset_paths,
@@ -298,6 +307,11 @@ pub fn revise_draw_plan_from_feedback(
     review: &Review,
     layout_map: &str,
     validation_report: &str,
+    quality_report: &str,
+    issue_history: &str,
+    issue_binding: &str,
+    regression_report: &str,
+    previous_code: &str,
     overlay_path: &Path,
     reference_selection: &ReferenceSelection,
     improvement_plan_json: &str,
@@ -318,11 +332,18 @@ pub fn revise_draw_plan_from_feedback(
     }
     let previous_draw_plan_json = serde_json::to_string_pretty(previous_draw_plan)?;
     let review_json = serde_json::to_string_pretty(review)?;
+    let improvement_plan = serde_json::from_str::<RoundImprovementPlan>(improvement_plan_json)
+        .with_context(|| "RoundImprovementPlan JSON was invalid while revising DrawPlan")?;
     let prompt = build_draw_plan_revision_prompt(
         &previous_draw_plan_json,
         layout_map,
         &review_json,
         validation_report,
+        quality_report,
+        issue_history,
+        issue_binding,
+        regression_report,
+        previous_code,
         reference_selection,
         improvement_plan_json,
     )?;
@@ -336,6 +357,14 @@ pub fn revise_draw_plan_from_feedback(
     let mut draw_plan: DrawPlan = serde_json::from_str(strip_json_fence(&text))
         .with_context(|| "DrawPlan optimizer did not return valid DrawPlan JSON")?;
     preserve_semantic_draw_objects(previous_draw_plan, &mut draw_plan);
+    constrain_draw_plan_revision_to_current_targets(
+        previous_draw_plan,
+        &mut draw_plan,
+        &improvement_plan,
+        review,
+        quality_report,
+        issue_binding,
+    );
     normalize_draw_plan_bounds(&mut draw_plan);
     validate_draw_plan(&draw_plan)?;
     if !has_material_draw_plan_change(previous_draw_plan, &draw_plan) {
@@ -351,6 +380,14 @@ pub fn revise_draw_plan_from_feedback(
         draw_plan = serde_json::from_str(strip_json_fence(&retry_text))
             .with_context(|| "DrawPlan optimizer retry did not return valid DrawPlan JSON")?;
         preserve_semantic_draw_objects(previous_draw_plan, &mut draw_plan);
+        constrain_draw_plan_revision_to_current_targets(
+            previous_draw_plan,
+            &mut draw_plan,
+            &improvement_plan,
+            review,
+            quality_report,
+            issue_binding,
+        );
         normalize_draw_plan_bounds(&mut draw_plan);
         validate_draw_plan(&draw_plan)?;
         if !has_material_draw_plan_change(previous_draw_plan, &draw_plan) {
@@ -362,11 +399,193 @@ pub fn revise_draw_plan_from_feedback(
     Ok(draw_plan)
 }
 
+fn constrain_draw_plan_revision_to_current_targets(
+    previous: &DrawPlan,
+    revised: &mut DrawPlan,
+    improvement_plan: &RoundImprovementPlan,
+    review: &Review,
+    quality_report: &str,
+    issue_binding: &str,
+) {
+    let Some(allowed_ids) = localized_revision_allowed_ids(
+        previous,
+        revised,
+        improvement_plan,
+        review,
+        quality_report,
+        issue_binding,
+    ) else {
+        return;
+    };
+    if allowed_ids.is_empty() {
+        return;
+    }
+
+    let previous_by_id = previous
+        .objects
+        .iter()
+        .map(|object| (draw_object_revision_id(object).to_string(), object))
+        .collect::<BTreeMap<_, _>>();
+    let revised_by_id = revised
+        .objects
+        .iter()
+        .map(|object| (draw_object_revision_id(object).to_string(), object))
+        .collect::<BTreeMap<_, _>>();
+    let mut objects = Vec::new();
+
+    for previous_object in &previous.objects {
+        let id = draw_object_revision_id(previous_object);
+        if allowed_ids.contains(id) {
+            if let Some(current_object) = revised_by_id.get(id) {
+                objects.push((*current_object).clone());
+            }
+        } else {
+            objects.push(previous_object.clone());
+        }
+    }
+
+    for current_object in &revised.objects {
+        let id = draw_object_revision_id(current_object);
+        if !previous_by_id.contains_key(id) && allowed_ids.contains(id) {
+            objects.push(current_object.clone());
+        }
+    }
+
+    revised.objects = objects;
+}
+
+fn localized_revision_allowed_ids(
+    previous: &DrawPlan,
+    revised: &DrawPlan,
+    improvement_plan: &RoundImprovementPlan,
+    review: &Review,
+    quality_report: &str,
+    issue_binding: &str,
+) -> Option<BTreeSet<String>> {
+    if improvement_plan.rejected_as_unusable
+        || improvement_plan
+            .actions
+            .iter()
+            .any(|action| action.change_type == "reference_replan")
+    {
+        return None;
+    }
+
+    let mut base_targets = BTreeSet::new();
+    for action in &improvement_plan.actions {
+        if let Some(target_id) = action.target_id.as_deref() {
+            insert_revision_target_id(target_id, &mut base_targets)?;
+        }
+    }
+    for issue in &review.localized_issues {
+        insert_revision_target_id(&issue.target_id, &mut base_targets)?;
+    }
+    collect_revision_target_ids_from_json(quality_report, &mut base_targets)?;
+    collect_revision_target_ids_from_json(issue_binding, &mut base_targets)?;
+
+    let mut allowed = base_targets.clone();
+    let all_objects = previous.objects.iter().chain(revised.objects.iter());
+    for object in all_objects {
+        let id = draw_object_revision_id(object);
+        if connector_touches_any_revision_target(object, &base_targets) {
+            allowed.insert(id.to_string());
+        }
+    }
+    Some(allowed)
+}
+
+fn insert_revision_target_id(target_id: &str, targets: &mut BTreeSet<String>) -> Option<()> {
+    let target_id = target_id.trim();
+    if target_id.is_empty() {
+        return Some(());
+    }
+    if target_id == "global_layout" {
+        return None;
+    }
+    targets.insert(target_id.to_string());
+    if let Some(edge_id) = target_id.strip_suffix("_label") {
+        if !edge_id.is_empty() {
+            targets.insert(edge_id.to_string());
+        }
+    }
+    Some(())
+}
+
+fn collect_revision_target_ids_from_json(
+    json_text: &str,
+    targets: &mut BTreeSet<String>,
+) -> Option<()> {
+    if json_text.trim().is_empty() {
+        return Some(());
+    }
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(json_text) else {
+        return Some(());
+    };
+    collect_revision_target_ids_from_value(&value, targets)
+}
+
+fn collect_revision_target_ids_from_value(
+    value: &serde_json::Value,
+    targets: &mut BTreeSet<String>,
+) -> Option<()> {
+    match value {
+        serde_json::Value::Object(map) => {
+            for (key, value) in map {
+                if key == "target_id" {
+                    if let Some(target_id) = value.as_str() {
+                        insert_revision_target_id(target_id, targets)?;
+                    }
+                    continue;
+                }
+                if key == "target_ids" {
+                    if let Some(ids) = value.as_array() {
+                        for id in ids.iter().filter_map(|id| id.as_str()) {
+                            insert_revision_target_id(id, targets)?;
+                        }
+                    }
+                    continue;
+                }
+                collect_revision_target_ids_from_value(value, targets)?;
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                collect_revision_target_ids_from_value(item, targets)?;
+            }
+        }
+        _ => {}
+    }
+    Some(())
+}
+
+fn connector_touches_any_revision_target(object: &DrawObject, targets: &BTreeSet<String>) -> bool {
+    let DrawObject::Connector { from, to, .. } = object else {
+        return false;
+    };
+    from.as_deref().is_some_and(|id| targets.contains(id))
+        || to.as_deref().is_some_and(|id| targets.contains(id))
+}
+
+fn draw_object_revision_id(object: &DrawObject) -> &str {
+    match object {
+        DrawObject::Box { id, .. }
+        | DrawObject::Text { id, .. }
+        | DrawObject::Connector { id, .. }
+        | DrawObject::Image { id, .. }
+        | DrawObject::Group { id, .. } => id,
+    }
+}
+
 pub fn build_draw_plan_revision_prompt(
     previous_draw_plan_json: &str,
     layout_map: &str,
     review_json: &str,
     validation_report_json: &str,
+    quality_report_json: &str,
+    issue_history_json: &str,
+    issue_binding_json: &str,
+    regression_report_json: &str,
+    previous_code: &str,
     reference_selection: &ReferenceSelection,
     improvement_plan_json: &str,
 ) -> Result<String> {
@@ -377,7 +596,11 @@ pub fn build_draw_plan_revision_prompt(
 Return exactly one DrawPlan object. Do not return TypeScript, SVG, markdown, prose, comments, or a schema wrapper.\n\
 The current rendered overlay image is attached. Treat it like AutoFigure-Edit's optimizer evidence: compare the visual overlay, layout_map coordinates, local validation errors, reviewer feedback, and current DrawPlan code/state.\n\n\
 Use the Selected visual reference as read-only layout/style evidence. If reference preview evidence is attached after the current overlay, use it only to judge composition quality; do not copy the source artwork and do not add it as a DrawPlan image. These references are derived from extracted PDF/SVG method-overview figures from classic or ML conference award papers. Treat the selected reference anti_patterns as hard: if the current figure contains one, remove or redesign it instead of merely moving it.\n\n\
+Templates and selected references are soft evidence only. Do not copy their slot coordinates, do not restart the layout from a template, and do not discard stable ids. First bind every blocking issue to exact DrawPlan ids, layout_map objects, and previous renderer code before proposing a change.\n\n\
+Use IssueBinding, QualityReport, and IssueHistory as the repair contract. Every visible change should resolve one current issue_id or a repeated issue key. If IssueHistory shows occurrences >= 2, change strategy for that local object/edge instead of micro-moving the same bbox again.\n\n\
+Use RegressionReport or RegressionContext as the anti-regression contract. If status is \"regressed\", revert to the revision source geometry before applying local fixes; do not repeat regressed_issue_types, do not reduce quality_report.score below budget.min_quality_score, and do not increase blocking or major issue counts beyond the budget. If latest_attempt_* evidence is present, read it as a negative example: compare it with the revision source and avoid repeating the exact geometry/code strategy that caused its regression. New edge_crossing, annotation_in_main_corridor, duplicate input lanes, or standalone inference lanes are hard regressions even if another issue was improved.\n\n\
 You must implement the RoundImprovementPlan. The returned DrawPlan must materially change at least one bbox, connector point list, connector label bbox, text, style, object addition, or object removal unless the Review already passes.\n\n\
+If QualityReport contains excessive_internal_whitespace, fix the named box by increasing paper-width text prominence, tightening its bbox, or adding meaningful editable internal substructure that belongs to the current semantics. If it contains text_wrap_risk, widen the named box, shorten the label, or lower paper-width font size so the longest token or short input phrase does not wrap awkwardly. If it contains component_crowding, increase the gutter between the named boxes or reroute nearby connectors; do not treat mere non-overlap as success. If it contains vertical_under_utilization, move or expand the named component group as a group so the main union bbox is vertically centered and uses available paper-height canvas; do not only tweak one small box while leaving a large top/bottom blank band. If it contains supervision_branch_asymmetry, move the named supervision node toward the midpoint between the named teacher and student branches and shorten both named supervision connectors without adding a new branch. If it contains route_detour, replace the named connector with a shorter direct or two-segment orthogonal route unless it is a necessary fan-in merge. If it contains edge_style_mismatch, change only the named connector style to match FigurePlan solid/dash intent while preserving endpoints and route. If it contains edge_crossing, reroute one of the named edges so connector strokes do not cross, and do not add new elbows that cross another edge. If it contains annotation_in_main_corridor, remove or reanchor the named annotation outside the teacher/student transfer path without adding a separate inference lane. If it contains task_loss_reverse_flow, move the named task_loss cue to the right or upper-right of the named student source and reroute the named edge with x-increasing flow; do not place the task_loss below-left or outside the canvas. If it contains label_far_from_edge, move the named connector label next to its own edge rather than leaving it in unrelated whitespace. If it contains label_outside_main_area, remove generic floating phase/capacity labels or reanchor meaningful labels inside the main figure near their target; never leave the named label in the top/bottom margin, and do not create a duplicate input lane, standalone inference lane, or new edge_crossing to make room. If it contains component_overlap, edge_crosses_component, label_overlaps_edge, or label_overlaps_component, move/resize only the named bbox or reroute the named connector/label so the concrete target ids no longer collide.\n\n\
 You are a visual optimizer, not a semantic replanner. Do not invent new semantic modules, duplicate outputs, extra loss boxes, or new branches that are absent from the current semantic state. Do not expand an inference note into a separate inference subgraph unless such boxes/connectors already exist in the DrawPlan.\n\n\
 Do not add an output-to-student task-loss feedback edge when a task_loss box or output-to-loss edge already exists. If the semantic state contains teacher-to-student latent residual supervision as an edge, prefer a direct dashed residual edge instead of creating a separate residual box.\n\n\
 Please carefully compare and optimize these TWO MAJOR ASPECTS:\n\
@@ -400,7 +623,12 @@ RoundImprovementPlan:\n{improvement_plan_json}\n\n\
 Current DrawPlan JSON:\n{previous_draw_plan_json}\n\n\
 layout_map.json:\n{layout_map}\n\n\
 Review JSON:\n{review_json}\n\n\
-validation_report.json:\n{validation_report_json}"
+validation_report.json:\n{validation_report_json}\n\n\
+QualityReport JSON:\n{quality_report_json}\n\n\
+IssueHistory JSON:\n{issue_history_json}\n\n\
+IssueBinding JSON:\n{issue_binding_json}\n\n\
+RegressionReport or RegressionContext JSON:\n{regression_report_json}\n\n\
+Previous generated figure.ts:\n```ts\n{previous_code}\n```"
     ))
 }
 
@@ -416,6 +644,7 @@ fn build_initial_code_prompt(
         "Return a GeneratedCodeBundle JSON object for this figure renderer.\n\
 Allowed paths are writable/code/figure.ts and writable/code/helpers.ts. Include writable/code/figure.ts.\n\
 method_templates.json is provided as layout evidence derived from extracted PDF/SVG figures. Do not copy those source figures; render the current DrawPlan as native PPTX shapes/text/connectors.\n\
+Runtime API contract: figure.ts must call createDrawPlanRuntimeFromEnv() and then runtime.renderDrawPlan(). Do not call runtime.getDrawPlan(), runtime.getSlide(), runtime.getPptx(), runtime.track(), or private runtime fields. Unsupported runtime API calls are rejected before Node rendering and force deterministic fallback.\n\
 GeneratedCodeBundle JSON Schema:\n{}\n\n\
 Renderer runtime path:\n{}\n\n\
 method_templates.json:\n{}\n\n\
@@ -439,6 +668,10 @@ fn build_revised_code_prompt(
     review: &Review,
     layout_map: &str,
     validation_report: &str,
+    quality_report: &str,
+    issue_history: &str,
+    issue_binding: &str,
+    regression_report: &str,
     style: &StyleSpec,
     renderer_root: &Path,
     asset_paths: &BTreeMap<String, PathBuf>,
@@ -449,6 +682,10 @@ fn build_revised_code_prompt(
         "Revise the generated renderer code. Return a GeneratedCodeBundle JSON object only.\n\
 Allowed paths are writable/code/figure.ts and writable/code/helpers.ts. Include writable/code/figure.ts.\n\
 method_templates.json is provided as layout evidence derived from extracted PDF/SVG figures. Do not copy those source figures; implement the current DrawPlan as native PPTX shapes/text/connectors.\n\
+Read the previous figure.ts first, then make the smallest issue-bound code change needed for the current DrawPlan. Do not restart from a template unless IssueHistory shows repeated unresolved blockers and the current renderer code cannot express the DrawPlan faithfully.\n\
+Every non-trivial code change must correspond to a current issue_id from IssueBinding or QualityReport, or to a repeated issue_key from IssueHistory.\n\
+Respect RegressionReport or RegressionContext as a hard budget: do not introduce code changes that lower quality_report.score below budget.min_quality_score or add blocking/major issues beyond the budget. If status is \"regressed\", prefer the deterministic reference code plus minimal local repairs over carrying forward the regressed code path. If latest_attempt_figure_ts or latest_attempt_* evidence is present, inspect it first as a negative example and avoid repeating the failed changes while still implementing the current DrawPlan.\n\
+Runtime API contract: figure.ts must call createDrawPlanRuntimeFromEnv() and then runtime.renderDrawPlan(). Do not call runtime.getDrawPlan(), runtime.getSlide(), runtime.getPptx(), runtime.track(), or private runtime fields. Unsupported runtime API calls are rejected before Node rendering and force deterministic fallback. If RegressionContext includes revision_source_renderer_error, previous_renderer_error, or latest_attempt_renderer_error, fix that exact TypeScript failure first.\n\
 GeneratedCodeBundle JSON Schema:\n{}\n\n\
 Renderer runtime path:\n{}\n\n\
 method_templates.json:\n{}\n\n\
@@ -459,6 +696,10 @@ Previous figure.ts:\n```ts\n{}\n```\n\n\
 Previous review JSON:\n{}\n\n\
 Previous layout_map.json:\n{}\n\n\
 Previous validation_report.json:\n{}\n\n\
+Previous quality_report.json:\n{}\n\n\
+Previous issue_history.json:\n{}\n\n\
+Previous issue_binding.json:\n{}\n\n\
+Previous regression report or regression context JSON:\n{}\n\n\
 Reference code that renders the current DrawPlan if the previous code is too broken:\n```ts\n{}\n```",
         GeneratedCodeBundle::schema_json()?,
         renderer_root.join("src/runtime.ts").display(),
@@ -470,6 +711,10 @@ Reference code that renders the current DrawPlan if the previous code is too bro
         serde_json::to_string_pretty(review)?,
         layout_map,
         validation_report,
+        quality_report,
+        issue_history,
+        issue_binding,
+        regression_report,
         deterministic_code
     ))
 }
@@ -511,6 +756,8 @@ fn mock_revise_draw_plan(previous_draw_plan: &DrawPlan, round_index: u32) -> Dra
             DrawObject::Box { id, bbox, .. } => {
                 if id == "inference_tag" {
                     *bbox = [0.72, 0.72, 0.94, 0.80];
+                } else if box_area(*bbox) > 0.065 && box_height(*bbox) > 0.22 {
+                    *bbox = shrink_box_height(*bbox, 0.20);
                 } else if box_height(*bbox) > 0.48 {
                     *bbox = shrink_box_height(*bbox, 0.34);
                 }
@@ -562,6 +809,11 @@ fn box_height(bbox: [f64; 4]) -> f64 {
     bbox[3] - bbox[1]
 }
 
+fn box_area(bbox: [f64; 4]) -> f64 {
+    let bbox = clamp_bbox(bbox);
+    (bbox[2] - bbox[0]) * (bbox[3] - bbox[1])
+}
+
 pub fn review_rendered_figure(
     plan: &FigurePlan,
     round_dir: &Path,
@@ -599,7 +851,7 @@ pub fn review_rendered_figure(
         &user_text,
         &vision_images,
     ))?;
-    let review = parse_review_text(&text).or_else(|first_error| {
+    let mut review = parse_review_text(&text).or_else(|first_error| {
         let retry_user_text = build_review_retry_prompt(
             &plan_json,
             &draw_plan_json,
@@ -618,6 +870,7 @@ pub fn review_rendered_figure(
             )
         })
     })?;
+    sanitize_review_false_positives(&mut review);
     Ok(review)
 }
 
@@ -636,7 +889,9 @@ Scores must include every field from the schema, including semantic_fidelity and
 Keep string values short and do not embed quotation marks inside string content.\n\n\
 DrawPlan is the rendered source of truth for visible editable objects. Use FigurePlan for semantic intent, but judge object presence, removal, routing, and placement against DrawPlan and layout_map.\n\
 Do not report FigurePlan annotations as missing when they are absent from DrawPlan; assume redundant or marginal annotations may be intentionally removed before rendering.\n\n\
+Never reject solely because a phase-only FigurePlan annotation such as Training, Inference, Testing, training_label, or inference_label is absent from DrawPlan. These phase labels may be folded into nearby module labels or omitted by design. Only report a phase label problem when the visible phase semantics are genuinely missing from editable DrawPlan components.\n\n\
 Use the Selected visual reference as the quality target. Respect its reading order and anti-patterns when the current DrawPlan is trying to follow it. If an optional reference preview image is attached, it is read-only evidence and must not be treated as an output asset.\n\n\
+Judge typography and spacing at the target paper width using layout_map text, font_size_pt, margin_in, bbox, and target_width_mm. Reject oversized boxes with tiny centered labels and adjacent modules that are visually crowded even if they do not overlap.\n\n\
 Every rejection must include localized_issues or at least one blocking issue that names concrete target ids from DrawPlan/layout_map. The suggested_direction must be actionable and describe a visible bbox, connector route, label, spacing, or style change.\n\n\
 For wps_editability, inspect DrawPlan/layout_map rather than guessing from the PNG. If the visible semantic figure is composed of native boxes, text, and connectors with no full-slide raster image, assign wps_editability 9 or 10 unless there is concrete evidence of non-editable text, missing objects, or invalid geometry.\n\n\
 Review JSON Schema:\n{schema}\n\n\
@@ -662,7 +917,9 @@ Keep each string value short and avoid embedded quotation marks inside the text.
 Scores must include every field from the schema, including semantic_fidelity and wps_editability, each as an integer from 1 to 10.\n\n\
 DrawPlan is the rendered source of truth for visible editable objects. Use FigurePlan for semantic intent, but judge object presence, removal, routing, and placement against DrawPlan and layout_map.\n\
 Do not report FigurePlan annotations as missing when they are absent from DrawPlan.\n\n\
+Never reject solely because a phase-only FigurePlan annotation such as Training, Inference, Testing, training_label, or inference_label is absent from DrawPlan. These phase labels may be folded into nearby module labels or omitted by design. Only report a phase label problem when the visible phase semantics are genuinely missing from editable DrawPlan components.\n\n\
 Use the Selected visual reference as the quality target. Every rejection must include localized_issues or concrete target ids in blocking_issues, with actionable suggested_direction text.\n\n\
+Judge typography and spacing at the target paper width using layout_map text, font_size_pt, margin_in, bbox, and target_width_mm. Reject oversized boxes with tiny centered labels and adjacent modules that are visually crowded even if they do not overlap.\n\n\
 For wps_editability, inspect DrawPlan/layout_map rather than guessing from the PNG. If the visible semantic figure is composed of native boxes, text, and connectors with no full-slide raster image, assign wps_editability 9 or 10 unless there is concrete evidence of non-editable text, missing objects, or invalid geometry.\n\n\
 Review JSON Schema:\n{schema}\n\n\
 Selected visual reference (ReferenceSelection):\n{selected_reference}\n\n\
@@ -676,6 +933,10 @@ pub fn create_round_improvement_plan(
     review: &Review,
     layout_map: &str,
     validation_report: &str,
+    quality_report: &str,
+    issue_history: &str,
+    issue_binding: &str,
+    regression_report: &str,
     reference_selection: &ReferenceSelection,
     config: &AppConfig,
     mock_models: bool,
@@ -707,6 +968,10 @@ pub fn create_round_improvement_plan(
                     &serde_json::to_string_pretty(review)?,
                     layout_map,
                     validation_report,
+                    quality_report,
+                    issue_history,
+                    issue_binding,
+                    regression_report,
                     reference_selection,
                     round_index,
                 )?,
@@ -714,16 +979,26 @@ pub fn create_round_improvement_plan(
         ],
     };
     let text = block_on(provider.complete(request))?;
-    let plan: RoundImprovementPlan = serde_json::from_str(strip_json_fence(&text))
+    let mut plan = parse_round_improvement_plan_text(&text)
         .with_context(|| "reasoner did not return valid RoundImprovementPlan JSON")?;
+    normalize_round_improvement_plan(&mut plan, review);
     validate_round_improvement_plan(&plan, review)?;
     Ok(plan)
+}
+
+fn parse_round_improvement_plan_text(text: &str) -> Result<RoundImprovementPlan> {
+    let value: serde_json::Value = serde_json::from_str(strip_json_fence(text))?;
+    Ok(serde_json::from_value(value)?)
 }
 
 pub fn build_round_improvement_prompt(
     review_json: &str,
     layout_map: &str,
     validation_report: &str,
+    quality_report: &str,
+    issue_history: &str,
+    issue_binding: &str,
+    regression_report: &str,
     reference_selection: &ReferenceSelection,
     round_index: u32,
 ) -> Result<String> {
@@ -734,11 +1009,19 @@ pub fn build_round_improvement_prompt(
 Return exactly one RoundImprovementPlan JSON object. Use actions as an array.\n\
 If Review.passed is false, actions must be non-empty. Each action must name a target_id from layout_map when possible, or use change_type \"reference_replan\" for a template-level change.\n\
 Do not give vague advice. Each expected_visible_effect must state what will visibly change in bbox, connector points, label bbox, text, style, object addition, or object removal.\n\n\
+Use QualityReport and IssueBinding to bind advice to concrete issue_id and target ids. Use IssueHistory to detect repeated failures; if an issue has occurrences >= 2, propose a different local strategy instead of a tiny bbox nudge.\n\n\
+Use RegressionReport or RegressionContext as a hard regression budget. If status is \"regressed\", the next round must revert to the revision source geometry/code and apply only local fixes for unresolved target ids. Do not introduce new blocking or major issue types listed in regressed_issue_types. The next round must keep quality_report.score >= budget.min_quality_score and must not exceed budget.max_blocking_issues or budget.max_major_issues. If latest_attempt_* evidence is present, include at least one action that explicitly avoids repeating the failed latest-attempt strategy. New edge_crossing, annotation_in_main_corridor, duplicate input lanes, or standalone inference lanes are hard regressions even if another issue was improved.\n\n\
+For excessive_internal_whitespace, the action must name the affected box and specify whether the next DrawPlan should tighten bbox, increase paper-width text prominence, or add meaningful editable internal structure. For text_wrap_risk, the action must name the affected box and specify the visible width, label, or font-size change that will keep the longest token or short input phrase on one readable line. For component_crowding, the action must name the crowded boxes and specify the visible gutter/route change. For vertical_under_utilization, the action must name global_layout or the full affected component group and specify the group move/scale/repacking strategy plus a success check for main union bbox vertical span and top/bottom whitespace balance. For supervision_branch_asymmetry, the action must name the supervision node id, teacher id, student id, and both supervision edge ids, then specify the midpoint placement and shorter connector routes. For route_detour, the action must name the connector id and specify the shorter direct or two-segment route strategy. For edge_style_mismatch, the action must name the connector id, the expected FigurePlan style, and the DrawPlan style change, without moving endpoints or route points. For edge_crossing, the action must name both crossing edge ids and specify which edge will be rerouted to remove the crossing. For teacher_student_branch_inversion, the action must name the teacher and student encoder ids and specify the local branch reorder that puts teacher above student or puts both on a clean left-to-right row without re-planning unrelated objects. For teacher_internal_flow_reversed, the action must name the encoder, head, and edge ids and specify a horizontal or downstream encoder-to-head route. For annotation_in_main_corridor and inference_annotation_in_bottom_margin, the action must name the annotation id and specify the nearby student/output placement or removal outside connector corridors and canvas margins. For loss_label_on_prediction_edge, the action must name the label and prediction edge ids and specify whether to move the loss cue to a separate objective component or supervision edge. For task_loss_reverse_flow, the action must name the task_loss box, student source, and edge ids, then specify a right/upper-right placement and x-increasing connector route that stays inside the canvas. For prediction_loss_semantic_mix, the action must name the output component id and specify the exact text split or relabeling that keeps prediction and task-loss semantics in distinct editable objects. For label_far_from_edge, the action must name the label id and its edge id and specify the new nearby label placement. For label_outside_main_area, the action must name the label id and specify whether to remove a redundant floating phase/capacity label or reanchor a meaningful label inside the main figure near its target; the action must explicitly avoid creating a duplicate input lane, standalone inference lane, or new edge_crossing. For component_overlap, edge_crosses_component, label_overlaps_edge, and label_overlaps_component, the action must name the exact colliding bbox, connector, component, or label ids and state the local movement/reroute that will remove the collision.\n\n\
+Never leave target_id empty for localized_geometry_or_style actions. If an issue spans many objects and no single target is best, set target_id to \"global_layout\".\n\n\
 RoundImprovementPlan JSON Schema:\n{schema}\n\n\
 Selected visual reference (ReferenceSelection):\n{selected_reference}\n\n\
 Review JSON:\n{review_json}\n\n\
 layout_map.json:\n{layout_map}\n\n\
-validation_report.json:\n{validation_report}"
+validation_report.json:\n{validation_report}\n\n\
+QualityReport JSON:\n{quality_report}\n\n\
+IssueHistory JSON:\n{issue_history}\n\n\
+IssueBinding JSON:\n{issue_binding}\n\n\
+RegressionReport or RegressionContext JSON:\n{regression_report}"
     ))
 }
 
@@ -747,32 +1030,11 @@ fn mock_round_improvement_plan(
     reference_selection: &ReferenceSelection,
     round_index: u32,
 ) -> RoundImprovementPlan {
-    let mut actions = Vec::new();
-    if !review.passed {
-        for issue in &review.localized_issues {
-            actions.push(ImprovementAction {
-                target_id: Some(issue.target_id.clone()),
-                change_type: "localized_geometry_or_style".to_string(),
-                issue: issue.issue.clone(),
-                expected_visible_effect: issue.suggested_direction.clone(),
-                success_check: format!(
-                    "{} no longer appears in review/layout_map issues",
-                    issue.target_id
-                ),
-            });
-        }
-        if actions.is_empty() {
-            for issue in &review.blocking_issues {
-                actions.push(ImprovementAction {
-                    target_id: Some("global_layout".to_string()),
-                    change_type: "reference_replan".to_string(),
-                    issue: issue.clone(),
-                    expected_visible_effect: "Apply selected reference anti-patterns to make a visible layout or routing change".to_string(),
-                    success_check: "next DrawPlan material diff is non-empty and the blocking issue is reduced".to_string(),
-                });
-            }
-        }
-    }
+    let actions = if review.passed {
+        Vec::new()
+    } else {
+        fallback_round_improvement_actions(review)
+    };
     RoundImprovementPlan {
         version: "0.1".to_string(),
         round_index,
@@ -786,6 +1048,104 @@ fn mock_round_improvement_plan(
         preserve: reference_selection.quality_targets.clone(),
         rejected_as_unusable: false,
     }
+}
+
+fn normalize_round_improvement_plan(plan: &mut RoundImprovementPlan, review: &Review) {
+    if !review.passed && plan.actions.is_empty() {
+        plan.actions = fallback_round_improvement_actions(review);
+    }
+
+    for action in &mut plan.actions {
+        if action.change_type.trim().is_empty() {
+            action.change_type = "localized_geometry_or_style".to_string();
+        }
+        if action
+            .target_id
+            .as_deref()
+            .unwrap_or_default()
+            .trim()
+            .is_empty()
+            && action.change_type != "reference_replan"
+        {
+            action.target_id = infer_improvement_target_id(action, review);
+        }
+        if action.expected_visible_effect.trim().is_empty() {
+            action.expected_visible_effect =
+                "Make a visible bbox, connector route, label, text, or style change for this issue."
+                    .to_string();
+        }
+        if action.success_check.trim().is_empty() {
+            let target = action
+                .target_id
+                .as_deref()
+                .unwrap_or("global_layout")
+                .to_string();
+            action.success_check =
+                format!("{target} no longer appears in review/layout_map issues");
+        }
+    }
+}
+
+fn fallback_round_improvement_actions(review: &Review) -> Vec<ImprovementAction> {
+    let mut actions = Vec::new();
+    for issue in &review.localized_issues {
+        actions.push(ImprovementAction {
+            target_id: Some(issue.target_id.clone()),
+            change_type: "localized_geometry_or_style".to_string(),
+            issue: issue.issue.clone(),
+            expected_visible_effect: issue.suggested_direction.clone(),
+            success_check: format!(
+                "{} no longer appears in review/layout_map issues",
+                issue.target_id
+            ),
+        });
+    }
+    if actions.is_empty() {
+        for issue in &review.blocking_issues {
+            actions.push(ImprovementAction {
+                target_id: Some("global_layout".to_string()),
+                change_type: "reference_replan".to_string(),
+                issue: issue.clone(),
+                expected_visible_effect:
+                    "Apply selected reference anti-patterns to make a visible layout or routing change"
+                        .to_string(),
+                success_check:
+                    "next DrawPlan material diff is non-empty and the blocking issue is reduced"
+                        .to_string(),
+            });
+        }
+    }
+    actions
+}
+
+fn infer_improvement_target_id(action: &ImprovementAction, review: &Review) -> Option<String> {
+    let action_text = format!(
+        "{} {} {}",
+        action.issue, action.expected_visible_effect, action.success_check
+    )
+    .to_ascii_lowercase();
+    for issue in &review.localized_issues {
+        if action_text.contains(&issue.target_id.to_ascii_lowercase()) {
+            return Some(issue.target_id.clone());
+        }
+    }
+    for issue in &review.localized_issues {
+        if text_overlap(&action_text, &issue.issue) || text_overlap(&action_text, &issue.evidence) {
+            return Some(issue.target_id.clone());
+        }
+    }
+    review
+        .localized_issues
+        .first()
+        .map(|issue| issue.target_id.clone())
+        .or_else(|| Some("global_layout".to_string()))
+}
+
+fn text_overlap(left: &str, right: &str) -> bool {
+    right
+        .split(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_')
+        .filter(|token| token.len() >= 5)
+        .any(|token| left.contains(&token.to_ascii_lowercase()))
 }
 
 fn validate_round_improvement_plan(plan: &RoundImprovementPlan, review: &Review) -> Result<()> {
@@ -816,6 +1176,306 @@ fn validate_round_improvement_plan(plan: &RoundImprovementPlan, review: &Review)
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::schema::{IssueSeverity, LocalizedIssue, ReviewScores};
+
+    #[test]
+    fn round_improvement_normalization_fills_missing_target_id_from_review() {
+        let review = review_with_localized_issue();
+        let mut plan = RoundImprovementPlan {
+            version: "0.1".to_string(),
+            round_index: 0,
+            reference_id: "simclr_contrastive_y_branch".to_string(),
+            summary: "Fix layout".to_string(),
+            actions: vec![ImprovementAction {
+                target_id: None,
+                change_type: "localized_geometry_or_style".to_string(),
+                issue: "Task Loss overlaps Student Head and Teacher Head".to_string(),
+                expected_visible_effect: "Shrink Task Loss to compact rectangle".to_string(),
+                success_check: String::new(),
+            }],
+            preserve: vec![],
+            rejected_as_unusable: false,
+        };
+
+        normalize_round_improvement_plan(&mut plan, &review);
+
+        assert_eq!(plan.actions[0].target_id.as_deref(), Some("comp_task_loss"));
+        assert!(!plan.actions[0].success_check.is_empty());
+        validate_round_improvement_plan(&plan, &review).expect("normalized plan should validate");
+    }
+
+    #[test]
+    fn round_improvement_normalization_adds_fallback_actions_for_rejected_review() {
+        let review = review_with_localized_issue();
+        let mut plan = RoundImprovementPlan {
+            version: "0.1".to_string(),
+            round_index: 0,
+            reference_id: "simclr_contrastive_y_branch".to_string(),
+            summary: "Empty model plan".to_string(),
+            actions: vec![],
+            preserve: vec![],
+            rejected_as_unusable: false,
+        };
+
+        normalize_round_improvement_plan(&mut plan, &review);
+
+        assert_eq!(plan.actions.len(), 1);
+        assert_eq!(plan.actions[0].target_id.as_deref(), Some("comp_task_loss"));
+        validate_round_improvement_plan(&plan, &review).expect("fallback plan should validate");
+    }
+
+    #[test]
+    fn round_improvement_parser_tolerates_duplicate_model_fields() {
+        let text = r#"{
+            "version": "0.1",
+            "round_index": 1,
+            "reference_id": "simclr_contrastive_y_branch",
+            "summary": "Fix task loss label",
+            "actions": [{
+                "target_id": "e_task_loss_label",
+                "change_type": "localized_geometry_or_style",
+                "issue": "label is far from edge",
+                "expected_visible_effect": "old placement",
+                "expected_visible_effect": "move label next to the task loss edge",
+                "success_check": "label center is near the connector"
+            }],
+            "preserve": [],
+            "rejected_as_unusable": false
+        }"#;
+
+        let plan =
+            parse_round_improvement_plan_text(text).expect("duplicate fields should be tolerated");
+
+        assert_eq!(
+            plan.actions[0].expected_visible_effect,
+            "move label next to the task loss edge"
+        );
+    }
+
+    #[test]
+    fn localized_draw_plan_guard_reverts_unrelated_revision_changes() {
+        let previous = test_draw_plan(vec![
+            test_box("input", [0.05, 0.40, 0.17, 0.56], "Input"),
+            test_box("teacher", [0.25, 0.18, 0.45, 0.34], "Teacher"),
+            test_box("student", [0.25, 0.58, 0.45, 0.74], "Student"),
+            test_box("task_loss", [0.62, 0.62, 0.76, 0.74], "Task Loss"),
+            test_connector(
+                "e_input_teacher",
+                Some("input"),
+                Some("teacher"),
+                vec![[0.17, 0.48], [0.25, 0.26]],
+            ),
+            test_connector(
+                "e_student_to_loss",
+                Some("student"),
+                Some("task_loss"),
+                vec![[0.45, 0.66], [0.62, 0.68]],
+            ),
+        ]);
+        let mut revised = test_draw_plan(vec![
+            test_box("input", [0.02, 0.08, 0.14, 0.24], "Input"),
+            test_box("teacher", [0.70, 0.70, 0.90, 0.86], "Teacher"),
+            test_box("student", [0.25, 0.58, 0.45, 0.74], "Student"),
+            test_box("task_loss", [0.68, 0.78, 0.82, 0.90], "Task Loss"),
+            test_box("new_projector", [0.46, 0.26, 0.58, 0.36], "Projector"),
+            test_connector(
+                "e_student_to_loss",
+                Some("student"),
+                Some("task_loss"),
+                vec![[0.45, 0.66], [0.55, 0.66], [0.68, 0.84]],
+            ),
+        ]);
+        let improvement_plan = RoundImprovementPlan {
+            version: "0.1".to_string(),
+            round_index: 1,
+            reference_id: "simclr_contrastive_y_branch".to_string(),
+            summary: "Move task loss only".to_string(),
+            actions: vec![ImprovementAction {
+                target_id: Some("task_loss".to_string()),
+                change_type: "localized_geometry_or_style".to_string(),
+                issue: "Task Loss crowds student output".to_string(),
+                expected_visible_effect: "Move task_loss below the student output edge".to_string(),
+                success_check: "task_loss no longer crowds student".to_string(),
+            }],
+            preserve: vec![],
+            rejected_as_unusable: false,
+        };
+        let review = review_with_localized_issue();
+        let quality_report = r#"{"issues":[{"target_ids":["task_loss","e_student_to_loss"]}]}"#;
+        let issue_binding = r#"{"entries":[{"target_ids":["task_loss","e_student_to_loss"]}]}"#;
+
+        constrain_draw_plan_revision_to_current_targets(
+            &previous,
+            &mut revised,
+            &improvement_plan,
+            &review,
+            quality_report,
+            issue_binding,
+        );
+
+        assert_eq!(box_bbox(&revised, "input"), [0.05, 0.40, 0.17, 0.56]);
+        assert_eq!(box_bbox(&revised, "teacher"), [0.25, 0.18, 0.45, 0.34]);
+        assert!(has_object(&revised, "e_input_teacher"));
+        assert!(!has_object(&revised, "new_projector"));
+        assert_eq!(box_bbox(&revised, "task_loss"), [0.68, 0.78, 0.82, 0.90]);
+        assert_eq!(
+            connector_points(&revised, "e_student_to_loss"),
+            vec![[0.45, 0.66], [0.55, 0.66], [0.68, 0.84]]
+        );
+    }
+
+    #[test]
+    fn localized_draw_plan_guard_allows_reference_replan_changes() {
+        let previous = test_draw_plan(vec![test_box(
+            "teacher",
+            [0.20, 0.20, 0.40, 0.36],
+            "Teacher",
+        )]);
+        let mut revised = test_draw_plan(vec![
+            test_box("teacher", [0.62, 0.62, 0.82, 0.78], "Teacher"),
+            test_box("student", [0.20, 0.62, 0.40, 0.78], "Student"),
+        ]);
+        let improvement_plan = RoundImprovementPlan {
+            version: "0.1".to_string(),
+            round_index: 1,
+            reference_id: "simclr_contrastive_y_branch".to_string(),
+            summary: "Global replan".to_string(),
+            actions: vec![ImprovementAction {
+                target_id: None,
+                change_type: "reference_replan".to_string(),
+                issue: "Layout unusable".to_string(),
+                expected_visible_effect: "Rebuild the branch arrangement".to_string(),
+                success_check: "global layout is usable".to_string(),
+            }],
+            preserve: vec![],
+            rejected_as_unusable: false,
+        };
+        let review = review_with_localized_issue();
+
+        constrain_draw_plan_revision_to_current_targets(
+            &previous,
+            &mut revised,
+            &improvement_plan,
+            &review,
+            "{}",
+            "{}",
+        );
+
+        assert_eq!(box_bbox(&revised, "teacher"), [0.62, 0.62, 0.82, 0.78]);
+        assert!(has_object(&revised, "student"));
+    }
+
+    fn review_with_localized_issue() -> Review {
+        Review {
+            passed: false,
+            scores: ReviewScores {
+                semantic_fidelity: 3,
+                story_clarity: 2,
+                visual_hierarchy: 2,
+                paper_readability: 1,
+                layout_cleanliness: 1,
+                arrow_routing: 2,
+                color_semantics: 3,
+                aesthetic_quality: 2,
+                wps_editability: 7,
+            },
+            blocking_issues: vec![
+                "Severe overlap: comp_task_loss overlaps comp_student_head".to_string()
+            ],
+            localized_issues: vec![LocalizedIssue {
+                target_id: "comp_task_loss".to_string(),
+                bbox: [0.49, 0.23, 0.98, 0.68],
+                severity: IssueSeverity::Blocking,
+                issue: "Task Loss box overlaps main flow modules".to_string(),
+                evidence: "Task Loss box spans across Student Head and Teacher Head".to_string(),
+                suggested_direction:
+                    "Shrink Task Loss to compact rectangle placed to the right of Student Head"
+                        .to_string(),
+            }],
+            accepted_assets: vec![],
+            rejected_assets: vec![],
+        }
+    }
+
+    fn test_draw_plan(objects: Vec<DrawObject>) -> DrawPlan {
+        DrawPlan {
+            version: "0.2".to_string(),
+            canvas: crate::schema::Canvas {
+                aspect: CanvasAspect::PaperWide,
+                target_width_mm: 85,
+                safe_margin: 0.02,
+            },
+            style_tokens: BTreeMap::new(),
+            objects,
+        }
+    }
+
+    fn test_box(id: &str, bbox: [f64; 4], text: &str) -> DrawObject {
+        DrawObject::Box {
+            id: id.to_string(),
+            bbox,
+            text: text.to_string(),
+            role: "module".to_string(),
+            style: "neutral_module".to_string(),
+            z: 10,
+        }
+    }
+
+    fn test_connector(
+        id: &str,
+        from: Option<&str>,
+        to: Option<&str>,
+        points: Vec<[f64; 2]>,
+    ) -> DrawObject {
+        DrawObject::Connector {
+            id: id.to_string(),
+            points,
+            from: from.map(str::to_string),
+            to: to.map(str::to_string),
+            style: "normal_flow".to_string(),
+            label: None,
+            z: 20,
+        }
+    }
+
+    fn has_object(plan: &DrawPlan, id: &str) -> bool {
+        plan.objects
+            .iter()
+            .any(|object| draw_object_revision_id(object) == id)
+    }
+
+    fn box_bbox(plan: &DrawPlan, id: &str) -> [f64; 4] {
+        plan.objects
+            .iter()
+            .find_map(|object| match object {
+                DrawObject::Box {
+                    id: object_id,
+                    bbox,
+                    ..
+                } if object_id == id => Some(*bbox),
+                _ => None,
+            })
+            .expect("box should exist")
+    }
+
+    fn connector_points(plan: &DrawPlan, id: &str) -> Vec<[f64; 2]> {
+        plan.objects
+            .iter()
+            .find_map(|object| match object {
+                DrawObject::Connector {
+                    id: object_id,
+                    points,
+                    ..
+                } if object_id == id => Some(points.clone()),
+                _ => None,
+            })
+            .expect("connector should exist")
+    }
 }
 
 pub fn create_patch_plan(

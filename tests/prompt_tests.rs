@@ -1,8 +1,10 @@
 use methodfig::agent::{
     build_draw_plan_revision_prompt, build_initial_plan_prompt, build_patch_prompt,
-    build_review_prompt, build_review_retry_prompt,
+    build_review_prompt, build_review_retry_prompt, build_round_improvement_prompt,
 };
-use methodfig::prompts::{TOP_TIER_FIGURE_DIRECTIVE, VISION_REVIEWER};
+use methodfig::prompts::{
+    CODER_DRAW_PLAN_INITIAL, CODER_DRAW_PLAN_REVISION, TOP_TIER_FIGURE_DIRECTIVE, VISION_REVIEWER,
+};
 use methodfig::schema::{CanvasAspect, ReferencePreviewMode, ReferenceSelection, StyleName};
 
 #[test]
@@ -25,6 +27,8 @@ fn initial_plan_prompt_includes_schema_and_required_top_level_keys() {
     assert!(prompt.contains("stable id"));
     assert!(prompt.contains("high space utilization"));
     assert!(prompt.contains("Never let text cover lines or arrows"));
+    assert!(prompt.contains("tiny labels floating"));
+    assert!(prompt.contains("clear gutters"));
     assert!(prompt.contains(TOP_TIER_FIGURE_DIRECTIVE));
     assert!(prompt.contains("Selected visual reference"));
     assert!(prompt.contains("ReferenceSelection"));
@@ -94,10 +98,15 @@ fn review_prompt_includes_schema_and_all_score_fields() {
     assert!(prompt.contains("simclr_contrastive_y_branch"));
     assert!(prompt.contains("DrawPlan is the rendered source of truth"));
     assert!(prompt.contains("Do not report FigurePlan annotations as missing"));
+    assert!(prompt.contains("phase-only FigurePlan annotation"));
+    assert!(prompt.contains("training_label"));
+    assert!(prompt.contains("visible phase semantics are genuinely missing"));
     assert!(prompt.contains("Selected visual reference"));
     assert!(prompt.contains("quality target"));
     assert!(prompt.contains("native boxes, text, and connectors"));
     assert!(prompt.contains("wps_editability 9 or 10"));
+    assert!(prompt.contains("font_size_pt"));
+    assert!(prompt.contains("visually crowded"));
     assert!(prompt.contains("do not embed quotation marks"));
     assert!(!prompt.contains(TOP_TIER_FIGURE_DIRECTIVE));
 }
@@ -137,8 +146,29 @@ fn patch_prompt_includes_schema_and_required_fields() {
 #[test]
 fn vision_reviewer_mentions_the_new_hard_constraints() {
     assert!(VISION_REVIEWER.contains("Reject any figure that wastes canvas space"));
+    assert!(VISION_REVIEWER.contains("tiny text floating inside oversized boxes"));
+    assert!(VISION_REVIEWER.contains("crowds boxes together without clear gutters"));
+    assert!(VISION_REVIEWER.contains("font_size_pt"));
     assert!(VISION_REVIEWER.contains("text on top of a line"));
     assert!(VISION_REVIEWER.contains("marginal explanatory notes"));
+}
+
+#[test]
+fn coder_prompts_limit_runtime_to_documented_draw_plan_api() {
+    for prompt in [CODER_DRAW_PLAN_INITIAL, CODER_DRAW_PLAN_REVISION] {
+        let lower = prompt.to_ascii_lowercase();
+        assert!(prompt.contains("createDrawPlanRuntimeFromEnv"));
+        assert!(prompt.contains("runtime.renderDrawPlan"));
+        assert!(prompt.contains("Do not call undocumented methods"));
+        assert!(prompt.contains("getSlide"));
+        assert!(prompt.contains("getDrawPlan"));
+        assert!(prompt.contains("Unsupported runtime API calls are rejected"));
+        assert!(prompt.contains("deterministic fallback"));
+        assert!(lower.contains("do not inspect payload/draw_plan/style_tokens directly"));
+        assert!(lower.contains("do not duplicate runtime color/layout logic"));
+    }
+    assert!(CODER_DRAW_PLAN_REVISION.contains("previous_renderer_error"));
+    assert!(CODER_DRAW_PLAN_REVISION.contains("latest_attempt_renderer_error"));
 }
 
 #[test]
@@ -148,6 +178,11 @@ fn draw_plan_revision_prompt_uses_autofigure_style_visual_optimization_contract(
         "{\"objects\":[]}",
         "{\"passed\":false}",
         "{\"errors\":[\"label overlaps edge\"]}",
+        "{\"issues\":[{\"issue_id\":\"quality_001\",\"target_ids\":[\"edge1\"]}]}",
+        "{\"issues\":[{\"issue_key\":\"label_overlaps_edge|edge1\",\"occurrences\":2}]}",
+        "{\"entries\":[{\"issue_id\":\"quality_001\",\"target_ids\":[\"edge1\"]}]}",
+        "{\"status\":\"regressed\",\"budget\":{\"min_quality_score\":80,\"max_blocking_issues\":0,\"max_major_issues\":1},\"regressed_issue_types\":[\"label_overlaps_edge\"]}",
+        "export async function render() { /* previous generated code */ }",
         &teacher_student_reference(),
         "{\"actions\":[{\"target_id\":\"student\",\"expected_visible_effect\":\"move label off edge\"}]}",
     )
@@ -171,6 +206,43 @@ fn draw_plan_revision_prompt_uses_autofigure_style_visual_optimization_contract(
     assert!(prompt.contains("simclr_contrastive_y_branch"));
     assert!(prompt.contains("Selected visual reference"));
     assert!(prompt.contains("RoundImprovementPlan"));
+    assert!(prompt.contains("QualityReport"));
+    assert!(prompt.contains("excessive_internal_whitespace"));
+    assert!(prompt.contains("text_wrap_risk"));
+    assert!(prompt.contains("component_crowding"));
+    assert!(prompt.contains("vertical_under_utilization"));
+    assert!(prompt.contains("supervision_branch_asymmetry"));
+    assert!(prompt.contains("route_detour"));
+    assert!(prompt.contains("edge_style_mismatch"));
+    assert!(prompt.contains("edge_crossing"));
+    assert!(prompt.contains("annotation_in_main_corridor"));
+    assert!(prompt.contains("task_loss_reverse_flow"));
+    assert!(prompt.contains("label_far_from_edge"));
+    assert!(prompt.contains("label_outside_main_area"));
+    assert!(prompt.contains("remove generic floating phase/capacity labels"));
+    assert!(prompt.contains("duplicate input lane"));
+    assert!(prompt.contains("standalone inference lane"));
+    assert!(prompt.contains("component_overlap"));
+    assert!(prompt.contains("edge_crosses_component"));
+    assert!(prompt.contains("label_overlaps_edge"));
+    assert!(prompt.contains("label_overlaps_component"));
+    assert!(prompt.contains("concrete target ids no longer collide"));
+    assert!(prompt.contains("longest token or short input phrase"));
+    assert!(prompt.contains("IssueHistory"));
+    assert!(prompt.contains("IssueBinding"));
+    assert!(prompt.contains("RegressionReport"));
+    assert!(prompt.contains("RegressionContext"));
+    assert!(prompt.contains("anti-regression contract"));
+    assert!(prompt.contains("latest_attempt_* evidence"));
+    assert!(prompt.contains("budget.min_quality_score"));
+    assert!(prompt.contains("regressed_issue_types"));
+    assert!(prompt.contains("New edge_crossing"));
+    assert!(prompt.contains("previous renderer code"));
+    assert!(prompt.contains("Previous generated figure.ts"));
+    assert!(prompt.contains("previous generated code"));
+    assert!(prompt.contains("soft evidence only"));
+    assert!(prompt.contains("do not restart the layout from a template"));
+    assert!(prompt.contains("occurrences >= 2"));
     assert!(prompt.contains("materially change"));
     assert!(prompt.contains("derived from extracted PDF/SVG"));
     assert!(prompt.contains("teacher_student_distillation"));
@@ -181,6 +253,51 @@ fn draw_plan_revision_prompt_uses_autofigure_style_visual_optimization_contract(
     assert!(prompt.contains("standalone inference note component"));
     assert!(prompt.contains("asymmetric branch annotations"));
     assert!(prompt.contains("connector-overlapping labels"));
+}
+
+#[test]
+fn round_improvement_prompt_uses_regression_budget_as_repair_contract() {
+    let prompt = build_round_improvement_prompt(
+        "{\"passed\":false,\"blocking_issues\":[\"label overlaps edge\"]}",
+        "{\"objects\":[]}",
+        "{\"errors\":[\"label overlaps edge\"]}",
+        "{\"score\":65,\"issues\":[{\"issue_id\":\"quality_001\",\"severity\":\"major\",\"target_ids\":[\"edge1\"]}]}",
+        "{\"issues\":[{\"issue_key\":\"label_overlaps_edge|edge1\",\"occurrences\":2}]}",
+        "{\"entries\":[{\"issue_id\":\"quality_001\",\"target_ids\":[\"edge1\"]}]}",
+        "{\"status\":\"regressed\",\"budget\":{\"min_quality_score\":80,\"max_blocking_issues\":0,\"max_major_issues\":1},\"regressed_issue_types\":[\"label_overlaps_edge\"]}",
+        &teacher_student_reference(),
+        2,
+    )
+    .expect("round improvement prompt should build");
+
+    assert!(prompt.contains("RegressionReport"));
+    assert!(prompt.contains("RegressionContext"));
+    assert!(prompt.contains("hard regression budget"));
+    assert!(prompt.contains("revert to the revision source geometry/code"));
+    assert!(prompt.contains("latest_attempt_* evidence"));
+    assert!(prompt.contains("budget.min_quality_score"));
+    assert!(prompt.contains("budget.max_blocking_issues"));
+    assert!(prompt.contains("regressed_issue_types"));
+    assert!(prompt.contains("IssueHistory"));
+    assert!(prompt.contains("occurrences >= 2"));
+    assert!(prompt.contains("route_detour"));
+    assert!(prompt.contains("edge_crossing"));
+    assert!(prompt.contains("annotation_in_main_corridor"));
+    assert!(prompt.contains("teacher_student_branch_inversion"));
+    assert!(prompt.contains("teacher_internal_flow_reversed"));
+    assert!(prompt.contains("loss_label_on_prediction_edge"));
+    assert!(prompt.contains("task_loss_reverse_flow"));
+    assert!(prompt.contains("inference_annotation_in_bottom_margin"));
+    assert!(prompt.contains("prediction_loss_semantic_mix"));
+    assert!(prompt.contains("vertical_under_utilization"));
+    assert!(prompt.contains("supervision_branch_asymmetry"));
+    assert!(prompt.contains("edge_style_mismatch"));
+    assert!(prompt.contains("label_far_from_edge"));
+    assert!(prompt.contains("label_outside_main_area"));
+    assert!(prompt.contains("short input phrase"));
+    assert!(prompt.contains("remove a redundant floating phase/capacity label"));
+    assert!(prompt.contains("duplicate input lane"));
+    assert!(prompt.contains("standalone inference lane"));
 }
 
 fn teacher_student_reference() -> ReferenceSelection {

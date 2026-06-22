@@ -47,6 +47,26 @@ pub fn scan_generated_typescript(code: &str) -> Result<()> {
     Ok(())
 }
 
+pub fn validate_generated_runtime_contract(code: &str) -> Result<()> {
+    let forbidden_methods = [
+        "getDrawPlan",
+        "getSlide",
+        "getPptx",
+        "getPresentation",
+        "track",
+        "write",
+    ];
+    for method in forbidden_methods {
+        let needle = format!(".{method}(");
+        if code.contains(&needle) {
+            return Err(anyhow!(
+                "generated TypeScript violates DrawPlan runtime contract: unsupported runtime method {method}; use createDrawPlanRuntimeFromEnv() followed by runtime.renderDrawPlan()"
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn collect_static_imports(code: &str) -> Vec<String> {
     let mut imports = Vec::new();
     let mut current: Option<String> = None;
@@ -123,6 +143,7 @@ pub fn run_node_renderer(
     allow_placeholder: bool,
 ) -> Result<()> {
     scan_generated_typescript(code)?;
+    validate_generated_runtime_contract(code)?;
     fs::create_dir_all(round_dir)?;
     let figure_ts = round_dir.join("figure.ts");
     fs::write(&figure_ts, code)?;
@@ -140,6 +161,10 @@ pub fn run_node_renderer(
                 .arg(&figure_ts)
                 .current_dir(&round_dir)
                 .env("METHODFIG_RENDER_OUT_DIR", &round_dir)
+                .env(
+                    "METHODFIG_RENDER_PAYLOAD_PATH",
+                    round_dir.join("renderer_payload.json"),
+                )
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped()),
             timeout,

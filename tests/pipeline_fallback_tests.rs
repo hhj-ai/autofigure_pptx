@@ -30,6 +30,8 @@ fn pipeline_fallback_renderer_uses_current_draw_plan_not_legacy_figure_plan() {
     )
     .expect("fallback code should build");
 
-    assert!(fallback_code.contains("createDrawPlanRuntime"));
+    assert!(fallback_code.contains("createDrawPlanRuntimeFromEnv"));
     assert!(!fallback_code.contains("createFigureRuntime"));
+    assert!(!fallback_code.contains("const payload"));
+    assert!(round_dir.join("renderer_payload.json").exists());
 }

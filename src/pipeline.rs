@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -12,8 +13,8 @@ use crate::agent::{
 };
 use crate::config::AppConfig;
 use crate::schema::{
-    validate_draw_plan, CanvasAspect, DrawPlan, FigurePlan, ImageProviderKind,
-    ReferencePreviewMode, ReferenceSelection, Review, StyleName,
+    validate_draw_plan, CanvasAspect, DrawObject, DrawPlan, EdgeStyle, FigurePlan,
+    ImageProviderKind, ReferencePreviewMode, ReferenceSelection, Review, StyleName,
 };
 use crate::style::style_by_name;
 use crate::tools::asset_gen::materialize_assets;
@@ -23,7 +24,7 @@ use crate::tools::cost::{
     EST_REASONER_PATCH_USD, EST_VISION_USD,
 };
 use crate::tools::draw_plan::{
-    draw_plan_from_figure_plan, generate_draw_plan_typescript,
+    draw_plan_from_figure_plan, draw_plan_material_changes, generate_draw_plan_typescript,
     polish_model_draw_plan_geometry_with_figure_plan, repair_draw_plan_geometry_with_figure_plan,
 };
 use crate::tools::export::export_round;
@@ -34,7 +35,9 @@ use crate::tools::generated_code::{
 use crate::tools::render::{
     default_renderer_root, run_node_renderer, run_node_renderer_with_fallback,
 };
-use crate::tools::review::{apply_plan_geometry_gate, apply_render_quality_gate};
+use crate::tools::review::{
+    apply_plan_geometry_gate, build_quality_report, QualityIssue, QualityReport,
+};
 use crate::tools::template_library::{method_template_pack_json, select_reference_for_method};
 use crate::tools::validate::{normalize_plan_for_render, validate_plan_for_render};
 use crate::tools::workspace::{
@@ -98,6 +101,77 @@ struct RendererStatus {
     used_fallback: bool,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct RepairReport {
+    version: String,
+    round_index: u32,
+    source_round_index: Option<u32>,
+    material_changes: Vec<String>,
+    notes: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct RegressionReport {
+    version: String,
+    round_index: u32,
+    source_round_index: Option<u32>,
+    status: String,
+    source_quality_score: Option<u32>,
+    quality_score: u32,
+    score_delta: Option<i32>,
+    blocking_delta: Option<i32>,
+    major_delta: Option<i32>,
+    issue_delta: Option<i32>,
+    regressed_issue_types: Vec<String>,
+    resolved_issue_types: Vec<String>,
+    budget: RegressionBudget,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct RegressionBudget {
+    min_quality_score: u32,
+    max_blocking_issues: usize,
+    max_major_issues: usize,
+    requirement: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct IssueBinding {
+    version: String,
+    round_index: u32,
+    entries: Vec<IssueBindingEntry>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct IssueBindingEntry {
+    issue_id: String,
+    issue_type: String,
+    severity: String,
+    source: String,
+    target_ids: Vec<String>,
+    evidence: String,
+    suggested_action: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct IssueHistory {
+    version: String,
+    round_index: u32,
+    issues: Vec<TrackedIssue>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct TrackedIssue {
+    issue_key: String,
+    issue_type: String,
+    target_ids: Vec<String>,
+    first_seen_round: u32,
+    last_seen_round: u32,
+    occurrences: u32,
+    latest_evidence: String,
+    latest_suggested_action: String,
+}
+
 pub fn run_pipeline(options: RunOptions) -> Result<PipelineResult> {
     run_pipeline_inner(options, None)
 }
@@ -107,10 +181,18 @@ struct ResumeState {
     method_text: String,
     plan: FigurePlan,
     reference_selection: ReferenceSelection,
-    best_round: Option<(u32, Review)>,
+    best_round: Option<BestRound>,
     previous_review: Option<Review>,
     next_round_index: u32,
     rounds_completed: u32,
+    rounds_this_invocation_offset: u32,
+}
+
+#[derive(Clone, Debug)]
+struct BestRound {
+    index: u32,
+    review: Review,
+    quality_report: QualityReport,
 }
 
 fn run_pipeline_inner(
@@ -134,6 +216,7 @@ fn run_pipeline_inner(
         mut previous_review,
         mut rounds_completed,
         mut round_index,
+        mut rounds_this_invocation,
     ) = match resume_state {
         Some(state) => {
             append_log(
@@ -148,6 +231,7 @@ fn run_pipeline_inner(
                 state.previous_review,
                 state.rounds_completed,
                 state.next_round_index,
+                state.rounds_this_invocation_offset,
             )
         }
         None => {
@@ -199,13 +283,12 @@ fn run_pipeline_inner(
                 &config,
                 options.mock_models,
             )?;
-            (method_text, plan, reference_selection, None, None, 0, 0)
+            (method_text, plan, reference_selection, None, None, 0, 0, 0)
         }
     };
     let reference_preview_path =
         resolve_reference_preview_path(&reference_selection, options.reference_previews)?;
 
-    let mut rounds_this_invocation = 0;
     loop {
         if options.max_iterations > 0 && rounds_this_invocation >= options.max_iterations {
             break;
@@ -220,16 +303,24 @@ fn run_pipeline_inner(
 
         let round_dir = options.out_dir.join(format!("round_{round_index:03}"));
         let revision_source_index =
-            revision_source_round_index(round_index, best_round.as_ref().map(|(index, _)| *index));
+            revision_source_round_index(round_index, best_round.as_ref().map(|best| best.index));
         let revision_round_dir = revision_source_index
             .map(|source_index| options.out_dir.join(format!("round_{source_index:03}")));
+        let latest_attempt_index = round_index.checked_sub(1);
+        let latest_attempt_round_dir = latest_attempt_index
+            .filter(|latest_index| Some(*latest_index) != revision_source_index)
+            .map(|latest_index| options.out_dir.join(format!("round_{latest_index:03}")));
+        let revision_regression_context = build_revision_regression_context(
+            revision_source_index,
+            revision_round_dir.as_deref(),
+            latest_attempt_index,
+            latest_attempt_round_dir.as_deref(),
+        )?;
         let revision_review = match revision_source_index {
             None => None,
             Some(source_index) => best_round
                 .as_ref()
-                .and_then(|(best_index, best_review)| {
-                    (*best_index == source_index).then_some(best_review.clone())
-                })
+                .and_then(|best| (best.index == source_index).then_some(best.review.clone()))
                 .or_else(|| {
                     if source_index + 1 == round_index {
                         previous_review.clone()
@@ -260,38 +351,55 @@ fn run_pipeline_inner(
             &round_dir.join("reference_selection.json"),
             &reference_selection,
         )?;
-        let mut draw_plan = if let (Some(revision_round_dir), Some(revision_review)) =
-            (revision_round_dir.as_deref(), revision_review.as_ref())
-        {
-            if !options.mock_models {
-                if let Err(error) = cost.reserve("vision DrawPlan optimization", EST_VISION_USD) {
-                    let reason = error.to_string();
-                    append_log(&options.out_dir, &reason)?;
-                    cap_reason = Some(reason);
-                    break;
+        let revision_source_draw_plan =
+            if let Some(revision_round_dir) = revision_round_dir.as_deref() {
+                Some(
+                    read_json::<DrawPlan>(&revision_round_dir.join("draw_plan.json"))
+                        .context("failed to read revision source draw_plan.json")?,
+                )
+            } else {
+                None
+            };
+        let mut draw_plan =
+            if let (Some(revision_round_dir), Some(revision_review), Some(previous_draw_plan)) = (
+                revision_round_dir.as_deref(),
+                revision_review.as_ref(),
+                revision_source_draw_plan.as_ref(),
+            ) {
+                if !options.mock_models {
+                    if let Err(error) = cost.reserve("vision DrawPlan optimization", EST_VISION_USD)
+                    {
+                        let reason = error.to_string();
+                        append_log(&options.out_dir, &reason)?;
+                        cap_reason = Some(reason);
+                        break;
+                    }
                 }
-            }
-            let previous_draw_plan: DrawPlan =
-                read_json(&revision_round_dir.join("draw_plan.json"))
-                    .context("failed to read revision source draw_plan.json")?;
-            let previous_improvement_plan =
-                read_text_or_empty(&revision_round_dir.join("improvement_plan.json"))?;
-            revise_draw_plan_from_feedback(
-                &previous_draw_plan,
-                revision_review,
-                &read_text_or_empty(&revision_round_dir.join("layout_map.json"))?,
-                &read_text_or_empty(&revision_round_dir.join("validation_report.json"))?,
-                &previous_overlay_path(revision_round_dir, options.target_width_mm),
-                &reference_selection,
-                &previous_improvement_plan,
-                reference_preview_path.as_deref(),
-                &config,
-                options.mock_models,
-                round_index,
-            )?
-        } else {
-            draw_plan_from_figure_plan(&plan, &style)
-        };
+                let previous_improvement_plan = select_revision_improvement_plan(
+                    revision_round_dir,
+                    latest_attempt_round_dir.as_deref(),
+                )?;
+                revise_draw_plan_from_feedback(
+                    previous_draw_plan,
+                    revision_review,
+                    &read_text_or_empty(&revision_round_dir.join("layout_map.json"))?,
+                    &read_text_or_empty(&revision_round_dir.join("validation_report.json"))?,
+                    &read_text_or_empty(&revision_round_dir.join("quality_report.json"))?,
+                    &read_text_or_empty(&revision_round_dir.join("issue_history.json"))?,
+                    &read_text_or_empty(&revision_round_dir.join("issue_binding.json"))?,
+                    &revision_regression_context,
+                    &read_text_or_empty(&revision_round_dir.join("figure.ts"))?,
+                    &previous_overlay_path(revision_round_dir, options.target_width_mm),
+                    &reference_selection,
+                    &previous_improvement_plan,
+                    reference_preview_path.as_deref(),
+                    &config,
+                    options.mock_models,
+                    round_index,
+                )?
+            } else {
+                draw_plan_from_figure_plan(&plan, &style)
+            };
         if options.mock_models {
             repair_draw_plan_geometry_with_figure_plan(&mut draw_plan, &plan);
         } else {
@@ -299,6 +407,13 @@ fn run_pipeline_inner(
         }
         validate_draw_plan(&draw_plan)?;
         write_json(&round_dir.join("draw_plan.json"), &draw_plan)?;
+        let repair_report = build_repair_report(
+            round_index,
+            revision_source_index,
+            revision_source_draw_plan.as_ref(),
+            &draw_plan,
+        );
+        write_json(&round_dir.join("repair_report.json"), &repair_report)?;
         write_json(
             &round_dir.join("validation_report.json"),
             &RoundValidationReport {
@@ -312,6 +427,7 @@ fn run_pipeline_inner(
             &method_text,
             &reference_selection,
             revision_round_dir.as_deref(),
+            latest_attempt_round_dir.as_deref(),
         )?;
         workspace.write_declared(
             "writable/design_brief.md",
@@ -388,6 +504,10 @@ fn run_pipeline_inner(
                 revision_review,
                 &read_text_or_empty(&revision_round_dir.join("layout_map.json"))?,
                 &read_text_or_empty(&revision_round_dir.join("validation_report.json"))?,
+                &read_text_or_empty(&revision_round_dir.join("quality_report.json"))?,
+                &read_text_or_empty(&revision_round_dir.join("issue_history.json"))?,
+                &read_text_or_empty(&revision_round_dir.join("issue_binding.json"))?,
+                &revision_regression_context,
                 &style,
                 &round_dir,
                 &renderer_root,
@@ -463,7 +583,24 @@ fn run_pipeline_inner(
             round_index,
         )?;
         apply_plan_geometry_gate(&plan, &mut review);
-        apply_render_quality_gate(&mut review, &round_dir.join("layout_map.json"))?;
+        let mut quality_report = build_quality_report(&round_dir.join("layout_map.json"))?;
+        inject_draw_plan_semantic_quality_issues(&mut quality_report, &plan, &draw_plan);
+        write_json(&round_dir.join("quality_report.json"), &quality_report)?;
+        let source_quality_report = revision_round_dir
+            .as_deref()
+            .map(|dir| read_json::<QualityReport>(&dir.join("quality_report.json")))
+            .transpose()?;
+        let regression_report = build_regression_report(
+            round_index,
+            revision_source_index,
+            source_quality_report.as_ref(),
+            &quality_report,
+        );
+        write_json(
+            &round_dir.join("regression_report.json"),
+            &regression_report,
+        )?;
+        apply_quality_report_gate(&mut review, &quality_report);
         if used_fallback {
             reject_fallback_round(&mut review);
         }
@@ -475,6 +612,11 @@ fn run_pipeline_inner(
                 errors: review.blocking_issues.clone(),
             },
         )?;
+        let issue_binding = build_issue_binding(round_index, &review, &quality_report);
+        write_json(&round_dir.join("issue_binding.json"), &issue_binding)?;
+        let issue_history =
+            build_issue_history(round_index, revision_round_dir.as_deref(), &issue_binding)?;
+        write_json(&round_dir.join("issue_history.json"), &issue_history)?;
         if !options.mock_models {
             if let Err(error) =
                 cost.reserve("reasoner round improvement plan", EST_REASONER_PATCH_USD)
@@ -489,6 +631,10 @@ fn run_pipeline_inner(
             &review,
             &read_text_or_empty(&round_dir.join("layout_map.json"))?,
             &read_text_or_empty(&round_dir.join("validation_report.json"))?,
+            &read_text_or_empty(&round_dir.join("quality_report.json"))?,
+            &read_text_or_empty(&round_dir.join("issue_history.json"))?,
+            &read_text_or_empty(&round_dir.join("issue_binding.json"))?,
+            &read_text_or_empty(&round_dir.join("regression_report.json"))?,
             &reference_selection,
             &config,
             options.mock_models,
@@ -496,8 +642,13 @@ fn run_pipeline_inner(
         )?;
         write_json(&round_dir.join("improvement_plan.json"), &improvement_plan)?;
         rounds_completed = count_rounds(&options.out_dir)?;
-        if should_replace_best_review(best_round.as_ref().map(|(_, review)| review), &review) {
-            best_round = Some((round_index, review.clone()));
+        let candidate_best_round = BestRound {
+            index: round_index,
+            review: review.clone(),
+            quality_report: quality_report.clone(),
+        };
+        if should_replace_best_round(best_round.as_ref(), &candidate_best_round) {
+            best_round = Some(candidate_best_round);
         }
 
         if review.passed {
@@ -516,10 +667,18 @@ fn run_pipeline_inner(
         rounds_this_invocation += 1;
     }
 
-    let (round_index, review) = best_round.ok_or_else(|| anyhow!("no round was produced"))?;
-    let round_dir = options.out_dir.join(format!("round_{round_index:03}"));
+    let best_round = best_round.ok_or_else(|| anyhow!("no round was produced"))?;
+    let round_dir = options
+        .out_dir
+        .join(format!("round_{:03}", best_round.index));
     let reason = cap_reason.unwrap_or_else(|| "cap reached before acceptance".to_string());
-    finalize_from_round(&options.out_dir, &round_dir, &review, false, &reason)?;
+    finalize_from_round(
+        &options.out_dir,
+        &round_dir,
+        &best_round.review,
+        false,
+        &reason,
+    )?;
     Ok(PipelineResult {
         accepted: false,
         rounds: rounds_completed,
@@ -531,6 +690,7 @@ fn run_pipeline_inner(
 
 pub fn resume_pipeline(run_dir: PathBuf) -> Result<PipelineResult> {
     let final_status = run_dir.join("final/status.json");
+    let resume_after_final = final_status.exists();
     if final_status.exists() {
         let status: FinalStatus = read_json(&final_status)?;
         if status.accepted {
@@ -546,7 +706,7 @@ pub fn resume_pipeline(run_dir: PathBuf) -> Result<PipelineResult> {
 
     let config: ConfigSnapshot = read_json(&run_dir.join("config_snapshot.json"))?;
     let input = run_dir.join("input.md");
-    let state = load_resume_state(&run_dir)?;
+    let state = load_resume_state(&run_dir, resume_after_final)?;
     run_pipeline_inner(
         RunOptions {
             method_path: input,
@@ -567,7 +727,7 @@ pub fn resume_pipeline(run_dir: PathBuf) -> Result<PipelineResult> {
     )
 }
 
-fn load_resume_state(run_dir: &Path) -> Result<ResumeState> {
+fn load_resume_state(run_dir: &Path, resume_after_final: bool) -> Result<ResumeState> {
     let method_text = fs::read_to_string(run_dir.join("input.md"))
         .with_context(|| format!("failed to read {}", run_dir.join("input.md").display()))?;
     let completed_indices = completed_round_indices(run_dir)?;
@@ -578,29 +738,36 @@ fn load_resume_state(run_dir: &Path) -> Result<ResumeState> {
         ));
     }
 
-    let mut best_round: Option<(u32, Review)> = None;
+    let mut best_round: Option<BestRound> = None;
     let mut previous_review: Option<Review> = None;
     let mut latest_completed_index = 0;
     for index in completed_indices {
-        let review: Review = read_json(&run_dir.join(format!("round_{index:03}/review.json")))?;
+        let round_dir = run_dir.join(format!("round_{index:03}"));
+        let review: Review = read_json(&round_dir.join("review.json"))?;
+        let quality_report: QualityReport = read_json(&round_dir.join("quality_report.json"))
+            .with_context(|| {
+                format!("failed to read quality_report.json from completed round {index}")
+            })?;
         if previous_review.is_none() || index > latest_completed_index {
             latest_completed_index = index;
             previous_review = Some(review.clone());
         }
-        if should_replace_best_review(best_round.as_ref().map(|(_, review)| review), &review) {
-            best_round = Some((index, review));
+        let candidate_best_round = BestRound {
+            index,
+            review,
+            quality_report,
+        };
+        if should_replace_best_round(best_round.as_ref(), &candidate_best_round) {
+            best_round = Some(candidate_best_round);
         }
     }
 
-    let best_index = best_round
-        .as_ref()
-        .map(|(index, _)| *index)
-        .ok_or_else(|| {
-            anyhow!(
-                "cannot resume {}; no best round was found",
-                run_dir.display()
-            )
-        })?;
+    let best_index = best_round.as_ref().map(|best| best.index).ok_or_else(|| {
+        anyhow!(
+            "cannot resume {}; no best round was found",
+            run_dir.display()
+        )
+    })?;
     let plan: FigurePlan =
         read_json(&run_dir.join(format!("round_{best_index:03}/figure_plan.json"))).with_context(
             || format!("failed to read best round figure_plan.json from round {best_index}"),
@@ -611,6 +778,7 @@ fn load_resume_state(run_dir: &Path) -> Result<ResumeState> {
         select_reference_for_resume(&method_text)?
     };
 
+    let rounds_completed = count_rounds(run_dir)?;
     Ok(ResumeState {
         method_text,
         plan,
@@ -618,7 +786,12 @@ fn load_resume_state(run_dir: &Path) -> Result<ResumeState> {
         best_round,
         previous_review,
         next_round_index: next_round_index(run_dir)?,
-        rounds_completed: count_rounds(run_dir)?,
+        rounds_completed,
+        rounds_this_invocation_offset: if resume_after_final {
+            0
+        } else {
+            rounds_completed
+        },
     })
 }
 
@@ -671,6 +844,23 @@ pub fn should_replace_best_review(current: Option<&Review>, candidate: &Review) 
     review_rank(candidate) > review_rank(current)
 }
 
+pub fn should_replace_best_round_quality(
+    current: Option<(&Review, &QualityReport)>,
+    candidate: (&Review, &QualityReport),
+) -> bool {
+    let Some((current_review, current_quality)) = current else {
+        return true;
+    };
+    best_round_rank(candidate.0, candidate.1) > best_round_rank(current_review, current_quality)
+}
+
+fn should_replace_best_round(current: Option<&BestRound>, candidate: &BestRound) -> bool {
+    should_replace_best_round_quality(
+        current.map(|best| (&best.review, &best.quality_report)),
+        (&candidate.review, &candidate.quality_report),
+    )
+}
+
 pub fn revision_source_round_index(
     current_round_index: u32,
     best_round_index: Option<u32>,
@@ -680,6 +870,193 @@ pub fn revision_source_round_index(
     } else {
         best_round_index.or(Some(current_round_index - 1))
     }
+}
+
+fn build_revision_regression_context(
+    revision_source_index: Option<u32>,
+    revision_round_dir: Option<&Path>,
+    latest_attempt_index: Option<u32>,
+    latest_attempt_round_dir: Option<&Path>,
+) -> Result<String> {
+    let Some(revision_round_dir) = revision_round_dir else {
+        return Ok(String::new());
+    };
+    let source_report =
+        read_json_value_if_exists(&revision_round_dir.join("regression_report.json"))?;
+    let source_renderer_error =
+        read_text_or_empty(&revision_round_dir.join("figure.model_error.log"))?;
+    let Some(latest_attempt_round_dir) = latest_attempt_round_dir else {
+        return Ok(serde_json::to_string_pretty(&serde_json::json!({
+            "version": "0.1",
+            "revision_source_round_index": revision_source_index,
+            "revision_source_regression_report": source_report,
+            "revision_source_renderer_error": source_renderer_error,
+            "instruction": "Treat revision_source_regression_report.budget as the hard floor. If revision_source_renderer_error is non-empty, fix the generated TypeScript by using only createDrawPlanRuntimeFromEnv() and runtime.renderDrawPlan(); do not repeat unsupported runtime API calls."
+        }))?);
+    };
+
+    // 回滚到 best-so-far 时，仍把最新失败尝试作为负例证据放进上下文，避免下一轮重复同一套坏策略。
+    serde_json::to_string_pretty(&serde_json::json!({
+        "version": "0.1",
+        "revision_source_round_index": revision_source_index,
+        "latest_attempt_round_index": latest_attempt_index,
+        "revision_source_regression_report": source_report,
+        "revision_source_renderer_error": source_renderer_error,
+        "latest_attempt_review": read_json_value_if_exists(&latest_attempt_round_dir.join("review.json"))?,
+        "latest_attempt_quality_report": read_json_value_if_exists(&latest_attempt_round_dir.join("quality_report.json"))?,
+        "latest_attempt_regression_report": read_json_value_if_exists(&latest_attempt_round_dir.join("regression_report.json"))?,
+        "latest_attempt_issue_binding": read_json_value_if_exists(&latest_attempt_round_dir.join("issue_binding.json"))?,
+        "latest_attempt_issue_history": read_json_value_if_exists(&latest_attempt_round_dir.join("issue_history.json"))?,
+        "latest_attempt_improvement_plan": read_json_value_if_exists(&latest_attempt_round_dir.join("improvement_plan.json"))?,
+        "latest_attempt_renderer_error": read_text_or_empty(&latest_attempt_round_dir.join("figure.model_error.log"))?,
+        "latest_attempt_figure_ts": read_text_or_empty(&latest_attempt_round_dir.join("figure.ts"))?,
+        "instruction": "Treat revision_source_regression_report.budget as the hard floor. Treat latest_attempt_* as negative evidence: identify what changed in the latest attempt, do not repeat its regressed issue types, and keep only local fixes that directly address current unresolved target ids. Never fix a local issue by adding edge_crossing, annotation_in_main_corridor, duplicate input lanes, or a standalone inference lane. If any renderer_error field is non-empty, fix the generated TypeScript by using only createDrawPlanRuntimeFromEnv() and runtime.renderDrawPlan(); do not repeat unsupported runtime API calls."
+    }))
+    .context("failed to build revision regression context")
+}
+
+fn read_json_value_if_exists(path: &Path) -> Result<serde_json::Value> {
+    if !path.exists() {
+        return Ok(serde_json::Value::Null);
+    }
+    let text = fs::read_to_string(path)
+        .with_context(|| format!("failed to read JSON context {}", path.display()))?;
+    serde_json::from_str(&text)
+        .with_context(|| format!("failed to parse JSON context {}", path.display()))
+}
+
+fn best_round_rank(
+    review: &Review,
+    quality_report: &QualityReport,
+) -> (
+    u8,
+    i32,
+    i32,
+    u32,
+    i32,
+    (u8, u8, i32, u32, u8, u8, u8, u8, u8),
+) {
+    (
+        u8::from(quality_report.passed),
+        -(quality_issue_count(quality_report, "blocking") as i32),
+        -(quality_issue_count(quality_report, "major") as i32),
+        quality_report.score,
+        -(quality_report.issues.len() as i32),
+        review_rank(review),
+    )
+}
+
+fn build_regression_report(
+    round_index: u32,
+    source_round_index: Option<u32>,
+    source: Option<&QualityReport>,
+    current: &QualityReport,
+) -> RegressionReport {
+    let source_score = source.map(|report| report.score);
+    let score_delta = source.map(|report| current.score as i32 - report.score as i32);
+    let blocking_delta = source.map(|report| {
+        quality_issue_count(current, "blocking") as i32
+            - quality_issue_count(report, "blocking") as i32
+    });
+    let major_delta = source.map(|report| {
+        quality_issue_count(current, "major") as i32 - quality_issue_count(report, "major") as i32
+    });
+    let issue_delta = source.map(|report| current.issues.len() as i32 - report.issues.len() as i32);
+    let status = match source {
+        None => "initial".to_string(),
+        Some(_) if blocking_delta.unwrap_or_default() > 0 => "regressed".to_string(),
+        Some(_) if major_delta.unwrap_or_default() > 0 => "regressed".to_string(),
+        Some(_) if score_delta.unwrap_or_default() < 0 => "regressed".to_string(),
+        Some(_)
+            if blocking_delta.unwrap_or_default() < 0
+                || major_delta.unwrap_or_default() < 0
+                || score_delta.unwrap_or_default() > 0
+                || issue_delta.unwrap_or_default() < 0 =>
+        {
+            "improved".to_string()
+        }
+        Some(_) => "same".to_string(),
+    };
+    let (regressed_issue_types, resolved_issue_types) = source
+        .map(|report| issue_type_deltas(report, current))
+        .unwrap_or_default();
+    let min_quality_score = source.map(|report| report.score).unwrap_or(current.score);
+    let max_blocking_issues = source
+        .map(|report| quality_issue_count(report, "blocking"))
+        .unwrap_or_else(|| quality_issue_count(current, "blocking"));
+    let max_major_issues = source
+        .map(|report| quality_issue_count(report, "major"))
+        .unwrap_or_else(|| quality_issue_count(current, "major"));
+
+    RegressionReport {
+        version: "0.1".to_string(),
+        round_index,
+        source_round_index,
+        status,
+        source_quality_score: source_score,
+        quality_score: current.score,
+        score_delta,
+        blocking_delta,
+        major_delta,
+        issue_delta,
+        regressed_issue_types,
+        resolved_issue_types,
+        budget: RegressionBudget {
+            min_quality_score,
+            max_blocking_issues,
+            max_major_issues,
+            requirement:
+                "Next round must not reduce quality_report.score or increase blocking/major issue counts relative to the revision source; if this round regressed, revert to the source geometry and apply only local fixes for unresolved target ids."
+                    .to_string(),
+        },
+    }
+}
+
+fn issue_type_deltas(
+    source: &QualityReport,
+    current: &QualityReport,
+) -> (Vec<String>, Vec<String>) {
+    let source_counts = issue_type_counts(source);
+    let current_counts = issue_type_counts(current);
+    let mut keys = source_counts
+        .keys()
+        .chain(current_counts.keys())
+        .cloned()
+        .collect::<Vec<_>>();
+    keys.sort();
+    keys.dedup();
+    let mut regressed = Vec::new();
+    let mut resolved = Vec::new();
+    for key in keys {
+        let before = source_counts.get(&key).copied().unwrap_or(0);
+        let after = current_counts.get(&key).copied().unwrap_or(0);
+        if after > before {
+            regressed.push(key);
+        } else if after < before {
+            resolved.push(key);
+        }
+    }
+    (regressed, resolved)
+}
+
+fn issue_type_counts(report: &QualityReport) -> BTreeMap<String, usize> {
+    let mut counts = BTreeMap::new();
+    for issue in report
+        .issues
+        .iter()
+        .filter(|issue| issue.severity == "blocking" || issue.severity == "major")
+    {
+        *counts.entry(issue.issue_type.clone()).or_insert(0) += 1;
+    }
+    counts
+}
+
+fn quality_issue_count(quality_report: &QualityReport, severity: &str) -> usize {
+    quality_report
+        .issues
+        .iter()
+        .filter(|issue| issue.severity == severity)
+        .count()
 }
 
 fn review_rank(review: &Review) -> (u8, u8, i32, u32, u8, u8, u8, u8, u8) {
@@ -734,6 +1111,11 @@ fn finalize_from_round(
         "renderer_status.json",
         "reference_selection.json",
         "improvement_plan.json",
+        "quality_report.json",
+        "regression_report.json",
+        "issue_binding.json",
+        "issue_history.json",
+        "repair_report.json",
     ] {
         let src = round_dir.join(file);
         if src.exists() {
@@ -889,9 +1271,310 @@ fn reject_fallback_round(review: &mut Review) {
     review.passed = false;
 }
 
+fn build_repair_report(
+    round_index: u32,
+    source_round_index: Option<u32>,
+    previous_draw_plan: Option<&DrawPlan>,
+    current_draw_plan: &DrawPlan,
+) -> RepairReport {
+    let material_changes = previous_draw_plan
+        .map(|previous| draw_plan_material_changes(previous, current_draw_plan))
+        .unwrap_or_default();
+    let notes = if previous_draw_plan.is_some() {
+        if material_changes.is_empty() {
+            vec!["No material DrawPlan change detected after geometry repair.".to_string()]
+        } else {
+            vec![
+                "Round is an incremental repair from the selected source round.".to_string(),
+                "Material changes are object-level evidence for the next coder/reasoner pass."
+                    .to_string(),
+            ]
+        }
+    } else {
+        vec!["Initial DrawPlan generated from FigurePlan.".to_string()]
+    };
+    RepairReport {
+        version: "0.1".to_string(),
+        round_index,
+        source_round_index,
+        material_changes,
+        notes,
+    }
+}
+
+fn inject_draw_plan_semantic_quality_issues(
+    quality_report: &mut QualityReport,
+    figure_plan: &FigurePlan,
+    draw_plan: &DrawPlan,
+) {
+    let draw_connector_styles = draw_plan
+        .objects
+        .iter()
+        .filter_map(|object| match object {
+            DrawObject::Connector { id, style, .. } => Some((id.as_str(), style.as_str())),
+            _ => None,
+        })
+        .collect::<BTreeMap<_, _>>();
+
+    for edge in &figure_plan.edges {
+        let Some(draw_style) = draw_connector_styles.get(edge.id.as_str()) else {
+            continue;
+        };
+        let expected_dash = figure_edge_style_uses_dash(edge.style);
+        let actual_dash = draw_style_uses_dash(draw_style);
+        if expected_dash == actual_dash {
+            continue;
+        }
+        append_quality_issue(
+            quality_report,
+            "edge_style_mismatch",
+            "major",
+            vec![edge.id.clone()],
+            format!(
+                "render quality failed: connector {} uses draw style '{}' but FigurePlan specifies {}",
+                edge.id,
+                draw_style,
+                figure_edge_style_name(edge.style)
+            ),
+            "Change the DrawPlan connector style to match the FigurePlan edge style; preserve semantic endpoints and routing while fixing only the stroke style.",
+        );
+    }
+    recompute_quality_report_status(quality_report);
+}
+
+fn apply_quality_report_gate(review: &mut Review, quality_report: &QualityReport) {
+    for issue in &quality_report.issues {
+        if issue.severity != "blocking" && issue.severity != "major" {
+            continue;
+        }
+        if !review.blocking_issues.contains(&issue.evidence) {
+            review.blocking_issues.push(issue.evidence.clone());
+        }
+    }
+    review.passed = crate::tools::review::review_passes_threshold(review);
+}
+
+fn append_quality_issue(
+    quality_report: &mut QualityReport,
+    issue_type: &str,
+    severity: &str,
+    target_ids: Vec<String>,
+    evidence: String,
+    suggested_action: &str,
+) {
+    let issue_id = format!("quality_{:03}", quality_report.issues.len() + 1);
+    quality_report.issues.push(QualityIssue {
+        issue_id,
+        issue_type: issue_type.to_string(),
+        severity: severity.to_string(),
+        target_ids,
+        evidence,
+        suggested_action: suggested_action.to_string(),
+    });
+}
+
+fn recompute_quality_report_status(quality_report: &mut QualityReport) {
+    let penalty = quality_report
+        .issues
+        .iter()
+        .map(|issue| match issue.severity.as_str() {
+            "blocking" => 12,
+            "major" => 6,
+            "minor" => 2,
+            _ => 1,
+        })
+        .sum::<u32>();
+    quality_report.passed = !quality_report
+        .issues
+        .iter()
+        .any(|issue| issue.severity == "blocking" || issue.severity == "major");
+    quality_report.score = 100_u32.saturating_sub(penalty);
+}
+
+fn figure_edge_style_uses_dash(style: EdgeStyle) -> bool {
+    matches!(style, EdgeStyle::Dash | EdgeStyle::LongDash)
+}
+
+fn draw_style_uses_dash(style: &str) -> bool {
+    let style = style.to_ascii_lowercase();
+    style.contains("dash") || style.contains("supervision")
+}
+
+fn figure_edge_style_name(style: EdgeStyle) -> &'static str {
+    match style {
+        EdgeStyle::Solid => "solid",
+        EdgeStyle::Dash => "dash",
+        EdgeStyle::LongDash => "long_dash",
+    }
+}
+
+fn build_issue_binding(
+    round_index: u32,
+    review: &Review,
+    quality_report: &QualityReport,
+) -> IssueBinding {
+    let mut entries = Vec::new();
+    for issue in &quality_report.issues {
+        entries.push(IssueBindingEntry {
+            issue_id: issue.issue_id.clone(),
+            issue_type: issue.issue_type.clone(),
+            severity: issue.severity.clone(),
+            source: "quality_report".to_string(),
+            target_ids: issue.target_ids.clone(),
+            evidence: issue.evidence.clone(),
+            suggested_action: issue.suggested_action.clone(),
+        });
+    }
+    for (index, issue) in review.localized_issues.iter().enumerate() {
+        entries.push(IssueBindingEntry {
+            issue_id: format!("review_localized_{:03}", index + 1),
+            issue_type: "localized_review".to_string(),
+            severity: issue_severity_name(issue.severity).to_string(),
+            source: "vision_review".to_string(),
+            target_ids: vec![issue.target_id.clone()],
+            evidence: issue.evidence.clone(),
+            suggested_action: issue.suggested_direction.clone(),
+        });
+    }
+    for (index, issue) in review.blocking_issues.iter().enumerate() {
+        entries.push(IssueBindingEntry {
+            issue_id: format!("review_blocking_{:03}", index + 1),
+            issue_type: "blocking_review".to_string(),
+            severity: "blocking".to_string(),
+            source: "vision_review".to_string(),
+            target_ids: target_ids_from_issue_text(issue),
+            evidence: issue.clone(),
+            suggested_action:
+                "Bind this blocking issue to concrete DrawPlan ids before changing code."
+                    .to_string(),
+        });
+    }
+    IssueBinding {
+        version: "0.1".to_string(),
+        round_index,
+        entries,
+    }
+}
+
+fn build_issue_history(
+    round_index: u32,
+    previous_round_dir: Option<&Path>,
+    binding: &IssueBinding,
+) -> Result<IssueHistory> {
+    let previous = previous_round_dir
+        .map(|dir| dir.join("issue_history.json"))
+        .filter(|path| path.exists())
+        .map(|path| read_json::<IssueHistory>(&path))
+        .transpose()?;
+    let previous_by_key = previous
+        .map(|history| {
+            history
+                .issues
+                .into_iter()
+                .map(|issue| (issue.issue_key.clone(), issue))
+                .collect::<BTreeMap<_, _>>()
+        })
+        .unwrap_or_default();
+    let issues = binding
+        .entries
+        .iter()
+        .map(|entry| {
+            let key = issue_history_key(entry);
+            let previous = previous_by_key.get(&key);
+            TrackedIssue {
+                issue_key: key,
+                issue_type: entry.issue_type.clone(),
+                target_ids: normalized_target_ids(&entry.target_ids),
+                first_seen_round: previous
+                    .map(|issue| issue.first_seen_round)
+                    .unwrap_or(round_index),
+                last_seen_round: round_index,
+                occurrences: previous
+                    .map(|issue| issue.occurrences.saturating_add(1))
+                    .unwrap_or(1),
+                latest_evidence: entry.evidence.clone(),
+                latest_suggested_action: entry.suggested_action.clone(),
+            }
+        })
+        .collect();
+    Ok(IssueHistory {
+        version: "0.1".to_string(),
+        round_index,
+        issues,
+    })
+}
+
+fn issue_severity_name(severity: crate::schema::IssueSeverity) -> &'static str {
+    match severity {
+        crate::schema::IssueSeverity::Blocking => "blocking",
+        crate::schema::IssueSeverity::Major => "major",
+        crate::schema::IssueSeverity::Minor => "minor",
+    }
+}
+
+fn issue_history_key(entry: &IssueBindingEntry) -> String {
+    let target_ids = normalized_target_ids(&entry.target_ids).join("+");
+    let evidence = normalize_issue_text(&entry.evidence);
+    format!("{}|{}|{}", entry.issue_type, target_ids, evidence)
+}
+
+fn normalized_target_ids(target_ids: &[String]) -> Vec<String> {
+    let mut ids = target_ids
+        .iter()
+        .filter(|id| !id.trim().is_empty())
+        .cloned()
+        .collect::<Vec<_>>();
+    ids.sort();
+    ids.dedup();
+    ids
+}
+
+fn normalize_issue_text(text: &str) -> String {
+    text.chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() {
+                ch.to_ascii_lowercase()
+            } else {
+                ' '
+            }
+        })
+        .collect::<String>()
+        .split_whitespace()
+        .take(16)
+        .collect::<Vec<_>>()
+        .join("_")
+}
+
+fn target_ids_from_issue_text(text: &str) -> Vec<String> {
+    let mut ids = text
+        .split(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_' || ch == '-'))
+        .filter(|token| token.contains('_') || token.starts_with('e'))
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    ids.sort();
+    ids.dedup();
+    if ids.is_empty() {
+        ids.push("global_layout".to_string());
+    }
+    ids
+}
+
 fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
     fs::write(path, serde_json::to_vec_pretty(value)?)?;
     Ok(())
+}
+
+fn select_revision_improvement_plan(
+    revision_round_dir: &Path,
+    latest_attempt_round_dir: Option<&Path>,
+) -> Result<String> {
+    if let Some(latest_attempt_round_dir) = latest_attempt_round_dir {
+        let latest_plan_path = latest_attempt_round_dir.join("improvement_plan.json");
+        if latest_plan_path.exists() {
+            return read_text_or_empty(&latest_plan_path);
+        }
+    }
+    read_text_or_empty(&revision_round_dir.join("improvement_plan.json"))
 }
 
 fn create_round_workspace(
@@ -900,6 +1583,7 @@ fn create_round_workspace(
     method_text: &str,
     reference_selection: &ReferenceSelection,
     previous_round_dir: Option<&Path>,
+    latest_attempt_round_dir: Option<&Path>,
 ) -> Result<AgentWorkspace> {
     let mut readable = vec![
         workspace_file(
@@ -954,6 +1638,36 @@ fn create_round_workspace(
                 512_000,
             ),
             workspace_file(
+                "readable/previous_quality_report.json",
+                "Previous round structured render quality report with target object ids.",
+                WorkspaceFileFormat::Json,
+                512_000,
+            ),
+            workspace_file(
+                "readable/previous_regression_report.json",
+                "Previous round quality regression report and next-round regression budget.",
+                WorkspaceFileFormat::Json,
+                256_000,
+            ),
+            workspace_file(
+                "readable/previous_issue_binding.json",
+                "Previous round issue-to-object binding used for incremental repair.",
+                WorkspaceFileFormat::Json,
+                512_000,
+            ),
+            workspace_file(
+                "readable/previous_issue_history.json",
+                "Active repeated issue history from previous rounds.",
+                WorkspaceFileFormat::Json,
+                512_000,
+            ),
+            workspace_file(
+                "readable/previous_repair_report.json",
+                "Previous round material DrawPlan changes and repair notes.",
+                WorkspaceFileFormat::Json,
+                256_000,
+            ),
+            workspace_file(
                 "readable/previous_code/figure.ts",
                 "Previous round generated renderer entrypoint.",
                 WorkspaceFileFormat::Typescript,
@@ -980,6 +1694,79 @@ fn create_round_workspace(
                 "Previous round generated renderer helper module.",
                 WorkspaceFileFormat::Typescript,
                 1_000_000,
+            ));
+        }
+        if previous_round_dir
+            .map(|dir| dir.join("figure.model_error.log").exists())
+            .unwrap_or(false)
+        {
+            readable.push(workspace_file(
+                "readable/previous_renderer_error.txt",
+                "Previous round model-generated renderer error; use it to avoid repeating invalid TypeScript/runtime API calls.",
+                WorkspaceFileFormat::Text,
+                256_000,
+            ));
+        }
+    }
+    if latest_attempt_round_dir.is_some() {
+        readable.extend([
+            workspace_file(
+                "readable/latest_attempt_draw_plan.json",
+                "Most recent attempted DrawPlan, included when revision source rolls back to an earlier best round.",
+                WorkspaceFileFormat::Json,
+                512_000,
+            ),
+            workspace_file(
+                "readable/latest_attempt_review.json",
+                "Most recent attempted review, used to avoid repeating a reverted failed strategy.",
+                WorkspaceFileFormat::Json,
+                512_000,
+            ),
+            workspace_file(
+                "readable/latest_attempt_quality_report.json",
+                "Most recent attempted structured render quality report.",
+                WorkspaceFileFormat::Json,
+                512_000,
+            ),
+            workspace_file(
+                "readable/latest_attempt_regression_report.json",
+                "Most recent attempted regression report against its revision source.",
+                WorkspaceFileFormat::Json,
+                256_000,
+            ),
+            workspace_file(
+                "readable/latest_attempt_issue_binding.json",
+                "Most recent attempted issue-to-object binding.",
+                WorkspaceFileFormat::Json,
+                512_000,
+            ),
+            workspace_file(
+                "readable/latest_attempt_code/figure.ts",
+                "Most recent attempted renderer entrypoint, used only as failure evidence when distinct from the revision source.",
+                WorkspaceFileFormat::Typescript,
+                1_000_000,
+            ),
+        ]);
+        if latest_attempt_round_dir
+            .map(|dir| dir.join("improvement_plan.json").exists())
+            .unwrap_or(false)
+        {
+            readable.push(workspace_file(
+                "readable/latest_attempt_improvement_plan.json",
+                "Most recent attempted improvement plan, used to avoid repeating a reverted failed strategy.",
+                WorkspaceFileFormat::Json,
+                256_000,
+            ));
+        }
+        if latest_attempt_round_dir
+            .map(|dir| dir.join("figure.model_error.log").exists())
+            .unwrap_or(false)
+        {
+            readable.push(workspace_file(
+                "readable/latest_attempt_renderer_error.txt",
+                "Most recent attempted model-generated renderer error; use it as negative evidence when revising code.",
+                WorkspaceFileFormat::Text,
+                256_000,
             ));
         }
     }
@@ -1068,6 +1855,36 @@ fn create_round_workspace(
             "validation_report.json",
             "readable/previous_validation_report.json",
         )?;
+        write_previous_readable_if_exists(
+            &workspace,
+            previous_round_dir,
+            "quality_report.json",
+            "readable/previous_quality_report.json",
+        )?;
+        write_previous_readable_if_exists(
+            &workspace,
+            previous_round_dir,
+            "regression_report.json",
+            "readable/previous_regression_report.json",
+        )?;
+        write_previous_readable_if_exists(
+            &workspace,
+            previous_round_dir,
+            "issue_binding.json",
+            "readable/previous_issue_binding.json",
+        )?;
+        write_previous_readable_if_exists(
+            &workspace,
+            previous_round_dir,
+            "issue_history.json",
+            "readable/previous_issue_history.json",
+        )?;
+        write_previous_readable_if_exists(
+            &workspace,
+            previous_round_dir,
+            "repair_report.json",
+            "readable/previous_repair_report.json",
+        )?;
         if previous_round_dir.join("improvement_plan.json").exists() {
             write_previous_readable(
                 &workspace,
@@ -1090,6 +1907,62 @@ fn create_round_workspace(
                 "readable/previous_code/helpers.ts",
             )?;
         }
+        write_previous_readable_if_exists(
+            &workspace,
+            previous_round_dir,
+            "figure.model_error.log",
+            "readable/previous_renderer_error.txt",
+        )?;
+    }
+    if let Some(latest_attempt_round_dir) = latest_attempt_round_dir {
+        write_previous_readable_if_exists(
+            &workspace,
+            latest_attempt_round_dir,
+            "draw_plan.json",
+            "readable/latest_attempt_draw_plan.json",
+        )?;
+        write_previous_readable_if_exists(
+            &workspace,
+            latest_attempt_round_dir,
+            "review.json",
+            "readable/latest_attempt_review.json",
+        )?;
+        write_previous_readable_if_exists(
+            &workspace,
+            latest_attempt_round_dir,
+            "quality_report.json",
+            "readable/latest_attempt_quality_report.json",
+        )?;
+        write_previous_readable_if_exists(
+            &workspace,
+            latest_attempt_round_dir,
+            "regression_report.json",
+            "readable/latest_attempt_regression_report.json",
+        )?;
+        write_previous_readable_if_exists(
+            &workspace,
+            latest_attempt_round_dir,
+            "issue_binding.json",
+            "readable/latest_attempt_issue_binding.json",
+        )?;
+        write_previous_readable_if_exists(
+            &workspace,
+            latest_attempt_round_dir,
+            "improvement_plan.json",
+            "readable/latest_attempt_improvement_plan.json",
+        )?;
+        write_previous_readable_if_exists(
+            &workspace,
+            latest_attempt_round_dir,
+            "figure.ts",
+            "readable/latest_attempt_code/figure.ts",
+        )?;
+        write_previous_readable_if_exists(
+            &workspace,
+            latest_attempt_round_dir,
+            "figure.model_error.log",
+            "readable/latest_attempt_renderer_error.txt",
+        )?;
     }
     Ok(workspace)
 }
@@ -1107,6 +1980,18 @@ fn write_previous_readable(
         )
     })?;
     workspace.write_readable(workspace_path, &bytes)
+}
+
+fn write_previous_readable_if_exists(
+    workspace: &AgentWorkspace,
+    previous_round_dir: &Path,
+    source_name: &str,
+    workspace_path: &str,
+) -> Result<()> {
+    if previous_round_dir.join(source_name).exists() {
+        write_previous_readable(workspace, previous_round_dir, source_name, workspace_path)?;
+    }
+    Ok(())
 }
 
 fn workspace_file(
@@ -1150,4 +2035,79 @@ fn append_log(run_dir: &Path, message: &str) -> Result<()> {
         .open(run_dir.join("run.log"))?;
     writeln!(file, "{message}")?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn revision_improvement_plan_prefers_latest_attempt_plan_when_revising_from_best_source() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let source = temp.path().join("round_001");
+        let latest = temp.path().join("round_002");
+        fs::create_dir_all(&source).expect("source dir");
+        fs::create_dir_all(&latest).expect("latest dir");
+        fs::write(
+            source.join("improvement_plan.json"),
+            r#"{"summary":"stale source plan"}"#,
+        )
+        .expect("source plan");
+        fs::write(
+            latest.join("improvement_plan.json"),
+            r#"{"summary":"latest failed attempt postmortem"}"#,
+        )
+        .expect("latest plan");
+
+        let selected = select_revision_improvement_plan(&source, Some(&latest))
+            .expect("revision plan should be selected");
+
+        assert!(selected.contains("latest failed attempt postmortem"));
+        assert!(!selected.contains("stale source plan"));
+    }
+
+    #[test]
+    fn quality_report_injects_draw_plan_edge_style_mismatch() {
+        let mut figure_plan = FigurePlan::mock_from_method(
+            "teacher student distillation",
+            StyleName::WpsClean,
+            CanvasAspect::PaperWide,
+            85,
+        );
+        figure_plan.edges[0].id = "teacher_to_alignment".to_string();
+        figure_plan.edges[0].style = EdgeStyle::Solid;
+
+        let draw_plan = DrawPlan {
+            version: "0.2".to_string(),
+            canvas: figure_plan.canvas.clone(),
+            style_tokens: BTreeMap::new(),
+            objects: vec![DrawObject::Connector {
+                id: "teacher_to_alignment".to_string(),
+                points: vec![[0.1, 0.2], [0.4, 0.2]],
+                from: Some("teacher".to_string()),
+                to: Some("student".to_string()),
+                style: "dashed_supervision".to_string(),
+                label: None,
+                z: 1,
+            }],
+        };
+        let mut quality_report = QualityReport {
+            version: "0.1".to_string(),
+            passed: true,
+            score: 100,
+            issues: vec![],
+        };
+
+        inject_draw_plan_semantic_quality_issues(&mut quality_report, &figure_plan, &draw_plan);
+
+        let issue = quality_report
+            .issues
+            .iter()
+            .find(|issue| issue.issue_type == "edge_style_mismatch")
+            .expect("draw connector style should match the FigurePlan edge style");
+        assert_eq!(issue.severity, "major");
+        assert_eq!(issue.target_ids, vec!["teacher_to_alignment".to_string()]);
+        assert!(!quality_report.passed);
+        assert_eq!(quality_report.score, 94);
+    }
 }

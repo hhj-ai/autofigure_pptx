@@ -23,6 +23,53 @@ pub fn selected_reference_json(selection: &ReferenceSelection) -> Result<String>
     Ok(serde_json::to_string_pretty(selection)?)
 }
 
+pub fn complete_reference_selection_from_pack(
+    selection: &mut ReferenceSelection,
+    preview_mode: ReferencePreviewMode,
+) -> Result<()> {
+    let value: serde_json::Value = serde_json::from_str(REFERENCE_FIGURE_PACK)
+        .context("reference figure pack is invalid JSON")?;
+    let references = value["references"]
+        .as_array()
+        .ok_or_else(|| anyhow!("reference figure pack has no references array"))?;
+    let Some(entry) = references
+        .iter()
+        .find(|entry| entry["id"].as_str() == Some(selection.selected_reference_id.as_str()))
+    else {
+        return Ok(());
+    };
+    let canonical = reference_selection_from_entry(entry, &selection.why_fit, preview_mode)?;
+    selection.preview_mode = preview_mode;
+    if selection.selected_reference_name.trim().is_empty() {
+        selection.selected_reference_name = canonical.selected_reference_name;
+    }
+    if selection.source_paper.trim().is_empty() {
+        selection.source_paper = canonical.source_paper;
+    }
+    if selection.source_url.trim().is_empty() {
+        selection.source_url = canonical.source_url;
+    }
+    if selection
+        .preview_path
+        .as_deref()
+        .unwrap_or_default()
+        .trim()
+        .is_empty()
+    {
+        selection.preview_path = canonical.preview_path;
+    }
+    if selection.adaptation_rules.is_empty() {
+        selection.adaptation_rules = canonical.adaptation_rules;
+    }
+    if selection.anti_patterns.is_empty() {
+        selection.anti_patterns = canonical.anti_patterns;
+    }
+    if selection.quality_targets.is_empty() {
+        selection.quality_targets = canonical.quality_targets;
+    }
+    Ok(())
+}
+
 pub fn select_reference_for_method(
     method: &str,
     preview_mode: ReferencePreviewMode,

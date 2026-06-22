@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use anyhow::{anyhow, Result};
 
@@ -11,6 +11,7 @@ const MIN_NORMALIZED_BOX_HEIGHT: f64 = 0.06;
 pub fn normalize_plan_for_render(plan: &mut FigurePlan) {
     normalize_editable_text(plan);
     deduplicate_region_stable_ids(plan);
+    repair_edges_with_missing_component_endpoints(plan);
 
     if !plan.canvas.safe_margin.is_finite()
         || plan.canvas.safe_margin < 0.0
@@ -46,6 +47,50 @@ pub fn normalize_plan_for_render(plan: &mut FigurePlan) {
             });
         }
     }
+}
+
+fn repair_edges_with_missing_component_endpoints(plan: &mut FigurePlan) {
+    let component_ids: HashSet<String> = plan
+        .components
+        .iter()
+        .map(|component| component.id.clone())
+        .collect();
+    let mut region_components: HashMap<String, Vec<String>> = HashMap::new();
+    for component in &plan.components {
+        region_components
+            .entry(component.region.clone())
+            .or_default()
+            .push(component.id.clone());
+    }
+
+    for edge in &mut plan.edges {
+        if !component_ids.contains(&edge.from) {
+            if let Some(replacement) =
+                single_component_for_region(&region_components, edge.from.as_str())
+            {
+                edge.from = replacement;
+            }
+        }
+        if !component_ids.contains(&edge.to) {
+            if let Some(replacement) =
+                single_component_for_region(&region_components, edge.to.as_str())
+            {
+                edge.to = replacement;
+            }
+        }
+    }
+
+    // 模型偶尔会把 edge 连到不存在的占位 id；这类边无法渲染成可靠 editable connector，直接丢弃比中断整轮更稳。
+    plan.edges
+        .retain(|edge| component_ids.contains(&edge.from) && component_ids.contains(&edge.to));
+}
+
+fn single_component_for_region(
+    region_components: &HashMap<String, Vec<String>>,
+    region_id: &str,
+) -> Option<String> {
+    let components = region_components.get(region_id)?;
+    (components.len() == 1).then(|| components[0].clone())
 }
 
 fn deduplicate_region_stable_ids(plan: &mut FigurePlan) {
